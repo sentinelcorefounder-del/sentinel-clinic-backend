@@ -32,12 +32,6 @@ CSRF_TRUSTED_ORIGINS = [
 
 CORS_ALLOW_CREDENTIALS = True
 
-CSRF_TRUSTED_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",")
-    if origin.strip()
-]
-
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 SESSION_COOKIE_SAMESITE = "None"
