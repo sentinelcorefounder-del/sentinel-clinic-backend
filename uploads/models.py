@@ -46,7 +46,11 @@ class ImageUpload(models.Model):
 
     def __str__(self):
         return f"{self.image_upload_id} - {self.encounter.encounter_id}"
-    
+
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        self.encounter.update_status_from_related_records()    
+        try:
+            if hasattr(self.encounter, "update_status_from_related_records"):
+                self.encounter.update_status_from_related_records()
+        except Exception as exc:
+            print("ImageUpload post-save status update failed:", exc)
