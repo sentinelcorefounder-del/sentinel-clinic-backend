@@ -1,11 +1,13 @@
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from django.conf import settings
-from django.conf.urls.static import static
 from django.http import JsonResponse
+from django.views.static import serve
+
 
 def home(request):
     return JsonResponse({"status": "ok", "message": "Sentinel Clinic backend is running"})
+
 
 urlpatterns = [
     path("", home),
@@ -17,6 +19,5 @@ urlpatterns = [
     path("api/reports/", include("reports.urls")),
     path("api/consents/", include("consents.urls")),
     path("api/dashboard/", include("dashboard.urls")),
+    re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
 ]
-
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
