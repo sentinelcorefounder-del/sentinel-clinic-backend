@@ -6,7 +6,10 @@ DEBUG = False
 
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.environ.get("ALLOWED_HOSTS", "sentinel-clinic-backend.onrender.com").split(",")
+    for host in os.environ.get(
+        "ALLOWED_HOSTS",
+        "sentinel-clinic-backend.onrender.com",
+    ).split(",")
     if host.strip()
 ]
 
@@ -15,12 +18,19 @@ DATABASES = {
 }
 
 CORS_ALLOWED_ORIGINS = [
-    "https://sentinel-clinic-frontend.vercel.app",
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://sentinel-clinic-frontend.*\.vercel\.app$",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://sentinel-clinic-frontend.vercel.app",
-    "https://sentinel-clinic-backend.onrender.com",
+    origin.strip()
+    for origin in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
 ]
 
 CORS_ALLOW_CREDENTIALS = True
