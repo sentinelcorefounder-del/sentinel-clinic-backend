@@ -45,9 +45,23 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 
 MIDDLEWARE.insert(2, "whitenoise.middleware.WhiteNoiseMiddleware")
 
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+
 STORAGES = {
     "default": {
-        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "access_key": R2_ACCESS_KEY_ID,
+            "secret_key": R2_SECRET_ACCESS_KEY,
+            "bucket_name": R2_BUCKET_NAME,
+            "endpoint_url": f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            "region_name": "auto",
+            "default_acl": None,
+            "querystring_auth": False,
+        },
     },
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
