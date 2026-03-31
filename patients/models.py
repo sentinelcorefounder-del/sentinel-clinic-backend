@@ -1,4 +1,5 @@
 from django.db import models
+from organizations.models import Organization
 
 
 class Patient(models.Model):
@@ -20,6 +21,19 @@ class Patient(models.Model):
     state = models.CharField(max_length=100, blank=True)
     country = models.CharField(max_length=100, default="Nigeria")
     consent_status = models.CharField(max_length=30, default="pending")
+
+    assigned_clinic = models.ForeignKey(
+        Organization,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="patients",
+    )
+    referral_id = models.CharField(max_length=50, blank=True)
+    referral_status = models.CharField(max_length=50, blank=True)
+    appointment_date = models.DateField(null=True, blank=True)
+    source_system = models.CharField(max_length=50, default="clinic_portal")
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
