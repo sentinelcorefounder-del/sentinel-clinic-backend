@@ -8,6 +8,7 @@ from rest_framework.views import APIView
 
 from .models import Organization
 from .serializers import OrganizationSyncSerializer
+from users.models import UserOrganization
 
 
 class OrganizationSyncView(APIView):
@@ -58,6 +59,11 @@ class OrganizationSyncView(APIView):
             user.set_password(temporary_password)
             user.save()
             user.groups.add(group)
+
+        UserOrganization.objects.update_or_create(
+            user=user,
+            defaults={"organization": org},
+        )
 
         return Response(
             {

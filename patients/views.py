@@ -18,6 +18,15 @@ class PatientListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         queryset = Patient.objects.all()
+
+        user = self.request.user
+        if not user.is_superuser:
+            org_link = getattr(user, "organization_link", None)
+            if org_link:
+                queryset = queryset.filter(assigned_clinic=org_link.organization)
+            else:
+                queryset = queryset.none()
+
         search = self.request.query_params.get("search")
 
         if search:
@@ -32,9 +41,21 @@ class PatientListCreateView(generics.ListCreateAPIView):
 
 
 class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Patient.objects.all()
     serializer_class = PatientSerializer
     permission_classes = [CanManagePatients]
+
+    def get_queryset(self):
+        queryset = Patient.objects.all()
+
+        user = self.request.user
+        if not user.is_superuser:
+            org_link = getattr(user, "organization_link", None)
+            if org_link:
+                queryset = queryset.filter(assigned_clinic=org_link.organization)
+            else:
+                queryset = queryset.none()
+
+        return queryset
 
 
 class PatientSyncView(APIView):
