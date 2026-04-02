@@ -8,7 +8,7 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in os.environ.get(
         "ALLOWED_HOSTS",
-        "sentinel-clinic-backend.onrender.com",
+        "sentinel-clinic-backend.onrender.com,api.usesentinelhealth.com",
     ).split(",")
     if host.strip()
 ]
