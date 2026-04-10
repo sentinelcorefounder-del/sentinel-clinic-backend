@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     "consents",
     "audit",
     "dashboard",
+    "payments",
 ]
 
 MIDDLEWARE = [
@@ -98,3 +99,10 @@ REST_FRAMEWORK = {
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_BASE_URL = os.environ.get("PAYSTACK_BASE_URL", "https://api.paystack.co")
+
+BASEROW_API_TOKEN = os.environ.get("BASEROW_API_TOKEN", "")
+BASEROW_BASE_URL = os.environ.get("BASEROW_BASE_URL", "https://api.baserow.io")
+BASEROW_PAYMENTS_TABLE_ID = os.environ.get("BASEROW_PAYMENTS_TABLE_ID", "")
