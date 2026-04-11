@@ -32,7 +32,8 @@ def initialize_paystack_payment(request):
         )
 
     try:
-        amount_kobo = int(float(amount) * 100)
+        normalized_amount = str(amount).replace(",", "").strip()
+        amount_kobo = int(float(normalized_amount) * 100)
     except (TypeError, ValueError):
         return JsonResponse({"detail": "Invalid amount"}, status=400)
 
