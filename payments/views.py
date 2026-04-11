@@ -3,7 +3,11 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from .services.paystack import initialize_transaction, verify_transaction
-from .services.baserow import update_payment_row, find_payment_row_by_reference
+from .services.baserow import (
+    update_payment_row,
+    find_payment_row_by_reference,
+    update_referral_row,
+)
 
 
 @csrf_exempt
@@ -39,7 +43,18 @@ def initialize_paystack_payment(request):
             reference=payment_id,
         )
     except Exception as exc:
-        return JsonResponse({"detail": f"Paystack init failed: {str(exc)}"}, status=502)
+        return JsonResponse(
+            {
+                "detail": "Paystack init failed",
+                "error": str(exc),
+                "row_id": row_id,
+                "email": email,
+                "amount": amount,
+                "payment_id": payment_id,
+                "amount_kobo": amount_kobo,
+            },
+            status=502,
+        )
 
     data = result.get("data", {})
     authorization_url = data.get("authorization_url")
@@ -132,5 +147,17 @@ def paystack_webhook(request):
             "Internal Notes": "Verified via Paystack webhook",
         },
     )
+
+    referral_links = payment_row.get("Referral") or []
+    if referral_links:
+        referral_row_id = referral_links[0].get("id")
+        if referral_row_id:
+            update_referral_row(
+                referral_row_id,
+                {
+                    "Referral Status": "ready_for_ops_review",
+                    "Ops Notes": "Payment verified via Paystack webhook",
+                },
+            )
 
     return JsonResponse({"success": True, "reference": reference})

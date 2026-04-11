@@ -106,3 +106,4 @@ PAYSTACK_BASE_URL = os.environ.get("PAYSTACK_BASE_URL", "https://api.paystack.co
 BASEROW_API_TOKEN = os.environ.get("BASEROW_API_TOKEN", "")
 BASEROW_BASE_URL = os.environ.get("BASEROW_BASE_URL", "https://api.baserow.io")
 BASEROW_PAYMENTS_TABLE_ID = os.environ.get("BASEROW_PAYMENTS_TABLE_ID", "")
+BASEROW_REFERRALS_TABLE_ID = os.environ.get("BASEROW_REFERRALS_TABLE_ID", "")
