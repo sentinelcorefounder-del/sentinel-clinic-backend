@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{{ report.report_id }}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            color: #222;
+            margin: 30px;
+        }
+        .header {
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        .logo-row {
+            display: table;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        .logo-cell {
+            display: table-cell;
+            width: 50%;
+            vertical-align: top;
+        }
+        .logo-cell.right {
+            text-align: right;
+        }
+        .logo {
+            max-height: 70px;
+            max-width: 180px;
+        }
+        h1 {
+            font-size: 20px;
+            margin-bottom: 6px;
+        }
+        h2 {
+            font-size: 14px;
+            margin-top: 24px;
+            margin-bottom: 8px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 4px;
+        }
+        .grid {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .grid td {
+            padding: 6px 4px;
+            vertical-align: top;
+        }
+        .label {
+            font-weight: bold;
+            width: 180px;
+        }
+        .section {
+            margin-bottom: 14px;
+        }
+        .signature-block {
+            margin-top: 50px;
+        }
+        .signature-line {
+            margin-top: 36px;
+            border-top: 1px solid #000;
+            width: 240px;
+            padding-top: 6px;
+        }
+        .muted {
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="logo-row">
+        <div class="logo-cell">
+            {% if sentinel_logo_url %}
+                <img src="{{ sentinel_logo_url }}" class="logo" alt="Sentinel Logo">
+            {% else %}
+                <strong>Sentinel</strong>
+            {% endif %}
+        </div>
+        <div class="logo-cell right">
+            {% if clinic_logo_url %}
+                <img src="{{ clinic_logo_url }}" class="logo" alt="Clinic Logo">
+            {% else %}
+                <strong>{{ clinic.name }}</strong>
+            {% endif %}
+        </div>
+    </div>
+
+    <h1>Retinal Screening Report</h1>
+    <div class="muted">Report ID: {{ report.report_id }}</div>
+
+    <h2>Patient Details</h2>
+    <table class="grid">
+        <tr><td class="label">Patient ID</td><td>{{ patient.patient_id }}</td></tr>
+        <tr><td class="label">Name</td><td>{{ patient.first_name }} {{ patient.last_name }}</td></tr>
+        <tr><td class="label">Date of Birth</td><td>{{ patient.date_of_birth }}</td></tr>
+        <tr><td class="label">Sex</td><td>{{ patient.sex }}</td></tr>
+        <tr><td class="label">Phone</td><td>{{ patient.phone }}</td></tr>
+        <tr><td class="label">Email</td><td>{{ patient.email }}</td></tr>
+    </table>
+
+    <h2>Encounter Details</h2>
+    <table class="grid">
+        <tr><td class="label">Encounter ID</td><td>{{ encounter.encounter_id }}</td></tr>
+        <tr><td class="label">Review Date</td><td>{{ report.review_date }}</td></tr>
+        <tr><td class="label">Report Status</td><td>{{ report.report_status }}</td></tr>
+    </table>
+
+    <h2>Clinical Findings</h2>
+    <table class="grid">
+        <tr><td class="label">DR Grade</td><td>{{ report.dr_grade }}</td></tr>
+        <tr><td class="label">Maculopathy Grade</td><td>{{ report.maculopathy_grade }}</td></tr>
+        <tr><td class="label">Ungradable</td><td>{{ report.ungradable }}</td></tr>
+        <tr><td class="label">Urgency Outcome</td><td>{{ report.urgency_outcome }}</td></tr>
+        <tr><td class="label">Recommendation</td><td>{{ report.recommendation }}</td></tr>
+        <tr><td class="label">Next Follow-up Interval</td><td>{{ report.next_followup_interval }}</td></tr>
+        <tr><td class="label">Notes</td><td>{{ report.notes }}</td></tr>
+    </table>
+
+    <div class="signature-block">
+        <div class="signature-line">
+            {{ clinic.report_signatory_name|default:"Doctor Name" }}<br>
+            {{ clinic.report_signatory_title|default:"Doctor / Reviewer" }}<br>
+            ODORBN: {{ clinic.report_signatory_odorbn|default:"________________" }}
+        </div>
+    </div>
+
+    {% if clinic.report_footer_note %}
+        <div style="margin-top: 30px;" class="muted">
+            {{ clinic.report_footer_note }}
+        </div>
+    {% endif %}
+</body>
+</html>
