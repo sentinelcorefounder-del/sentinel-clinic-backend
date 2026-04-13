@@ -315,7 +315,7 @@ class StructuredReportPDFView(APIView):
         primary_blue = (31 / 255, 78 / 255, 121 / 255)
 
         sentinel_logo_path = os.path.join(
-            settings.MEDIA_ROOT, "branding", "sentinel-logo.png"
+            settings.BASE_DIR / "assets", "sentinel-logo.png"
         )
 
         if os.path.exists(sentinel_logo_path):
@@ -336,6 +336,8 @@ class StructuredReportPDFView(APIView):
             pdf.setFont("Helvetica-Bold", 12)
             pdf.drawString(left, y - 5, "Sentinel")
 
+        clinic_display_name = clinic.name if clinic and clinic.name else "Clinic"
+
         if clinic and clinic.logo:
             try:
                 pdf.drawImage(
@@ -349,10 +351,10 @@ class StructuredReportPDFView(APIView):
                 )
             except Exception:
                 pdf.setFont("Helvetica-Bold", 12)
-                pdf.drawRightString(right, y - 5, clinic.name or "Clinic")
+                pdf.drawRightString(right, y - 5, clinic_display_name)
         else:
             pdf.setFont("Helvetica-Bold", 12)
-            pdf.drawRightString(right, y - 5, clinic.name if clinic else "Clinic")
+            pdf.drawRightString(right, y - 5, clinic_display_name)
 
         y -= 48
 
