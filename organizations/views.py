@@ -1,23 +1,58 @@
 import os
-import secrets
 
-from django.contrib.auth.models import Group, User
-from rest_framework import status
+from rest_framework import generics, status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from common.tenant import get_user_organization
 from .models import Organization
-from .serializers import OrganizationSyncSerializer
-from users.models import UserOrganization
+from .provision_serializers import ClinicProvisionSerializer
+from .serializers import OrganizationSerializer
+from .services.provisioning import provision_clinic_with_admin
 
 
-class OrganizationSyncView(APIView):
+class OrganizationListView(generics.ListAPIView):
+    serializer_class = OrganizationSerializer
+
+    def get_queryset(self):
+        queryset = Organization.objects.all()
+
+        user = self.request.user
+        if user.is_superuser:
+            return queryset
+
+        org = get_user_organization(user)
+        if not org:
+            return Organization.objects.none()
+
+        return queryset.filter(id=org.id)
+
+
+class OrganizationDetailView(generics.RetrieveAPIView):
+    serializer_class = OrganizationSerializer
+
+    def get_queryset(self):
+        queryset = Organization.objects.all()
+
+        user = self.request.user
+        if user.is_superuser:
+            return queryset
+
+        org = get_user_organization(user)
+        if not org:
+            return Organization.objects.none()
+
+        return queryset.filter(id=org.id)
+
+
+class ClinicProvisionView(APIView):
     authentication_classes = []
     permission_classes = []
 
     def post(self, request):
-        token = request.headers.get("X-SENTINEL-SYNC-TOKEN")
-        expected = os.environ.get("SENTINEL_SYNC_TOKEN", "")
+        token = request.headers.get("X-SENTINEL-PROVISION-TOKEN")
+        expected = os.environ.get("SENTINEL_PROVISION_TOKEN", "")
 
         if not expected or token != expected:
             return Response(
@@ -25,55 +60,15 @@ class OrganizationSyncView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        serializer = OrganizationSyncSerializer(data=request.data)
+        serializer = ClinicProvisionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
 
-        org, clinic_created = Organization.objects.update_or_create(
-            clinic_id=data["clinic_id"],
-            defaults={
-                "name": data["name"],
-                "contact_email": data.get("contact_email", ""),
-                "is_active": data.get("is_active", True),
-            },
-        )
-
-        group, _ = Group.objects.get_or_create(name="clinic_admin")
-
-        username = f"{org.clinic_id.lower().replace('-', '_')}_admin"
-        email = org.contact_email or f"{username}@sentinel.local"
-
-        user, admin_created = User.objects.get_or_create(
-            username=username,
-            defaults={
-                "email": email,
-                "is_active": True,
-                "is_staff": True,
-            },
-        )
-
-        temporary_password = None
-
-        if admin_created:
-            temporary_password = secrets.token_urlsafe(10)
-            user.set_password(temporary_password)
-            user.save()
-            user.groups.add(group)
-
-        UserOrganization.objects.update_or_create(
-            user=user,
-            defaults={"organization": org},
-        )
+        result = provision_clinic_with_admin(serializer.validated_data)
 
         return Response(
             {
-                "detail": "Clinic synced successfully",
-                "clinic_id": org.clinic_id,
-                "clinic_name": org.name,
-                "admin_username": username,
-                "temporary_password": temporary_password,
-                "admin_created": admin_created,
-                "clinic_created": clinic_created,
+                "detail": "Clinic provisioned successfully",
+                **result,
             },
             status=status.HTTP_200_OK,
         )

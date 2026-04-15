@@ -1,13 +1,19 @@
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
-ALLOWED_PATIENT_WRITE_ROLES = {"sentinel_ops", "super_admin"}
+ALLOWED_PATIENT_WRITE_ROLES = {
+    "sentinel_ops",
+    "super_admin",
+    "clinic_admin",
+    "clinic_screener",
+}
 
 
 class CanManagePatients(BasePermission):
     """
     Authenticated users can read patients.
-    Only sentinel_ops or superuser can create/update/delete patients.
+    sentinel_ops, super_admin, clinic_admin, and clinic_screener
+    can create/update/delete patients.
     """
 
     def has_permission(self, request, view):
