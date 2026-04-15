@@ -1,8 +1,21 @@
 from rest_framework import serializers
+from .models import Organization
 
 
-class OrganizationSyncSerializer(serializers.Serializer):
-    clinic_id = serializers.CharField(max_length=50)
-    name = serializers.CharField(max_length=255)
-    contact_email = serializers.EmailField(required=False, allow_blank=True)
-    is_active = serializers.BooleanField(required=False)
+class OrganizationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Organization
+        fields = [
+            "id",
+            "clinic_id",
+            "name",
+            "address",
+            "contact_email",
+            "phone",
+            "logo",
+            "report_signatory_name",
+            "report_signatory_title",
+            "report_signatory_odorbn",
+            "created_at",
+            "updated_at",
+        ]
