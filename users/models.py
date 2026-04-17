@@ -17,3 +17,15 @@ class UserOrganization(models.Model):
 
     def __str__(self):
         return f"{self.user.username} -> {self.organization.clinic_id}"
+
+
+class UserSecurityProfile(models.Model):
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="security_profile",
+    )
+    must_change_password = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.user.username} security profile"

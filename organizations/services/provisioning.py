@@ -3,7 +3,7 @@ from django.contrib.auth.models import Group
 from django.db import transaction
 
 from organizations.models import Organization
-from users.models import UserOrganization
+from users.models import UserOrganization, UserSecurityProfile
 
 User = get_user_model()
 
@@ -46,10 +46,14 @@ def provision_clinic_with_admin(payload):
 
     user.is_active = True
 
+    security_profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
+
     if user_created and payload.get("temporary_password"):
         user.set_password(payload["temporary_password"])
+        security_profile.must_change_password = True
 
     user.save()
+    security_profile.save()
 
     UserOrganization.objects.get_or_create(
         user=user,
