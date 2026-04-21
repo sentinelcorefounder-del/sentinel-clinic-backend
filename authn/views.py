@@ -4,7 +4,6 @@ from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.middleware.csrf import get_token
-from django.template.loader import render_to_string
 from django.utils.decorators import method_decorator
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -15,6 +14,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from common.tenant import get_user_organization
 from users.models import UserSecurityProfile
 
 
@@ -25,6 +25,28 @@ def get_user_role_names(user):
 def get_must_change_password(user):
     profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
     return profile.must_change_password
+
+
+def serialize_user(user):
+    org = get_user_organization(user)
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_staff": user.is_staff,
+        "is_superuser": user.is_superuser,
+        "must_change_password": get_must_change_password(user),
+        "roles": get_user_role_names(user),
+        "organization": {
+            "id": org.id,
+            "name": org.name,
+            "clinic_id": org.clinic_id,
+            "organization_type": org.organization_type,
+            "contact_email": org.contact_email,
+            "is_active": org.is_active,
+        } if org else None,
+    }
 
 
 class LoginView(APIView):
@@ -43,16 +65,7 @@ class LoginView(APIView):
             )
 
         login(request, user)
-
-        return Response({
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "is_staff": user.is_staff,
-            "is_superuser": user.is_superuser,
-            "must_change_password": get_must_change_password(user),
-            "roles": get_user_role_names(user),
-        })
+        return Response(serialize_user(user))
 
 
 class LogoutView(APIView):
@@ -67,16 +80,7 @@ class CurrentUserView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = request.user
-        return Response({
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "is_staff": user.is_staff,
-            "is_superuser": user.is_superuser,
-            "must_change_password": get_must_change_password(user),
-            "roles": get_user_role_names(user),
-        })
+        return Response(serialize_user(request.user))
 
 
 class ChangePasswordView(APIView):
@@ -126,7 +130,6 @@ class ForgotPasswordRequestView(APIView):
 
         user = User.objects.filter(email__iexact=email, is_active=True).first()
 
-        # Always return success-like response to avoid account enumeration
         if not user:
             return Response(
                 {"detail": "If an account exists for that email, a reset link has been sent."},

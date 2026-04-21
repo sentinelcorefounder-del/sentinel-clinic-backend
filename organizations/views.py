@@ -1,15 +1,17 @@
 import os
 
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
 from .models import Organization
-from .provision_serializers import ClinicProvisionSerializer
+from .provision_serializers import ClinicProvisionSerializer, HospitalProvisionSerializer
 from .serializers import OrganizationSerializer
-from .services.provisioning import provision_clinic_with_admin
+from .services.provisioning import (
+    provision_clinic_with_admin,
+    provision_hospital_with_admin,
+)
 
 
 class OrganizationListView(generics.ListAPIView):
@@ -68,6 +70,34 @@ class ClinicProvisionView(APIView):
         return Response(
             {
                 "detail": "Clinic provisioned successfully",
+                **result,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class HospitalProvisionView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        token = request.headers.get("X-SENTINEL-PROVISION-TOKEN")
+        expected = os.environ.get("SENTINEL_PROVISION_TOKEN", "")
+
+        if not expected or token != expected:
+            return Response(
+                {"detail": "Unauthorized"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        serializer = HospitalProvisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        result = provision_hospital_with_admin(serializer.validated_data)
+
+        return Response(
+            {
+                "detail": "Hospital provisioned successfully",
                 **result,
             },
             status=status.HTTP_200_OK,

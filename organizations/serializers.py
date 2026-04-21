@@ -9,6 +9,7 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "id",
             "clinic_id",
             "name",
+            "organization_type",
             "address",
             "contact_email",
             "phone",
@@ -17,5 +18,4 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "report_signatory_title",
             "report_signatory_odorbn",
             "created_at",
-            "updated_at",
         ]

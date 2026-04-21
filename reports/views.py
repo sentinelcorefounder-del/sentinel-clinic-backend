@@ -2,19 +2,27 @@ from io import BytesIO
 import os
 
 from django.conf import settings
+from django.core.mail import send_mail
 from django.http import Http404, HttpResponse
+from django.utils import timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
-from rest_framework import generics
+from rest_framework import generics, status
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
 from uploads.models import ImageUpload
 from .models import StructuredReport
-from .permissions import CanManageReports
+from .permissions import (
+    CanManageReports,
+    CanReviewOpsReports,
+    CanSubmitReportToOps,
+)
 from .serializers import StructuredReportSerializer
 
 
@@ -67,6 +75,33 @@ class StructuredReportRulesMixin:
                 "Cannot create or update report until an image is uploaded. If no usable image is available, mark the report as Ungradable or Image Retake."
             )
 
+    def _validate_report_can_be_submitted_to_ops(self, report):
+        missing_items = []
+
+        if not report.patient_id:
+            missing_items.append("patient")
+        if not report.encounter_id:
+            missing_items.append("encounter")
+        if not report.review_date:
+            missing_items.append("review_date")
+
+        consent_status = (report.patient.consent_status or "").strip().lower()
+        if consent_status != "completed":
+            missing_items.append("patient consent")
+
+        has_uploaded_image = self._has_any_uploaded_image(report.encounter)
+        allowed_without_image = bool(report.ungradable) or (
+            (report.urgency_outcome or "").strip().lower() == "image_retake"
+        )
+
+        if not has_uploaded_image and not allowed_without_image:
+            missing_items.append("uploaded image or valid ungradable/image retake outcome")
+
+        if missing_items:
+            raise PermissionDenied(
+                f"Report cannot be submitted to Ops yet. Missing/incomplete: {', '.join(missing_items)}."
+            )
+
 
 class StructuredReportListCreateView(
     StructuredReportRulesMixin, generics.ListCreateAPIView
@@ -80,10 +115,20 @@ class StructuredReportListCreateView(
             "patient__assigned_clinic",
             "encounter",
             "encounter__patient",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
         ).all()
+
+        report_status = self.request.query_params.get("report_status")
+        if report_status:
+            queryset = queryset.filter(report_status=report_status)
 
         user = self.request.user
         if user.is_superuser:
+            return queryset
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             return queryset
 
         org = get_user_organization(user)
@@ -100,6 +145,11 @@ class StructuredReportListCreateView(
         self._validate_report_prerequisites(serializer, patient, encounter)
 
         if user.is_superuser:
+            serializer.save()
+            return
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             serializer.save()
             return
 
@@ -127,10 +177,16 @@ class StructuredReportDetailView(
             "patient__assigned_clinic",
             "encounter",
             "encounter__patient",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
         ).all()
 
         user = self.request.user
         if user.is_superuser:
+            return queryset
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             return queryset
 
         org = get_user_organization(user)
@@ -149,6 +205,11 @@ class StructuredReportDetailView(
         self._validate_report_prerequisites(serializer, patient, encounter)
 
         if user.is_superuser:
+            serializer.save()
+            return
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             serializer.save()
             return
 
@@ -175,10 +236,16 @@ class EncounterReportListView(generics.ListAPIView):
             "patient__assigned_clinic",
             "encounter",
             "encounter__patient",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
         ).filter(encounter_id=encounter_id)
 
         user = self.request.user
         if user.is_superuser:
+            return queryset
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             return queryset
 
         org = get_user_organization(user)
@@ -199,10 +266,16 @@ class PatientReportListView(generics.ListAPIView):
             "patient__assigned_clinic",
             "encounter",
             "encounter__patient",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
         ).filter(patient_id=patient_id)
 
         user = self.request.user
         if user.is_superuser:
+            return queryset
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
             return queryset
 
         org = get_user_organization(user)
@@ -210,6 +283,196 @@ class PatientReportListView(generics.ListAPIView):
             return StructuredReport.objects.none()
 
         return queryset.filter(patient__assigned_clinic=org)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanSubmitReportToOps])
+def submit_report_to_ops(request, pk):
+    try:
+        report = StructuredReport.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+            "encounter",
+        ).get(pk=pk)
+    except StructuredReport.DoesNotExist:
+        raise Http404("Report not found.")
+
+    user = request.user
+
+    if not user.is_superuser:
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" not in user_groups:
+            org = get_user_organization(user)
+            if not org or report.patient.assigned_clinic_id != org.id:
+                raise PermissionDenied("You cannot submit this report to Ops.")
+
+    if report.report_status not in {"draft", "under_review", "signed_off"}:
+        return Response(
+            {
+                "detail": f"Only draft, under_review, or signed_off reports can be submitted to Ops. Current status: {report.report_status}"
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    mixin = StructuredReportRulesMixin()
+    mixin._validate_report_can_be_submitted_to_ops(report)
+
+    report.report_status = "submitted_to_ops"
+    report.submitted_to_ops_at = timezone.now()
+    report.submitted_to_ops_by = user
+    report.save(
+        update_fields=[
+            "report_status",
+            "submitted_to_ops_at",
+            "submitted_to_ops_by",
+            "updated_at",
+        ]
+    )
+
+    return Response(
+        {
+            "message": "Report submitted to Ops successfully.",
+            "report_id": report.report_id,
+            "report_status": report.report_status,
+            "submitted_to_ops_at": report.submitted_to_ops_at,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+def _build_manual_payout_email(report):
+    patient = report.patient
+    clinic = patient.assigned_clinic if patient else None
+
+    patient_name = f"{patient.first_name} {patient.last_name}".strip() if patient else "Unknown Patient"
+    clinic_name = clinic.name if clinic and clinic.name else "Unknown Clinic"
+    encounter_id = report.encounter.encounter_id if report.encounter else "-"
+    payout_outcome = (report.urgency_outcome or "-").replace("_", " ").title()
+
+    subject = f"[Sentinel Manual Payout] Ops approved report {report.report_id}"
+
+    body = f"""
+A Sentinel report has been approved by Ops and is ready for manual payout review.
+
+Report ID: {report.report_id}
+Internal Report PK: {report.pk}
+Patient: {patient_name}
+Patient ID: {patient.patient_id if patient else "-"}
+Clinic: {clinic_name}
+Encounter ID: {encounter_id}
+Review Date: {report.review_date}
+Outcome: {payout_outcome}
+Approved At: {timezone.now().isoformat()}
+
+Please review and process manual payout.
+
+Sentinel
+""".strip()
+
+    return subject, body
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanReviewOpsReports])
+def approve_report_by_ops(request, pk):
+    try:
+        report = StructuredReport.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+            "encounter",
+        ).get(pk=pk)
+    except StructuredReport.DoesNotExist:
+        raise Http404("Report not found.")
+
+    if report.report_status != "submitted_to_ops":
+        return Response(
+            {
+                "detail": f"Only reports submitted to Ops can be approved. Current status: {report.report_status}"
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    report.report_status = "ops_approved"
+    report.ops_reviewed_at = timezone.now()
+    report.ops_reviewed_by = request.user
+    report.ops_review_note = (request.data.get("note") or "").strip()
+    report.save(
+        update_fields=[
+            "report_status",
+            "ops_reviewed_at",
+            "ops_reviewed_by",
+            "ops_review_note",
+            "updated_at",
+        ]
+    )
+
+    subject, body = _build_manual_payout_email(report)
+
+    send_mail(
+        subject=subject,
+        message=body,
+        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+        recipient_list=["sentinel.core.founder@gmail.com"],
+        fail_silently=False,
+    )
+
+    report.payout_email_sent_at = timezone.now()
+    report.save(update_fields=["payout_email_sent_at", "updated_at"])
+
+    return Response(
+        {
+            "message": "Report approved by Ops. Manual payout email sent.",
+            "report_id": report.report_id,
+            "report_status": report.report_status,
+            "payout_email_sent_at": report.payout_email_sent_at,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanReviewOpsReports])
+def reject_report_by_ops(request, pk):
+    try:
+        report = StructuredReport.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+            "encounter",
+        ).get(pk=pk)
+    except StructuredReport.DoesNotExist:
+        raise Http404("Report not found.")
+
+    if report.report_status != "submitted_to_ops":
+        return Response(
+            {
+                "detail": f"Only reports submitted to Ops can be rejected. Current status: {report.report_status}"
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    report.report_status = "ops_rejected"
+    report.ops_reviewed_at = timezone.now()
+    report.ops_reviewed_by = request.user
+    report.ops_review_note = (request.data.get("note") or "").strip()
+    report.save(
+        update_fields=[
+            "report_status",
+            "ops_reviewed_at",
+            "ops_reviewed_by",
+            "ops_review_note",
+            "updated_at",
+        ]
+    )
+
+    return Response(
+        {
+            "message": "Report rejected by Ops.",
+            "report_id": report.report_id,
+            "report_status": report.report_status,
+            "ops_review_note": report.ops_review_note,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 class StructuredReportPDFView(APIView):
@@ -295,9 +558,20 @@ class StructuredReportPDFView(APIView):
 
         user = request.user
         if not user.is_superuser:
-            org = get_user_organization(user)
-            if not org or report.patient.assigned_clinic_id != org.id:
-                raise PermissionDenied("You cannot access this report.")
+            user_groups = set(user.groups.values_list("name", flat=True))
+            if "ops_admin" not in user_groups:
+                org = get_user_organization(user)
+                if not org:
+                    raise PermissionDenied("You cannot access this report.")
+
+                is_clinic_match = report.patient.assigned_clinic_id == org.id
+
+                is_hospital_match = report.hospital_referrals.filter(
+                    source_hospital=org
+                ).exists()
+
+                if not is_clinic_match and not is_hospital_match:
+                    raise PermissionDenied("You cannot access this report.")
 
         patient = report.patient
         encounter = report.encounter

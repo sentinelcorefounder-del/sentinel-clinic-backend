@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
 
@@ -8,6 +9,9 @@ class StructuredReport(models.Model):
         ("draft", "Draft"),
         ("under_review", "Under Review"),
         ("signed_off", "Signed Off"),
+        ("submitted_to_ops", "Submitted to Ops"),
+        ("ops_approved", "Ops Approved"),
+        ("ops_rejected", "Ops Rejected"),
         ("issued", "Issued"),
     ]
 
@@ -47,6 +51,27 @@ class StructuredReport(models.Model):
         default="draft"
     )
     notes = models.TextField(blank=True)
+
+    submitted_to_ops_at = models.DateTimeField(null=True, blank=True)
+    submitted_to_ops_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reports_submitted_to_ops",
+    )
+
+    ops_reviewed_at = models.DateTimeField(null=True, blank=True)
+    ops_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reports_reviewed_by_ops",
+    )
+    ops_review_note = models.TextField(blank=True, default="")
+    payout_email_sent_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -55,7 +80,7 @@ class StructuredReport(models.Model):
 
     def __str__(self):
         return f"{self.report_id} - {self.encounter.encounter_id}"
-    
+
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
         self.encounter.update_status_from_related_records()

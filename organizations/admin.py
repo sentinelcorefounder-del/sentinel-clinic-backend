@@ -4,6 +4,13 @@ from .models import Organization
 
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
-    list_display = ("clinic_id", "name", "contact_email", "is_active", "created_at")
-    search_fields = ("clinic_id", "name", "contact_email")
-    list_filter = ("is_active",)
+    list_display = (
+        "name",
+        "clinic_id",
+        "organization_type",
+        "contact_email",
+        "is_active",
+        "created_at",
+    )
+    list_filter = ("organization_type", "is_active")
+    search_fields = ("name", "clinic_id", "contact_email")

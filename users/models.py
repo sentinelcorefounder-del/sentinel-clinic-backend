@@ -16,7 +16,7 @@ class UserOrganization(models.Model):
     )
 
     def __str__(self):
-        return f"{self.user.username} -> {self.organization.clinic_id}"
+        return f"{self.user.username} -> {self.organization.name} ({self.organization.clinic_id})"
 
 
 class UserSecurityProfile(models.Model):

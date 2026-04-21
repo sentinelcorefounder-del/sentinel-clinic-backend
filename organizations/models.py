@@ -2,10 +2,22 @@ from django.db import models
 
 
 class Organization(models.Model):
+    ORGANIZATION_TYPE_CHOICES = [
+        ("clinic", "Clinic"),
+        ("hospital", "Hospital"),
+        ("sentinel", "Sentinel"),
+    ]
+
     clinic_id = models.CharField(max_length=50, unique=True)
     name = models.CharField(max_length=255)
     contact_email = models.EmailField(blank=True)
     is_active = models.BooleanField(default=True)
+
+    organization_type = models.CharField(
+        max_length=20,
+        choices=ORGANIZATION_TYPE_CHOICES,
+        default="clinic",
+    )
 
     logo = models.ImageField(upload_to="clinic_logos/", blank=True, null=True)
     address = models.TextField(blank=True)

@@ -107,6 +107,8 @@ BASEROW_API_TOKEN = os.environ.get("BASEROW_API_TOKEN", "")
 BASEROW_BASE_URL = os.environ.get("BASEROW_BASE_URL", "https://api.baserow.io")
 BASEROW_PAYMENTS_TABLE_ID = os.environ.get("BASEROW_PAYMENTS_TABLE_ID", "")
 BASEROW_REFERRALS_TABLE_ID = os.environ.get("BASEROW_REFERRALS_TABLE_ID", "")
+BASEROW_HOSPITAL_INTAKE_TABLE_ID = os.environ.get("BASEROW_HOSPITAL_INTAKE_TABLE_ID", "")
+BASEROW_HOSPITALS_TABLE_ID = os.environ.get("BASEROW_HOSPITALS_TABLE_ID", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "no-reply@example.com")
 
@@ -114,5 +116,10 @@ EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", ""))
 EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True") == "True"
+<<<<<<< HEAD
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+=======
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "sentinelhealthops@gmail.com")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+>>>>>>> 1557e02 (Add lean hospital portal flow, hospital referral submit, sync endpoint, and hospital provisioning)
