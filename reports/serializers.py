@@ -14,14 +14,27 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "encounter",
             "patient",
             "review_date",
+
             "dr_grade",
             "maculopathy_grade",
+
+            "left_unaided_va",
+            "left_corrected_va",
+            "left_dr_grade",
+            "left_maculopathy_grade",
+
+            "right_unaided_va",
+            "right_corrected_va",
+            "right_dr_grade",
+            "right_maculopathy_grade",
+
             "ungradable",
             "urgency_outcome",
             "recommendation",
             "next_followup_interval",
             "report_status",
             "notes",
+
             "submitted_to_ops_at",
             "submitted_to_ops_by",
             "submitted_to_ops_by_display",

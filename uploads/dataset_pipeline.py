@@ -37,10 +37,55 @@ def has_ai_training_consent_granted(patient):
     return True
 
 
+def va_is_6_12_or_worse(va_value):
+    value = clean_value(va_value)
+
+    if not value:
+        return False
+
+    very_poor = {"cf", "hm", "pl", "npl"}
+    if value in very_poor:
+        return True
+
+    match = re.match(r"6(\d+)$", value)
+    if not match:
+        return False
+
+    denominator = int(match.group(1))
+    return denominator >= 12
+
+
+def get_eye_report_values(report, eye_laterality):
+    eye = clean_value(eye_laterality)
+
+    if eye == "left":
+        return {
+            "unaided_va": report.left_unaided_va or "",
+            "corrected_va": report.left_corrected_va or "",
+            "dr_grade": report.left_dr_grade or report.dr_grade or "",
+            "maculopathy_grade": report.left_maculopathy_grade or report.maculopathy_grade or "",
+        }
+
+    if eye == "right":
+        return {
+            "unaided_va": report.right_unaided_va or "",
+            "corrected_va": report.right_corrected_va or "",
+            "dr_grade": report.right_dr_grade or report.dr_grade or "",
+            "maculopathy_grade": report.right_maculopathy_grade or report.maculopathy_grade or "",
+        }
+
+    return {
+        "unaided_va": "",
+        "corrected_va": "",
+        "dr_grade": report.dr_grade or "",
+        "maculopathy_grade": report.maculopathy_grade or "",
+    }
+
+
 def normalise_report_urgency(report):
     urgency = clean_value(report.urgency_outcome)
 
-    if urgency in ["urgentreferral", "ophthalmologyrequired"]:
+    if urgency in {"urgentreferral", "ophthalmologyrequired"}:
         return "urgent"
 
     if urgency == "earlyreview":
@@ -52,35 +97,43 @@ def normalise_report_urgency(report):
     return "routine"
 
 
-def clinician_referable_from_report(report):
+def diabetic_referable_from_eye_values(report, eye_values):
     urgency = clean_value(report.urgency_outcome)
-    mac = clean_value(report.maculopathy_grade)
-    dr = clean_value(report.dr_grade)
+    mac = clean_value(eye_values.get("maculopathy_grade"))
+    dr = clean_value(eye_values.get("dr_grade"))
 
     if report.ungradable:
         return True
 
-    if urgency in ["earlyreview", "urgentreferral", "ophthalmologyrequired"]:
+    if urgency in {"earlyreview", "urgentreferral", "ophthalmologyrequired"}:
         return True
 
-    if mac in ["m1", "maculopathy", "maculopathypresent", "present", "yes"]:
+    if mac in {"m1", "maculopathy", "maculopathypresent", "present", "yes"}:
         return True
 
-    if dr in [
+    if dr in {
         "r2",
         "r3",
+        "r3a",
+        "r3s",
         "moderatenpdr",
         "severenpdr",
         "pdr",
         "proliferativedr",
         "proliferativediabeticretinopathy",
-    ]:
+    }:
         return True
 
-    if urgency == "routinefollowup":
-        return False
-
     return False
+
+
+def vision_referral_from_eye_values(eye_values):
+    corrected_va = eye_values.get("corrected_va") or ""
+
+    if va_is_6_12_or_worse(corrected_va):
+        return True, "Corrected/pinhole VA is 6/12 or worse. Full sight test or clinical review recommended."
+
+    return False, ""
 
 
 def ai_referable_from_analysis(ai):
@@ -101,26 +154,22 @@ def ai_referable_from_analysis(ai):
     return None
 
 
-def disagreement_from_report_and_ai(report, ai):
-    clinician_ref = clinician_referable_from_report(report)
+def disagreement_from_values(diabetic_referable, ai):
     ai_ref = ai_referable_from_analysis(ai)
 
     if ai_ref is None:
         return None, "ai_unavailable"
 
-    if clinician_ref is True and ai_ref is False:
+    if diabetic_referable is True and ai_ref is False:
         return False, "ai_missed_referable"
 
-    if clinician_ref is False and ai_ref is True:
+    if diabetic_referable is False and ai_ref is True:
         return False, "ai_overcalled_referable"
-
-    if clinician_ref != ai_ref:
-        return False, "referable_mismatch"
 
     return True, "none"
 
 
-def calculate_quality_score(report, image_upload, ai, disagreement_flag):
+def calculate_quality_score(report, image_upload, ai, disagreement_flag, eye_values):
     score = 100
     image_quality = clean_value(image_upload.image_quality)
 
@@ -134,10 +183,13 @@ def calculate_quality_score(report, image_upload, ai, disagreement_flag):
     if report.ungradable:
         score -= 35
 
-    if not report.dr_grade:
+    if not eye_values.get("dr_grade"):
         score -= 15
 
-    if not report.maculopathy_grade:
+    if not eye_values.get("maculopathy_grade"):
+        score -= 10
+
+    if not eye_values.get("corrected_va"):
         score -= 10
 
     if not ai:
@@ -187,10 +239,21 @@ def sync_dataset_from_report(report):
 
     for image_upload in uploads:
         ai = getattr(image_upload, "ai_analysis", None)
+        eye_values = get_eye_report_values(report, image_upload.eye_laterality)
 
-        clinician_referable = clinician_referable_from_report(report)
-        ai_agreement, disagreement_flag = disagreement_from_report_and_ai(report, ai)
-        quality_score = calculate_quality_score(report, image_upload, ai, disagreement_flag)
+        diabetic_referable = diabetic_referable_from_eye_values(report, eye_values)
+        vision_referral_needed, vision_referral_reason = vision_referral_from_eye_values(eye_values)
+        overall_referable = diabetic_referable or vision_referral_needed
+
+        ai_agreement, disagreement_flag = disagreement_from_values(diabetic_referable, ai)
+
+        quality_score = calculate_quality_score(
+            report,
+            image_upload,
+            ai,
+            disagreement_flag,
+            eye_values,
+        )
         quality_flag = quality_flag_from_score(quality_score)
 
         DatasetLabel.objects.update_or_create(
@@ -201,17 +264,28 @@ def sync_dataset_from_report(report):
                 "patient": patient,
                 "consent_confirmed": True,
                 "image_quality_label": image_upload.image_quality,
-                "dr_grade": report.dr_grade or "unknown",
-                "maculopathy_grade": report.maculopathy_grade or "unknown",
-                "referable": clinician_referable,
+
+                "eye_laterality": image_upload.eye_laterality,
+                "unaided_visual_acuity": eye_values["unaided_va"],
+                "corrected_visual_acuity": eye_values["corrected_va"],
+                "dr_grade": eye_values["dr_grade"] or "unknown",
+                "maculopathy_grade": eye_values["maculopathy_grade"] or "unknown",
+
+                "diabetic_referable": diabetic_referable,
+                "vision_referral_needed": vision_referral_needed,
+                "vision_referral_reason": vision_referral_reason,
+                "referable": overall_referable,
+
                 "referral_urgency": normalise_report_urgency(report),
                 "clinician_notes": report.recommendation or "",
                 "other_findings": report.notes or "",
+
                 "ai_prediction_at_label_time": getattr(ai, "prediction", "") if ai else "",
                 "ai_provider_at_label_time": getattr(ai, "provider", "") if ai else "",
                 "ai_confidence_at_label_time": getattr(ai, "confidence", None) if ai else None,
                 "ai_referable_at_label_time": ai_referable_from_analysis(ai),
                 "ai_raw_response_at_label_time": getattr(ai, "raw_response_json", None) if ai else None,
+
                 "report_status_at_label_time": report.report_status,
                 "quality_score": quality_score,
                 "quality_flag": quality_flag,

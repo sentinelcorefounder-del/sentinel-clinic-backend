@@ -28,12 +28,12 @@ class ImageUpload(models.Model):
     encounter = models.ForeignKey(
         ScreeningEncounter,
         on_delete=models.CASCADE,
-        related_name="image_uploads"
+        related_name="image_uploads",
     )
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
-        related_name="image_uploads"
+        related_name="image_uploads",
     )
     eye_laterality = models.CharField(max_length=10, choices=LATERALITY_CHOICES)
     image_type = models.CharField(max_length=20, choices=IMAGE_TYPE_CHOICES, default="fundus")
@@ -77,19 +77,19 @@ class AIAnalysis(models.Model):
     image_upload = models.OneToOneField(
         ImageUpload,
         on_delete=models.CASCADE,
-        related_name="ai_analysis"
+        related_name="ai_analysis",
     )
 
     encounter = models.ForeignKey(
         ScreeningEncounter,
         on_delete=models.CASCADE,
-        related_name="ai_analyses"
+        related_name="ai_analyses",
     )
 
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
-        related_name="ai_analyses"
+        related_name="ai_analyses",
     )
 
     provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES)
@@ -99,7 +99,7 @@ class AIAnalysis(models.Model):
         max_length=20,
         choices=FUNDUS_STATUS_CHOICES,
         null=True,
-        blank=True
+        blank=True,
     )
 
     prediction = models.CharField(max_length=150, null=True, blank=True)
@@ -163,7 +163,7 @@ class DatasetLabel(models.Model):
     image_upload = models.OneToOneField(
         ImageUpload,
         on_delete=models.CASCADE,
-        related_name="dataset_label"
+        related_name="dataset_label",
     )
 
     source_report = models.ForeignKey(
@@ -171,26 +171,34 @@ class DatasetLabel(models.Model):
         on_delete=models.CASCADE,
         null=True,
         blank=True,
-        related_name="dataset_labels"
+        related_name="dataset_labels",
     )
 
     encounter = models.ForeignKey(
         ScreeningEncounter,
         on_delete=models.CASCADE,
-        related_name="dataset_labels"
+        related_name="dataset_labels",
     )
 
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
-        related_name="dataset_labels"
+        related_name="dataset_labels",
     )
 
     consent_confirmed = models.BooleanField(default=False)
     image_quality_label = models.CharField(max_length=50, default="good")
 
+    eye_laterality = models.CharField(max_length=10, blank=True, default="")
+    unaided_visual_acuity = models.CharField(max_length=20, blank=True, default="")
+    corrected_visual_acuity = models.CharField(max_length=20, blank=True, default="")
+
     dr_grade = models.CharField(max_length=50, blank=True, default="")
     maculopathy_grade = models.CharField(max_length=50, blank=True, default="")
+
+    diabetic_referable = models.BooleanField(default=False)
+    vision_referral_needed = models.BooleanField(default=False)
+    vision_referral_reason = models.CharField(max_length=150, blank=True, default="")
 
     referable = models.BooleanField(default=False)
     referral_urgency = models.CharField(max_length=50, default="routine")
@@ -231,7 +239,7 @@ class DatasetLabel(models.Model):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="dataset_labels_created"
+        related_name="dataset_labels_created",
     )
 
     labelled_at = models.DateTimeField(auto_now=True)

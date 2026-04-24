@@ -2,7 +2,7 @@ import csv
 
 from django.http import HttpResponse
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -25,9 +25,7 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
             "encounter",
             "encounter__patient",
             "encounter__patient__assigned_clinic",
-        ).prefetch_related(
-            "ai_analysis",
-        ).all()
+        ).prefetch_related("ai_analysis").all()
 
         user = self.request.user
         if user.is_superuser:
@@ -41,22 +39,29 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         user = self.request.user
-
-        if user.is_superuser:
-            image_upload = serializer.save()
-            run_ai_analysis(image_upload)
-            return image_upload
-
-        org = get_user_organization(user)
-        if not org:
-            raise PermissionDenied("You are not linked to a clinic organization.")
-
         encounter = serializer.validated_data.get("encounter")
+        eye_laterality = serializer.validated_data.get("eye_laterality")
+
         if not encounter:
             raise PermissionDenied("An encounter is required.")
 
-        if encounter.patient.assigned_clinic_id != org.id:
-            raise PermissionDenied("You cannot upload images for another clinic's encounter.")
+        duplicate_exists = ImageUpload.objects.filter(
+            encounter=encounter,
+            eye_laterality=eye_laterality,
+        ).exists()
+
+        if duplicate_exists:
+            raise ValidationError(
+                f"A {eye_laterality} eye image already exists for this encounter. Delete the existing image before uploading a replacement."
+            )
+
+        if not user.is_superuser:
+            org = get_user_organization(user)
+            if not org:
+                raise PermissionDenied("You are not linked to a clinic organization.")
+
+            if encounter.patient.assigned_clinic_id != org.id:
+                raise PermissionDenied("You cannot upload images for another clinic's encounter.")
 
         image_upload = serializer.save()
         run_ai_analysis(image_upload)
@@ -72,6 +77,9 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
             return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
         except PermissionDenied:
+            raise
+
+        except ValidationError:
             raise
 
         except Exception as exc:
@@ -92,9 +100,7 @@ class ImageUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
             "encounter",
             "encounter__patient",
             "encounter__patient__assigned_clinic",
-        ).prefetch_related(
-            "ai_analysis",
-        ).all()
+        ).prefetch_related("ai_analysis").all()
 
         user = self.request.user
         if user.is_superuser:
@@ -134,9 +140,7 @@ class EncounterImageUploadListView(generics.ListAPIView):
             "encounter",
             "encounter__patient",
             "encounter__patient__assigned_clinic",
-        ).prefetch_related(
-            "ai_analysis",
-        ).filter(encounter_id=encounter_id)
+        ).prefetch_related("ai_analysis").filter(encounter_id=encounter_id)
 
         user = self.request.user
         if user.is_superuser:
@@ -178,9 +182,14 @@ class DatasetTrainingExportView(APIView):
             "eye_laterality",
             "image_type",
             "image_quality_label",
+            "unaided_visual_acuity",
+            "corrected_visual_acuity",
             "dr_grade",
             "maculopathy_grade",
-            "referable",
+            "diabetic_referable",
+            "vision_referral_needed",
+            "vision_referral_reason",
+            "overall_referable",
             "referral_urgency",
             "clinician_notes",
             "other_findings",
@@ -213,8 +222,13 @@ class DatasetTrainingExportView(APIView):
                 label.image_upload.eye_laterality,
                 label.image_upload.image_type,
                 label.image_quality_label,
+                label.unaided_visual_acuity,
+                label.corrected_visual_acuity,
                 label.dr_grade,
                 label.maculopathy_grade,
+                label.diabetic_referable,
+                label.vision_referral_needed,
+                label.vision_referral_reason,
                 label.referable,
                 label.referral_urgency,
                 label.clinician_notes,
