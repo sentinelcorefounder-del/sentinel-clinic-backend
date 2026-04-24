@@ -1,4 +1,9 @@
 from datetime import date
+import re
+
+
+def clean_value(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
 
 
 def latest_ai_training_consent(patient):
@@ -33,48 +38,47 @@ def has_ai_training_consent_granted(patient):
 
 
 def normalise_report_urgency(report):
-    urgency = (report.urgency_outcome or "").strip().lower()
+    urgency = clean_value(report.urgency_outcome)
 
-    if urgency in ["urgent_referral", "ophthalmology_required"]:
+    if urgency in ["urgentreferral", "ophthalmologyrequired"]:
         return "urgent"
 
-    if urgency in ["early_review"]:
+    if urgency == "earlyreview":
         return "priority"
 
-    if urgency in ["image_retake"]:
+    if urgency == "imageretake":
         return "not_required"
 
     return "routine"
 
 
 def clinician_referable_from_report(report):
-    urgency = (report.urgency_outcome or "").strip().lower()
-    mac = (report.maculopathy_grade or "").strip().lower()
-    dr = (report.dr_grade or "").strip().lower()
+    urgency = clean_value(report.urgency_outcome)
+    mac = clean_value(report.maculopathy_grade)
+    dr = clean_value(report.dr_grade)
 
     if report.ungradable:
         return True
 
-    if urgency in ["early_review", "urgent_referral", "ophthalmology_required"]:
+    if urgency in ["earlyreview", "urgentreferral", "ophthalmologyrequired"]:
         return True
 
-    if urgency == "routine_followup":
-        return False
-
-    if mac in ["m1", "maculopathy", "maculopathy present", "present"]:
+    if mac in ["m1", "maculopathy", "maculopathypresent", "present", "yes"]:
         return True
 
     if dr in [
-        "moderate_npdr",
-        "moderate npdr",
-        "severe_npdr",
-        "severe npdr",
-        "pdr",
-        "proliferative dr",
         "r2",
         "r3",
+        "moderatenpdr",
+        "severenpdr",
+        "pdr",
+        "proliferativedr",
+        "proliferativediabeticretinopathy",
     ]:
         return True
+
+    if urgency == "routinefollowup":
+        return False
 
     return False
 
@@ -86,9 +90,9 @@ def ai_referable_from_analysis(ai):
     if ai.referable is not None:
         return ai.referable
 
-    prediction = (ai.prediction or "").strip().lower()
+    prediction = clean_value(ai.prediction)
 
-    if "no referable" in prediction:
+    if "noreferable" in prediction:
         return False
 
     if "referable" in prediction:
@@ -118,8 +122,7 @@ def disagreement_from_report_and_ai(report, ai):
 
 def calculate_quality_score(report, image_upload, ai, disagreement_flag):
     score = 100
-
-    image_quality = (image_upload.image_quality or "").strip().lower()
+    image_quality = clean_value(image_upload.image_quality)
 
     if image_quality == "acceptable":
         score -= 10
@@ -147,8 +150,7 @@ def calculate_quality_score(report, image_upload, ai, disagreement_flag):
     elif disagreement_flag and disagreement_flag != "none":
         score -= 20
 
-    score = max(0, min(100, score))
-    return score
+    return max(0, min(100, score))
 
 
 def quality_flag_from_score(score):
@@ -186,6 +188,7 @@ def sync_dataset_from_report(report):
     for image_upload in uploads:
         ai = getattr(image_upload, "ai_analysis", None)
 
+        clinician_referable = clinician_referable_from_report(report)
         ai_agreement, disagreement_flag = disagreement_from_report_and_ai(report, ai)
         quality_score = calculate_quality_score(report, image_upload, ai, disagreement_flag)
         quality_flag = quality_flag_from_score(quality_score)
@@ -200,7 +203,7 @@ def sync_dataset_from_report(report):
                 "image_quality_label": image_upload.image_quality,
                 "dr_grade": report.dr_grade or "unknown",
                 "maculopathy_grade": report.maculopathy_grade or "unknown",
-                "referable": clinician_referable_from_report(report),
+                "referable": clinician_referable,
                 "referral_urgency": normalise_report_urgency(report),
                 "clinician_notes": report.recommendation or "",
                 "other_findings": report.notes or "",
