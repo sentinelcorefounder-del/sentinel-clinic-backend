@@ -128,3 +128,21 @@ EMAIL_PORT = int(os.environ.get("EMAIL_PORT", 587))
 EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True") == "True"
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "sentinelhealthops@gmail.com")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+# -------------------------------
+# AI INTEGRATION
+# -------------------------------
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "sentinel")
+
+# Sentinel AI Flask backend
+SENTINEL_AI_BASE_URL = os.environ.get(
+    "SENTINEL_AI_BASE_URL",
+    "https://sentinel-ai1.onrender.com"
+)
+SENTINEL_AI_ANALYZE_PATH = os.environ.get(
+    "SENTINEL_AI_ANALYZE_PATH",
+    "/analyze"
+)
+
+# OpenAI Vision support
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini")

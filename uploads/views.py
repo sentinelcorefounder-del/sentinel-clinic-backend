@@ -7,6 +7,7 @@ from common.tenant import get_user_organization
 from .models import ImageUpload
 from .serializers import ImageUploadSerializer
 from .permissions import CanManageUploads
+from .ai_services import run_ai_analysis
 
 
 class ImageUploadListCreateView(generics.ListCreateAPIView):
@@ -35,8 +36,9 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
         user = self.request.user
 
         if user.is_superuser:
-            serializer.save()
-            return
+            image_upload = serializer.save()
+            run_ai_analysis(image_upload)
+            return image_upload
 
         org = get_user_organization(user)
         if not org:
@@ -49,16 +51,22 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
         if encounter.patient.assigned_clinic_id != org.id:
             raise PermissionDenied("You cannot upload images for another clinic's encounter.")
 
-        serializer.save()
+        image_upload = serializer.save()
+        run_ai_analysis(image_upload)
+        return image_upload
 
     def create(self, request, *args, **kwargs):
         try:
             serializer = self.get_serializer(data=request.data)
             serializer.is_valid(raise_exception=True)
-            self.perform_create(serializer)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            image_upload = self.perform_create(serializer)
+
+            response_serializer = self.get_serializer(image_upload)
+            return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
         except PermissionDenied:
             raise
+
         except Exception as exc:
             print("UPLOAD ERROR:", repr(exc))
             return Response(
