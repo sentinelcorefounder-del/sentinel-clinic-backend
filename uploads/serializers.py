@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import ImageUpload, AIAnalysis
+from .models import ImageUpload, AIAnalysis, DatasetLabel
 
 
 class AIAnalysisSerializer(serializers.ModelSerializer):
@@ -30,9 +30,55 @@ class AIAnalysisSerializer(serializers.ModelSerializer):
         ]
 
 
+class DatasetLabelSerializer(serializers.ModelSerializer):
+    labelled_by_username = serializers.CharField(
+        source="labelled_by.username",
+        read_only=True
+    )
+
+    class Meta:
+        model = DatasetLabel
+        fields = [
+            "id",
+            "label_id",
+            "image_upload",
+            "encounter",
+            "patient",
+            "consent_confirmed",
+            "image_quality_label",
+            "dr_grade",
+            "maculopathy_grade",
+            "referable",
+            "referral_urgency",
+            "clinician_notes",
+            "other_findings",
+            "ai_prediction_at_label_time",
+            "ai_provider_at_label_time",
+            "ai_confidence_at_label_time",
+            "labelled_by",
+            "labelled_by_username",
+            "labelled_at",
+            "created_at",
+        ]
+        read_only_fields = [
+            "label_id",
+            "encounter",
+            "patient",
+            "consent_confirmed",
+            "ai_prediction_at_label_time",
+            "ai_provider_at_label_time",
+            "ai_confidence_at_label_time",
+            "labelled_by",
+            "labelled_by_username",
+            "labelled_at",
+            "created_at",
+        ]
+
+
 class ImageUploadSerializer(serializers.ModelSerializer):
     image_file = serializers.ImageField(use_url=True)
     ai_analysis = AIAnalysisSerializer(read_only=True)
+    dataset_label = DatasetLabelSerializer(read_only=True)
 
     class Meta:
         model = ImageUpload
@@ -49,4 +95,5 @@ class ImageUploadSerializer(serializers.ModelSerializer):
             "retake_required",
             "uploaded_at",
             "ai_analysis",
+            "dataset_label",
         ]

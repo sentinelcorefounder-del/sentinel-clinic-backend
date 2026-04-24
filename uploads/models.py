@@ -1,4 +1,5 @@
 from django.db import models
+from django.contrib.auth.models import User
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
 import uuid
@@ -61,6 +62,7 @@ class AIAnalysis(models.Model):
     PROVIDER_CHOICES = [
         ("openai", "OpenAI"),
         ("sentinel", "Sentinel AI"),
+        ("hybrid", "Hybrid AI"),
     ]
 
     FUNDUS_STATUS_CHOICES = [
@@ -134,3 +136,95 @@ class AIAnalysis(models.Model):
 
     def __str__(self):
         return f"{self.analysis_id} - {self.provider}"
+
+
+class DatasetLabel(models.Model):
+    DR_GRADE_CHOICES = [
+        ("no_dr", "No DR"),
+        ("mild_npdr", "Mild NPDR"),
+        ("moderate_npdr", "Moderate NPDR"),
+        ("severe_npdr", "Severe NPDR"),
+        ("pdr", "Proliferative DR"),
+        ("ungradable", "Ungradable"),
+        ("other", "Other"),
+    ]
+
+    MACULOPATHY_CHOICES = [
+        ("m0", "M0 - No maculopathy"),
+        ("m1", "M1 - Maculopathy present / suspected"),
+        ("unknown", "Unknown"),
+    ]
+
+    URGENCY_CHOICES = [
+        ("routine", "Routine"),
+        ("priority", "Priority"),
+        ("urgent", "Urgent"),
+        ("not_required", "Not Required"),
+    ]
+
+    label_id = models.CharField(max_length=30, unique=True, blank=True)
+
+    image_upload = models.OneToOneField(
+        ImageUpload,
+        on_delete=models.CASCADE,
+        related_name="dataset_label"
+    )
+
+    encounter = models.ForeignKey(
+        ScreeningEncounter,
+        on_delete=models.CASCADE,
+        related_name="dataset_labels"
+    )
+
+    patient = models.ForeignKey(
+        Patient,
+        on_delete=models.CASCADE,
+        related_name="dataset_labels"
+    )
+
+    consent_confirmed = models.BooleanField(default=False)
+    image_quality_label = models.CharField(max_length=50, default="good")
+
+    dr_grade = models.CharField(max_length=50, choices=DR_GRADE_CHOICES)
+    maculopathy_grade = models.CharField(
+        max_length=20,
+        choices=MACULOPATHY_CHOICES,
+        default="unknown"
+    )
+
+    referable = models.BooleanField(default=False)
+    referral_urgency = models.CharField(
+        max_length=30,
+        choices=URGENCY_CHOICES,
+        default="routine"
+    )
+
+    clinician_notes = models.TextField(blank=True, default="")
+    other_findings = models.TextField(blank=True, default="")
+
+    ai_prediction_at_label_time = models.CharField(max_length=150, blank=True, default="")
+    ai_provider_at_label_time = models.CharField(max_length=50, blank=True, default="")
+    ai_confidence_at_label_time = models.FloatField(null=True, blank=True)
+    ai_raw_response_at_label_time = models.JSONField(null=True, blank=True)
+
+    labelled_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="dataset_labels_created"
+    )
+
+    labelled_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-labelled_at"]
+
+    def save(self, *args, **kwargs):
+        if not self.label_id:
+            self.label_id = f"LBL-{uuid.uuid4().hex[:10].upper()}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.label_id} - {self.image_upload.image_upload_id}"
