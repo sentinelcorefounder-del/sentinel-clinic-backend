@@ -12,6 +12,14 @@ from django.utils import timezone
 
 from .models import AIAnalysis, ImageUpload
 
+GLOBAL_AI_DISCLAIMER = (
+    "Sentinel AI evaluates retinal images only for diabetic retinopathy referral risk. "
+    "It is not designed to detect, diagnose, or rule out other retinal or ophthalmic conditions. "
+    "As a result, images with non-diabetic retinal abnormalities may still be classified as referable "
+    "or non-referable diabetic retinopathy. This tool is intended for research and decision support only "
+    "and must not replace clinical assessment by a qualified eye care professional."
+)
+
 
 SENTINEL_CONFIDENCE_DISPLAY_THRESHOLD = 0.80
 OPENAI_IMAGE_MAX_SIZE = 1280
@@ -237,7 +245,7 @@ def analyze_with_sentinel_ai(image_upload: ImageUpload):
         analysis.severity = normalized["severity"]
         analysis.severity_label = normalized["severity_label"]
         analysis.message = normalized["message"]
-        analysis.disclaimer = normalized["disclaimer"]
+        analysis.disclaimer = GLOBAL_AI_DISCLAIMER 
         analysis.heatmap_url = normalized["heatmap_url"]
         analysis.processed_image_url = normalized["processed_image_url"]
         analysis.raw_response_json = normalized["raw"]
@@ -279,7 +287,7 @@ def analyze_with_openai(image_upload: ImageUpload):
         analysis.suggested_review_priority = data.get("suggested_review_priority")
         analysis.message = data.get("limitations")
         analysis.draft_note = data.get("draft_note")
-        analysis.disclaimer = "OpenAI output is for clinician review only and is not a diagnosis."
+        analysis.disclaimer = GLOBAL_AI_DISCLAIMER
         analysis.raw_response_json = data
         analysis.model_version = settings.OPENAI_VISION_MODEL
         analysis.analyzed_at = timezone.now()
@@ -353,10 +361,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
                     "OpenAI clinician-support observation is shown as the primary AI note because Sentinel AI triggered the hybrid safety rule."
                 )
                 analysis.draft_note = openai_data.get("draft_note")
-                analysis.disclaimer = (
-                    "Hybrid AI output is for clinician review only. Sentinel AI output is stored in the audit trail; OpenAI is shown because a safety trigger was met."
-                )
-
+                analysis.disclaimer = GLOBAL_AI_DISCLAIMER 
             except Exception as openai_exc:
                 raw_combined["openai_error"] = str(openai_exc)
 
@@ -378,8 +383,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
                     "Clinician review required. Sentinel AI result is stored in the audit trail "
                     "but not shown as the primary result because a hybrid safety rule was triggered."
                 )
-                analysis.disclaimer = "OpenAI support failed. Clinician review is required."
-
+                analysis.disclaimer = GLOBAL_AI_DISCLAIMER
         else:
             analysis.ai_status = "completed"
             analysis.fundus_status = sentinel_normalized["fundus_status"]
@@ -389,9 +393,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
             analysis.severity = sentinel_normalized["severity"]
             analysis.severity_label = sentinel_normalized["severity_label"]
             analysis.message = sentinel_normalized["message"]
-            analysis.disclaimer = (
-                "Sentinel AI output is shown because no hybrid safety trigger was met. Clinician review is still required."
-            )
+            analysis.disclaimer = GLOBAL_AI_DISCLAIMER 
             analysis.risk_flag = "low"
             analysis.suggested_review_priority = "routine"
             analysis.draft_note = (
