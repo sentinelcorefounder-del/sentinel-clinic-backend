@@ -108,13 +108,12 @@ def should_use_openai_as_primary(sentinel_normalized):
 
 
 def image_file_to_data_url(image_upload: ImageUpload):
-    file_path = image_upload.image_file.path
-    mime_type, _ = mimetypes.guess_type(file_path)
+    mime_type, _ = mimetypes.guess_type(image_upload.image_file.name)
 
     if not mime_type:
         mime_type = "image/jpeg"
 
-    with open(file_path, "rb") as image_file:
+    with image_upload.image_file.open("rb") as image_file:
         encoded = base64.b64encode(image_file.read()).decode("utf-8")
 
     return f"data:{mime_type};base64,{encoded}"
