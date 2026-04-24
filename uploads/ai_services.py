@@ -131,22 +131,15 @@ def should_use_openai_as_primary(sentinel_normalized):
 
 
 def image_file_to_data_url(image_upload: ImageUpload):
-    with image_upload.image_file.open("rb") as f:
-        img = Image.open(f).convert("RGB")
+    mime_type, _ = mimetypes.guess_type(image_upload.image_file.name)
 
-    img.thumbnail((OPENAI_IMAGE_MAX_SIZE, OPENAI_IMAGE_MAX_SIZE))
+    if not mime_type:
+        mime_type = "image/jpeg"
 
-    buffer = io.BytesIO()
-    img.save(
-        buffer,
-        format="JPEG",
-        quality=OPENAI_IMAGE_JPEG_QUALITY,
-        optimize=True,
-    )
-    buffer.seek(0)
+    with image_upload.image_file.open("rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("utf-8")
 
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def call_openai_for_observation(image_upload: ImageUpload, sentinel_context=None):
