@@ -139,27 +139,21 @@ class AIAnalysis(models.Model):
 
 
 class DatasetLabel(models.Model):
-    DR_GRADE_CHOICES = [
-        ("no_dr", "No DR"),
-        ("mild_npdr", "Mild NPDR"),
-        ("moderate_npdr", "Moderate NPDR"),
-        ("severe_npdr", "Severe NPDR"),
-        ("pdr", "Proliferative DR"),
-        ("ungradable", "Ungradable"),
-        ("other", "Other"),
+    QUALITY_FLAG_CHOICES = [
+        ("high", "High"),
+        ("medium", "Medium"),
+        ("low", "Low"),
     ]
 
-    MACULOPATHY_CHOICES = [
-        ("m0", "M0 - No maculopathy"),
-        ("m1", "M1 - Maculopathy present / suspected"),
-        ("unknown", "Unknown"),
+    DISAGREEMENT_CHOICES = [
+        ("none", "None"),
+        ("ai_unavailable", "AI Unavailable"),
+        ("referable_mismatch", "Referable Mismatch"),
     ]
 
-    URGENCY_CHOICES = [
-        ("routine", "Routine"),
-        ("priority", "Priority"),
-        ("urgent", "Urgent"),
-        ("not_required", "Not Required"),
+    LABEL_SOURCE_CHOICES = [
+        ("report_auto", "Report Auto"),
+        ("manual_admin", "Manual Admin"),
     ]
 
     label_id = models.CharField(max_length=30, unique=True, blank=True)
@@ -168,6 +162,14 @@ class DatasetLabel(models.Model):
         ImageUpload,
         on_delete=models.CASCADE,
         related_name="dataset_label"
+    )
+
+    source_report = models.ForeignKey(
+        "reports.StructuredReport",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="dataset_labels"
     )
 
     encounter = models.ForeignKey(
@@ -185,19 +187,11 @@ class DatasetLabel(models.Model):
     consent_confirmed = models.BooleanField(default=False)
     image_quality_label = models.CharField(max_length=50, default="good")
 
-    dr_grade = models.CharField(max_length=50, choices=DR_GRADE_CHOICES)
-    maculopathy_grade = models.CharField(
-        max_length=20,
-        choices=MACULOPATHY_CHOICES,
-        default="unknown"
-    )
+    dr_grade = models.CharField(max_length=50, blank=True, default="")
+    maculopathy_grade = models.CharField(max_length=50, blank=True, default="")
 
     referable = models.BooleanField(default=False)
-    referral_urgency = models.CharField(
-        max_length=30,
-        choices=URGENCY_CHOICES,
-        default="routine"
-    )
+    referral_urgency = models.CharField(max_length=50, default="routine")
 
     clinician_notes = models.TextField(blank=True, default="")
     other_findings = models.TextField(blank=True, default="")
@@ -205,7 +199,30 @@ class DatasetLabel(models.Model):
     ai_prediction_at_label_time = models.CharField(max_length=150, blank=True, default="")
     ai_provider_at_label_time = models.CharField(max_length=50, blank=True, default="")
     ai_confidence_at_label_time = models.FloatField(null=True, blank=True)
+    ai_referable_at_label_time = models.BooleanField(null=True, blank=True)
     ai_raw_response_at_label_time = models.JSONField(null=True, blank=True)
+
+    report_status_at_label_time = models.CharField(max_length=50, blank=True, default="")
+
+    quality_score = models.FloatField(null=True, blank=True)
+    quality_flag = models.CharField(
+        max_length=20,
+        choices=QUALITY_FLAG_CHOICES,
+        default="medium",
+    )
+
+    ai_clinician_agreement = models.BooleanField(null=True, blank=True)
+    disagreement_flag = models.CharField(
+        max_length=50,
+        choices=DISAGREEMENT_CHOICES,
+        default="none",
+    )
+
+    label_source = models.CharField(
+        max_length=30,
+        choices=LABEL_SOURCE_CHOICES,
+        default="report_auto",
+    )
 
     labelled_by = models.ForeignKey(
         User,

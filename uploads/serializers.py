@@ -42,6 +42,7 @@ class DatasetLabelSerializer(serializers.ModelSerializer):
             "id",
             "label_id",
             "image_upload",
+            "source_report",
             "encounter",
             "patient",
             "consent_confirmed",
@@ -55,19 +56,13 @@ class DatasetLabelSerializer(serializers.ModelSerializer):
             "ai_prediction_at_label_time",
             "ai_provider_at_label_time",
             "ai_confidence_at_label_time",
-            "labelled_by",
-            "labelled_by_username",
-            "labelled_at",
-            "created_at",
-        ]
-        read_only_fields = [
-            "label_id",
-            "encounter",
-            "patient",
-            "consent_confirmed",
-            "ai_prediction_at_label_time",
-            "ai_provider_at_label_time",
-            "ai_confidence_at_label_time",
+            "ai_referable_at_label_time",
+            "report_status_at_label_time",
+            "quality_score",
+            "quality_flag",
+            "ai_clinician_agreement",
+            "disagreement_flag",
+            "label_source",
             "labelled_by",
             "labelled_by_username",
             "labelled_at",
@@ -78,7 +73,6 @@ class DatasetLabelSerializer(serializers.ModelSerializer):
 class ImageUploadSerializer(serializers.ModelSerializer):
     image_file = serializers.ImageField(use_url=True)
     ai_analysis = AIAnalysisSerializer(read_only=True)
-    dataset_label = DatasetLabelSerializer(read_only=True)
 
     class Meta:
         model = ImageUpload
@@ -95,5 +89,4 @@ class ImageUploadSerializer(serializers.ModelSerializer):
             "retake_required",
             "uploaded_at",
             "ai_analysis",
-            "dataset_label",
         ]
