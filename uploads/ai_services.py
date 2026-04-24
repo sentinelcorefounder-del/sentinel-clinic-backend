@@ -4,7 +4,9 @@ import mimetypes
 import os
 import uuid
 import requests
+import io
 
+from PIL import Image
 from django.conf import settings
 from django.utils import timezone
 
@@ -12,6 +14,8 @@ from .models import AIAnalysis, ImageUpload
 
 
 SENTINEL_CONFIDENCE_DISPLAY_THRESHOLD = 0.80
+OPENAI_IMAGE_MAX_SIZE = 768
+OPENAI_IMAGE_JPEG_QUALITY = 85
 
 
 def build_absolute_url(base_url, path):
@@ -97,6 +101,25 @@ def normalize_sentinel_result(data):
 
 def should_use_openai_as_primary(sentinel_normalized):
     confidence = sentinel_normalized.get("confidence")
+    severity = sentinel_normalized.get("severity")
+    prediction = sentinel_normalized.get("prediction")
+    fundus_status = sentinel_normalized.get("fundus_status")
+    referable = sentinel_normalized.get("referable")
+
+    if fundus_status in ["rejected", "uncertain", "error"]:
+        return True
+
+    if prediction == "Referable DR":
+        return True
+
+    if referable is True:
+        return True
+
+    try:
+        if severity is not None and int(severity) >= 1:
+            return True
+    except Exception:
+        return True
 
     if confidence is None:
         return True
@@ -107,23 +130,22 @@ def should_use_openai_as_primary(sentinel_normalized):
         return True
 
 
-from PIL import Image
-import io
-
-
 def image_file_to_data_url(image_upload: ImageUpload):
     with image_upload.image_file.open("rb") as f:
         img = Image.open(f).convert("RGB")
 
-    # 🔥 Resize logic (cost optimisation)
-    max_size = 768
-    img.thumbnail((max_size, max_size))
+    img.thumbnail((OPENAI_IMAGE_MAX_SIZE, OPENAI_IMAGE_MAX_SIZE))
 
-    # Save to buffer
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    img.save(
+        buffer,
+        format="JPEG",
+        quality=OPENAI_IMAGE_JPEG_QUALITY,
+        optimize=True,
+    )
+    buffer.seek(0)
 
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{encoded}"
 
 
@@ -300,8 +322,9 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
             "openai_triggered": use_openai_primary,
             "openai": None,
             "display_policy": {
-                "rule": "Below 80% Sentinel confidence = OpenAI is shown as primary clinician-support output.",
+                "rule": "OpenAI is shown as primary clinician-support output if Sentinel confidence is below 80%, or if Sentinel detects uncertainty, mild-or-above severity, or referable features.",
                 "sentinel_confidence": sentinel_normalized.get("confidence"),
+                "sentinel_severity": sentinel_normalized.get("severity"),
                 "threshold": SENTINEL_CONFIDENCE_DISPLAY_THRESHOLD,
             },
         }
@@ -334,13 +357,11 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
                     openai_data.get("suggested_review_priority") or "priority"
                 )
                 analysis.message = (
-                    "Sentinel AI confidence was below the 80% safety threshold. "
-                    "OpenAI clinician-support observation is shown as the primary AI note."
+                    "OpenAI clinician-support observation is shown as the primary AI note because Sentinel AI triggered the hybrid safety rule."
                 )
                 analysis.draft_note = openai_data.get("draft_note")
                 analysis.disclaimer = (
-                    "Hybrid AI output is for clinician review only. "
-                    "Sentinel AI output is stored in the audit trail; OpenAI is shown because Sentinel confidence was below threshold."
+                    "Hybrid AI output is for clinician review only. Sentinel AI output is stored in the audit trail; OpenAI is shown because a safety trigger was met."
                 )
 
             except Exception as openai_exc:
@@ -357,16 +378,14 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
                 analysis.risk_flag = "review_needed"
                 analysis.suggested_review_priority = "priority"
                 analysis.message = (
-                    "Sentinel AI confidence was below the 80% safety threshold, "
+                    "A hybrid safety rule was triggered, "
                     f"but OpenAI support failed: {str(openai_exc)}"
                 )
                 analysis.draft_note = (
                     "Clinician review required. Sentinel AI result is stored in the audit trail "
-                    "but not shown as the primary result because confidence was below threshold."
+                    "but not shown as the primary result because a hybrid safety rule was triggered."
                 )
-                analysis.disclaimer = (
-                    "OpenAI support failed. Clinician review is required."
-                )
+                analysis.disclaimer = "OpenAI support failed. Clinician review is required."
 
         else:
             analysis.ai_status = "completed"
@@ -378,13 +397,12 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
             analysis.severity_label = sentinel_normalized["severity_label"]
             analysis.message = sentinel_normalized["message"]
             analysis.disclaimer = (
-                "Sentinel AI output is shown because confidence was above the 80% threshold. "
-                "Clinician review is still required."
+                "Sentinel AI output is shown because no hybrid safety trigger was met. Clinician review is still required."
             )
             analysis.risk_flag = "low"
             analysis.suggested_review_priority = "routine"
             analysis.draft_note = (
-                "Sentinel AI confidence was above the safety threshold. "
+                "Sentinel AI confidence was above the safety threshold and severity was normal. "
                 "No OpenAI support note was generated. Clinician review is still required."
             )
 
