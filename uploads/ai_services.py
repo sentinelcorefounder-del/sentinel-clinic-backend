@@ -14,8 +14,8 @@ from .models import AIAnalysis, ImageUpload
 
 
 SENTINEL_CONFIDENCE_DISPLAY_THRESHOLD = 0.80
-OPENAI_IMAGE_MAX_SIZE = 768
-OPENAI_IMAGE_JPEG_QUALITY = 85
+OPENAI_IMAGE_MAX_SIZE = 1280
+OPENAI_IMAGE_JPEG_QUALITY = 90
 
 
 def build_absolute_url(base_url, path):
