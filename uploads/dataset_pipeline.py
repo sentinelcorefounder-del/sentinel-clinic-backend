@@ -58,10 +58,22 @@ def clinician_referable_from_report(report):
     if urgency in ["early_review", "urgent_referral", "ophthalmology_required"]:
         return True
 
+    if urgency == "routine_followup":
+        return False
+
     if mac in ["m1", "maculopathy", "maculopathy present", "present"]:
         return True
 
-    if dr in ["moderate_npdr", "moderate npdr", "severe_npdr", "severe npdr", "pdr", "proliferative dr"]:
+    if dr in [
+        "moderate_npdr",
+        "moderate npdr",
+        "severe_npdr",
+        "severe npdr",
+        "pdr",
+        "proliferative dr",
+        "r2",
+        "r3",
+    ]:
         return True
 
     return False
@@ -76,13 +88,32 @@ def ai_referable_from_analysis(ai):
 
     prediction = (ai.prediction or "").strip().lower()
 
-    if "referable" in prediction and "no referable" not in prediction:
-        return True
-
     if "no referable" in prediction:
         return False
 
+    if "referable" in prediction:
+        return True
+
     return None
+
+
+def disagreement_from_report_and_ai(report, ai):
+    clinician_ref = clinician_referable_from_report(report)
+    ai_ref = ai_referable_from_analysis(ai)
+
+    if ai_ref is None:
+        return None, "ai_unavailable"
+
+    if clinician_ref is True and ai_ref is False:
+        return False, "ai_missed_referable"
+
+    if clinician_ref is False and ai_ref is True:
+        return False, "ai_overcalled_referable"
+
+    if clinician_ref != ai_ref:
+        return False, "referable_mismatch"
+
+    return True, "none"
 
 
 def calculate_quality_score(report, image_upload, ai, disagreement_flag):
@@ -109,7 +140,11 @@ def calculate_quality_score(report, image_upload, ai, disagreement_flag):
     if not ai:
         score -= 10
 
-    if disagreement_flag and disagreement_flag != "none":
+    if disagreement_flag == "ai_missed_referable":
+        score -= 35
+    elif disagreement_flag == "ai_overcalled_referable":
+        score -= 20
+    elif disagreement_flag and disagreement_flag != "none":
         score -= 20
 
     score = max(0, min(100, score))
@@ -122,19 +157,6 @@ def quality_flag_from_score(score):
     if score >= 60:
         return "medium"
     return "low"
-
-
-def disagreement_from_report_and_ai(report, ai):
-    clinician_ref = clinician_referable_from_report(report)
-    ai_ref = ai_referable_from_analysis(ai)
-
-    if ai_ref is None:
-        return None, "ai_unavailable"
-
-    if clinician_ref != ai_ref:
-        return False, "referable_mismatch"
-
-    return True, "none"
 
 
 def sync_dataset_from_report(report):

@@ -149,6 +149,8 @@ class DatasetLabel(models.Model):
         ("none", "None"),
         ("ai_unavailable", "AI Unavailable"),
         ("referable_mismatch", "Referable Mismatch"),
+        ("ai_missed_referable", "AI Missed Referable"),
+        ("ai_overcalled_referable", "AI Overcalled Referable"),
     ]
 
     LABEL_SOURCE_CHOICES = [
