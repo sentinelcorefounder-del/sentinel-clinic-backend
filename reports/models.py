@@ -83,4 +83,14 @@ class StructuredReport(models.Model):
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        self.encounter.update_status_from_related_records()
+
+        try:
+            self.encounter.update_status_from_related_records()
+        except Exception as exc:
+            print("StructuredReport encounter status update failed:", exc)
+
+        try:
+            from uploads.dataset_pipeline import sync_dataset_from_report
+            sync_dataset_from_report(self)
+        except Exception as exc:
+            print("StructuredReport dataset sync failed:", exc)
