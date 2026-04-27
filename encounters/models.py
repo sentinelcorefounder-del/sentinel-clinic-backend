@@ -17,17 +17,21 @@ class ScreeningEncounter(models.Model):
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
-        related_name="encounters"
+        related_name="encounters",
     )
     encounter_date = models.DateField()
     encounter_type = models.CharField(max_length=50, default="diabetic_eye_screening")
     screening_status = models.CharField(
         max_length=30,
         choices=STATUS_CHOICES,
-        default="scheduled"
+        default="scheduled",
     )
+
+    # Kept for database/backwards compatibility only.
+    # VA should now be recorded on StructuredReport by laterality.
     visual_acuity_left = models.CharField(max_length=20, blank=True)
     visual_acuity_right = models.CharField(max_length=20, blank=True)
+
     diabetes_duration = models.CharField(max_length=50, blank=True)
     symptoms_notes = models.TextField(blank=True)
     clinical_notes = models.TextField(blank=True)
@@ -39,21 +43,34 @@ class ScreeningEncounter(models.Model):
 
     def __str__(self):
         return f"{self.encounter_id} - {self.patient}"
-    
+
     def update_status_from_related_records(self):
+        """
+        Single source of truth for encounter status movement.
+
+        Desired behaviour:
+        - image uploaded -> images_uploaded
+        - report created -> under_review
+        - report issued/submitted_to_ops/ops_approved -> completed
+        """
+        if self.screening_status == "cancelled":
+            return
+
         has_uploads = self.image_uploads.exists()
         has_reports = self.reports.exists()
-        has_issued_report = self.reports.filter(report_status="issued").exists()
+        has_completed_report = self.reports.filter(
+            report_status__in=["issued", "submitted_to_ops", "ops_approved"]
+        ).exists()
 
-        if has_issued_report:
+        if has_completed_report:
             new_status = "completed"
         elif has_reports:
             new_status = "under_review"
         elif has_uploads:
             new_status = "images_uploaded"
         else:
-            return
+            new_status = "scheduled"
 
         if self.screening_status != new_status:
             self.screening_status = new_status
-            self.save(update_fields=["screening_status", "updated_at"])   
+            self.save(update_fields=["screening_status", "updated_at"])

@@ -75,11 +75,11 @@ class StructuredReport(models.Model):
 
     review_date = models.DateField()
 
-    # Legacy whole-report fields kept for backwards compatibility
+    # Legacy fields retained only so old DB rows/migrations do not break.
+    # Do not use these in the active UI/PDF/dataset logic.
     dr_grade = models.CharField(max_length=50, blank=True)
     maculopathy_grade = models.CharField(max_length=50, blank=True)
 
-    # Eye-specific VA and grading
     left_unaided_va = models.CharField(max_length=20, choices=VA_CHOICES, blank=True)
     left_corrected_va = models.CharField(max_length=20, choices=VA_CHOICES, blank=True)
     left_dr_grade = models.CharField(max_length=20, choices=DR_GRADE_CHOICES, blank=True)
@@ -140,6 +140,11 @@ class StructuredReport(models.Model):
         return f"{self.report_id} - {self.encounter.encounter_id}"
 
     def save(self, *args, **kwargs):
+        # Report creation should not remain draft in the active clinical workflow.
+        # As soon as a report is created/edited, it is under clinical review unless it has moved further.
+        if self.report_status == "draft":
+            self.report_status = "under_review"
+
         super().save(*args, **kwargs)
 
         try:

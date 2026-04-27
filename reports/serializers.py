@@ -15,14 +15,11 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "patient",
             "review_date",
 
-            "dr_grade",
-            "maculopathy_grade",
-
+            # Laterality-aware clinical fields
             "left_unaided_va",
             "left_corrected_va",
             "left_dr_grade",
             "left_maculopathy_grade",
-
             "right_unaided_va",
             "right_corrected_va",
             "right_dr_grade",
@@ -47,6 +44,7 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = [
+            "report_status",
             "submitted_to_ops_at",
             "submitted_to_ops_by",
             "submitted_to_ops_by_display",

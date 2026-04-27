@@ -12,11 +12,16 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "encounter_date",
             "encounter_type",
             "screening_status",
-            "visual_acuity_left",
-            "visual_acuity_right",
+            # VA fields intentionally not exposed in normal encounter UI/API.
+            # They remain in the model only for backwards compatibility.
             "diabetes_duration",
             "symptoms_notes",
             "clinical_notes",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "screening_status",
             "created_at",
             "updated_at",
         ]

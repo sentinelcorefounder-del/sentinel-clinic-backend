@@ -51,11 +51,24 @@ class ImageUpload(models.Model):
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
+
         try:
             if hasattr(self.encounter, "update_status_from_related_records"):
                 self.encounter.update_status_from_related_records()
         except Exception as exc:
             print("ImageUpload post-save status update failed:", exc)
+
+        # If a ready report already exists and an image is added/replaced later,
+        # refresh dataset labels. Consent rules are still enforced by the pipeline.
+        try:
+            from uploads.dataset_pipeline import sync_dataset_from_report
+            ready_reports = self.encounter.reports.filter(
+                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"]
+            )
+            for report in ready_reports:
+                sync_dataset_from_report(report)
+        except Exception as exc:
+            print("ImageUpload dataset refresh failed:", exc)
 
 
 class AIAnalysis(models.Model):
@@ -132,7 +145,21 @@ class AIAnalysis(models.Model):
     def save(self, *args, **kwargs):
         if not self.analysis_id:
             self.analysis_id = f"AI-{uuid.uuid4().hex[:10].upper()}"
+
         super().save(*args, **kwargs)
+
+        # Critical fix:
+        # AI may complete after report creation/submission.
+        # Re-sync ready reports so DatasetLabel gets AI fields updated.
+        try:
+            from uploads.dataset_pipeline import sync_dataset_from_report
+            ready_reports = self.encounter.reports.filter(
+                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"]
+            )
+            for report in ready_reports:
+                sync_dataset_from_report(report)
+        except Exception as exc:
+            print("AIAnalysis dataset refresh failed:", exc)
 
     def __str__(self):
         return f"{self.analysis_id} - {self.provider}"
