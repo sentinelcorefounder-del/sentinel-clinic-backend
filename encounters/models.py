@@ -1,3 +1,4 @@
+
 from django.db import models
 from patients.models import Patient
 
@@ -14,27 +15,40 @@ class ScreeningEncounter(models.Model):
     ]
 
     encounter_id = models.CharField(max_length=30, unique=True)
+
     patient = models.ForeignKey(
         Patient,
         on_delete=models.CASCADE,
         related_name="encounters",
     )
+
     encounter_date = models.DateField()
     encounter_type = models.CharField(max_length=50, default="diabetic_eye_screening")
+
     screening_status = models.CharField(
         max_length=30,
         choices=STATUS_CHOICES,
         default="scheduled",
     )
 
-    # Kept for database/backwards compatibility only.
-    # VA should now be recorded on StructuredReport by laterality.
+    # Kept only for backwards compatibility.
+    # VA should now be captured in the report by laterality.
     visual_acuity_left = models.CharField(max_length=20, blank=True)
     visual_acuity_right = models.CharField(max_length=20, blank=True)
 
+    # Clinical encounter fields
     diabetes_duration = models.CharField(max_length=50, blank=True)
     symptoms_notes = models.TextField(blank=True)
     clinical_notes = models.TextField(blank=True)
+
+    # IOP / dilation fields
+    iop_before_dilation_left = models.CharField(max_length=20, blank=True)
+    iop_before_dilation_right = models.CharField(max_length=20, blank=True)
+    iop_after_dilation_left = models.CharField(max_length=20, blank=True)
+    iop_after_dilation_right = models.CharField(max_length=20, blank=True)
+    dilation_drops_used = models.CharField(max_length=255, blank=True)
+    dilation_notes = models.TextField(blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -48,7 +62,6 @@ class ScreeningEncounter(models.Model):
         """
         Single source of truth for encounter status movement.
 
-        Desired behaviour:
         - image uploaded -> images_uploaded
         - report created -> under_review
         - report issued/submitted_to_ops/ops_approved -> completed

@@ -10,6 +10,8 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
 
     patient_linked_id = serializers.CharField(source="patient.patient_id", read_only=True)
 
+    report_pdf_url = serializers.SerializerMethodField()
+
     class Meta:
         model = HospitalReferral
         fields = [
@@ -34,6 +36,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "report",
             "report_pk",
             "report_id_display",
+            "report_pdf_url",
             "referral_date",
             "referral_status",
             "report_ready",
@@ -47,3 +50,15 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_report_pdf_url(self, obj):
+        if not obj.report_id:
+            return ""
+
+        request = self.context.get("request")
+        path = f"/api/reports/{obj.report_id}/pdf/"
+
+        if request:
+            return request.build_absolute_uri(path)
+
+        return path
