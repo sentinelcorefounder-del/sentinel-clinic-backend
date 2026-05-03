@@ -80,8 +80,41 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
+# -------------------------------
+# COOKIES / CROSS-SUBDOMAIN AUTH
+# -------------------------------
+SESSION_COOKIE_DOMAIN = os.environ.get("SESSION_COOKIE_DOMAIN") or None
+CSRF_COOKIE_DOMAIN = os.environ.get("CSRF_COOKIE_DOMAIN") or None
+
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "False") == "True"
+CSRF_COOKIE_SECURE = os.environ.get("CSRF_COOKIE_SECURE", "False") == "True"
+
+SESSION_COOKIE_SAMESITE = os.environ.get("SESSION_COOKIE_SAMESITE", "Lax")
+CSRF_COOKIE_SAMESITE = os.environ.get("CSRF_COOKIE_SAMESITE", "Lax")
+
 # CORS
 CORS_ALLOW_CREDENTIALS = True
+
+# CORS
+CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOWED_ORIGINS = [
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "https://usesentinelhealth.com",
+    "https://www.usesentinelhealth.com",
+    "https://clinic.usesentinelhealth.com",
+    "https://ops.usesentinelhealth.com",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "https://usesentinelhealth.com",
+    "https://www.usesentinelhealth.com",
+    "https://clinic.usesentinelhealth.com",
+    "https://ops.usesentinelhealth.com",
+]
 
 # DRF
 REST_FRAMEWORK = {
