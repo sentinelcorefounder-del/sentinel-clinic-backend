@@ -27,10 +27,14 @@ def _send_startup_email(user, organization_name, activation_link, portal_label):
     subject = f"Activate your {portal_label} account"
     message = (
         f"Hello {user.first_name or user.username},\n\n"
-        f"Your account for {organization_name} has been created on the {portal_label}.\n\n"
-        f"Please use the activation link below to set your password and access your portal:\n\n"
+        f"Your Sentinel account for {organization_name} has been created.\n\n"
+        f"Username: {user.username}\n\n"
+        f"Please click the activation link below to set your password and access your portal:\n\n"
         f"{activation_link}\n\n"
-        f"If you did not expect this email, please contact Sentinel Ops.\n"
+        f"For security, this link should only be used by the intended recipient.\n\n"
+        f"If you did not expect this email, please contact Sentinel Ops.\n\n"
+        f"Thank you,\n"
+        f"Sentinel Health"
     )
 
     send_mail(
@@ -41,6 +45,34 @@ def _send_startup_email(user, organization_name, activation_link, portal_label):
         fail_silently=False,
     )
     return True
+
+
+def _prepare_user_for_activation(user, payload):
+    if payload.get("admin_email"):
+        user.email = payload.get("admin_email", user.email)
+
+    if payload.get("admin_first_name"):
+        user.first_name = payload.get("admin_first_name", user.first_name)
+
+    if payload.get("admin_last_name"):
+        user.last_name = payload.get("admin_last_name", user.last_name)
+
+    user.is_active = True
+
+    profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
+    profile.must_change_password = True
+
+    # The activation/reset-password email is the main onboarding method.
+    # Temporary password is optional fallback only.
+    if payload.get("temporary_password"):
+        user.set_password(payload["temporary_password"])
+    else:
+        user.set_unusable_password()
+
+    user.save()
+    profile.save()
+
+    return profile
 
 
 @transaction.atomic
@@ -71,25 +103,7 @@ def provision_clinic_with_admin(payload):
         },
     )
 
-    if payload.get("admin_email"):
-        user.email = payload.get("admin_email", user.email)
-    if payload.get("admin_first_name"):
-        user.first_name = payload.get("admin_first_name", user.first_name)
-    if payload.get("admin_last_name"):
-        user.last_name = payload.get("admin_last_name", user.last_name)
-
-    user.is_active = True
-
-    security_profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
-    security_profile.must_change_password = True
-
-    if payload.get("temporary_password"):
-        user.set_password(payload["temporary_password"])
-    else:
-        user.set_unusable_password()
-
-    user.save()
-    security_profile.save()
+    _prepare_user_for_activation(user, payload)
 
     UserOrganization.objects.update_or_create(
         user=user,
@@ -145,25 +159,7 @@ def provision_hospital_with_admin(payload):
         },
     )
 
-    if payload.get("admin_email"):
-        user.email = payload.get("admin_email", user.email)
-    if payload.get("admin_first_name"):
-        user.first_name = payload.get("admin_first_name", user.first_name)
-    if payload.get("admin_last_name"):
-        user.last_name = payload.get("admin_last_name", user.last_name)
-
-    user.is_active = True
-
-    security_profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
-    security_profile.must_change_password = True
-
-    if payload.get("temporary_password"):
-        user.set_password(payload["temporary_password"])
-    else:
-        user.set_unusable_password()
-
-    user.save()
-    security_profile.save()
+    _prepare_user_for_activation(user, payload)
 
     UserOrganization.objects.update_or_create(
         user=user,

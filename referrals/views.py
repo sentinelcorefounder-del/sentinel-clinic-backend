@@ -1,7 +1,7 @@
-import os
 
 from django.utils import timezone
 from rest_framework import generics, status
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -10,17 +10,11 @@ from common.tenant import get_user_organization
 from organizations.models import Organization
 from patients.models import Patient
 from reports.models import StructuredReport
-from .models import HospitalReferral
+from .models import HospitalReferral, generate_referral_id
 from .permissions import IsHospitalUser
 from .serializers import HospitalReferralSerializer
-from .services_baserow import create_hospital_intake_row, find_hospital_row_id
 from .submit_serializers import HospitalReferralSubmitSerializer
 from .sync_serializers import HospitalReferralStatusSyncSerializer
-
-
-def generate_submission_id(org_code: str) -> str:
-    timestamp = timezone.now().strftime("%Y%m%d%H%M%S")
-    return f"SUB-{org_code}-{timestamp}"
 
 
 class HospitalScopedMixin:
@@ -87,6 +81,8 @@ class HospitalDashboardView(APIView):
             "total_referrals": referrals.count(),
             "submitted": referrals.filter(referral_status="submitted").count(),
             "clinic_matched": referrals.filter(referral_status="clinic_matched").count(),
+            "in_clinic": referrals.filter(referral_status="in_clinic").count(),
+            "report_issued": referrals.filter(referral_status="report_issued").count(),
             "completed": referrals.filter(referral_status="completed").count(),
             "cancelled": referrals.filter(referral_status="cancelled").count(),
             "payout_pending": referrals.filter(payout_status="pending").count(),
@@ -97,7 +93,55 @@ class HospitalDashboardView(APIView):
         return Response(data)
 
 
+def _normalise_diabetes_type(value):
+    mapping = {
+        "type_1": "type 1",
+        "type_2": "type 2",
+        "other": "other",
+        "unknown": "unknown",
+    }
+    return mapping.get(value, value or "unknown")
+
+
+def _normalise_patient_sex(value):
+    mapping = {
+        "male": "male",
+        "female": "female",
+        "prefer_not_to_say": "prefer not to say",
+    }
+    return mapping.get(value, value or "")
+
+
+def _create_or_update_patient_from_referral(org, data, referral_id):
+    patient_id = data.get("patient_id") or referral_id
+
+    patient, _created = Patient.objects.update_or_create(
+        patient_id=patient_id,
+        defaults={
+            "first_name": data["first_name"],
+            "last_name": data["last_name"],
+            "date_of_birth": data["dob"],
+            "sex": _normalise_patient_sex(data["patient_sex"]),
+            "phone": data.get("phone_number", ""),
+            "email": data.get("email", ""),
+            "country": "Nigeria",
+            "consent_status": "pending",
+            "source_system": "hospital_portal",
+            "referral_id": referral_id,
+            "referral_status": "submitted",
+        },
+    )
+    return patient
+
+
 class HospitalReferralSubmitView(APIView):
+    """
+    Backend-owned hospital referral submission.
+
+    This no longer depends on Basecrow/Baserow to create the referral.
+    The Django backend creates the master referral_id and patient record directly.
+    """
+
     permission_classes = [IsAuthenticated, IsHospitalUser]
 
     def post(self, request):
@@ -120,96 +164,31 @@ class HospitalReferralSubmitView(APIView):
             )
 
         data = serializer.validated_data
-        submission_id = generate_submission_id(org.clinic_id)
+        referral_id = generate_referral_id()
 
-        referrer_name = (
-            user.get_full_name().strip()
-            if hasattr(user, "get_full_name") and user.get_full_name().strip()
-            else user.username
+        patient = _create_or_update_patient_from_referral(
+            org=org,
+            data=data,
+            referral_id=referral_id,
         )
 
-        try:
-            referring_hospital_row_id = find_hospital_row_id(
-                hospital_id=org.clinic_id,
-                name=org.name,
-            )
-        except Exception as exc:
-            return Response(
-                {
-                    "detail": "Failed to resolve referring hospital row.",
-                    "error": str(exc),
-                },
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        if not referring_hospital_row_id:
-            return Response(
-                {
-                    "detail": "Hospital could not be matched to a Basecrow hospitals row.",
-                    "error": f"No Hospitals row found for clinic_id={org.clinic_id} or name={org.name}",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        diabetes_type_display = {
-            "type_1": "type 1",
-            "type_2": "type 2",
-            "other": "other",
-            "unknown": "unknown",
-        }[data["diabetes_type"]]
-
-        patient_sex_display = {
-            "male": "male",
-            "female": "female",
-            "prefer_not_to_say": "prefer not to say",
-        }[data["patient_sex"]]
-
-        baserow_payload = {
-            "Submission ID": submission_id,
-            "Patient ID": data["patient_id"],
-            "First Name": data["first_name"],
-            "Last Name": data["last_name"],
-            "DOB": data["dob"].isoformat(),
-            "Patient Sex": patient_sex_display,
-            "Hospital MRN / Local Patient Number": data.get("hospital_mrn", ""),
-            "Phone Number": data.get("phone_number", ""),
-            "Email": data.get("email", ""),
-            "Diabetes Type": diabetes_type_display,
-            "Referring Hospital": [referring_hospital_row_id],
-            "Reason for referral": data["reason_for_referral"],
-            "Referrer Name": referrer_name,
-            "Notes": data.get("notes", ""),
-            "Processed": False,
-        }
-
-        try:
-            created_row = create_hospital_intake_row(baserow_payload)
-        except Exception as exc:
-            return Response(
-                {
-                    "detail": "Failed to create hospital intake row.",
-                    "error": str(exc),
-                },
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
         hospital_referral = HospitalReferral.objects.create(
-            referral_id=submission_id,
+            referral_id=referral_id,
             source_hospital=org,
-            patient_id_text=data["patient_id"],
+            patient=patient,
+            patient_id_text=data.get("patient_id", patient.patient_id),
             first_name=data["first_name"],
             last_name=data["last_name"],
             dob=data["dob"],
-            patient_sex=patient_sex_display,
+            patient_sex=_normalise_patient_sex(data["patient_sex"]),
             hospital_mrn=data.get("hospital_mrn", ""),
-            diabetes_type=diabetes_type_display,
+            diabetes_type=_normalise_diabetes_type(data.get("diabetes_type", "")),
             reason_for_referral=data["reason_for_referral"],
             phone_number=data.get("phone_number", ""),
             email=data.get("email", ""),
             referral_date=timezone.now(),
             referral_status="submitted",
-            baserow_row_id=created_row.get("id"),
-            source_system="hospital_portal",
+            source_system="backend_ops",
             notes=data.get("notes", ""),
             submitted_by_username=user.username,
         )
@@ -217,21 +196,29 @@ class HospitalReferralSubmitView(APIView):
         return Response(
             {
                 "message": "Hospital referral submitted successfully.",
-                "submission_id": submission_id,
-                "hospital_intake_row_id": created_row.get("id"),
+                "referral_id": hospital_referral.referral_id,
                 "hospital_name": org.name,
                 "hospital_referral_id": hospital_referral.id,
+                "patient_id": patient.patient_id,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
 class HospitalReferralStatusSyncView(APIView):
+    """
+    Temporary compatibility endpoint.
+
+    This is retained so old Basecrow/Pipedream syncs do not break immediately,
+    but the new source of truth is Django backend Ops.
+    """
+
     authentication_classes = []
     permission_classes = []
 
     def post(self, request):
         token = request.headers.get("X-SENTINEL-SYNC-TOKEN")
+        import os
         expected = os.environ.get("SENTINEL_SYNC_TOKEN", "")
 
         if not expected or token != expected:
@@ -275,6 +262,11 @@ class HospitalReferralStatusSyncView(APIView):
             hospital_referral.matched_clinic = matched_clinic
             updated_fields.append("matched_clinic")
 
+            if hospital_referral.patient:
+                hospital_referral.patient.assigned_clinic = matched_clinic
+                hospital_referral.patient.referral_status = "clinic_matched"
+                hospital_referral.patient.save(update_fields=["assigned_clinic", "referral_status", "updated_at"])
+
         linked_patient_id = data.get("linked_patient_id", "").strip()
         if linked_patient_id:
             patient = Patient.objects.filter(patient_id=linked_patient_id).first()
@@ -287,7 +279,8 @@ class HospitalReferralStatusSyncView(APIView):
             report = StructuredReport.objects.filter(report_id=report_id).first()
             if report and hospital_referral.report_id != report.id:
                 hospital_referral.report = report
-                updated_fields.append("report")
+                hospital_referral.report_ready = True
+                updated_fields.extend(["report", "report_ready"])
 
         if "report_ready" in data:
             if hospital_referral.report_ready != data["report_ready"]:
@@ -316,7 +309,6 @@ class HospitalReferralStatusSyncView(APIView):
                 hospital_referral.referral_status = "submitted"
 
         updated_fields.append("referral_status")
-
         hospital_referral.updated_at = timezone.now()
         updated_fields.append("updated_at")
 
@@ -331,6 +323,70 @@ class HospitalReferralStatusSyncView(APIView):
                 "patient_id": hospital_referral.patient.patient_id if hospital_referral.patient else "",
                 "report_ready": hospital_referral.report_ready,
                 "payout_status": hospital_referral.payout_status,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class MatchClinicView(APIView):
+    """
+    Backend Ops clinic matching endpoint.
+
+    Expected JSON:
+    {
+      "referral_id": "SNT-REF-2026-000001",
+      "clinic_id": 3
+    }
+
+    clinic_id is the Django Organization primary key.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        referral_id = (request.data.get("referral_id") or "").strip()
+        clinic_id = request.data.get("clinic_id")
+
+        if not referral_id or not clinic_id:
+            raise ValidationError("referral_id and clinic_id are required.")
+
+        try:
+            referral = HospitalReferral.objects.select_related("patient").get(referral_id=referral_id)
+        except HospitalReferral.DoesNotExist:
+            return Response(
+                {"detail": "Referral not found.", "referral_id": referral_id},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            clinic = Organization.objects.get(id=clinic_id)
+        except Organization.DoesNotExist:
+            return Response(
+                {"detail": "Clinic organization not found.", "clinic_id": clinic_id},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if clinic.organization_type != "clinic":
+            return Response(
+                {"detail": "Selected organization is not a clinic."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        referral.matched_clinic = clinic
+        referral.referral_status = "clinic_matched"
+        referral.save(update_fields=["matched_clinic", "referral_status", "updated_at"])
+
+        if referral.patient:
+            referral.patient.assigned_clinic = clinic
+            referral.patient.referral_status = "clinic_matched"
+            referral.patient.save(update_fields=["assigned_clinic", "referral_status", "updated_at"])
+
+        return Response(
+            {
+                "message": "Clinic matched successfully.",
+                "referral_id": referral.referral_id,
+                "matched_clinic": clinic.name,
+                "referral_status": referral.referral_status,
             },
             status=status.HTTP_200_OK,
         )

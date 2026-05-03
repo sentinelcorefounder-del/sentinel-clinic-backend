@@ -22,5 +22,6 @@ urlpatterns = [
     path("api/dashboard/", include("dashboard.urls")),
     path("api/organizations/", include("organizations.urls")),
     path("api/payments/", include("payments.urls")),
+    path("api/ops/", include("ops.urls")),
     re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
 ]

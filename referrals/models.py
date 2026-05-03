@@ -1,12 +1,42 @@
+
 from django.db import models
+from django.utils import timezone
 from organizations.models import Organization
 from patients.models import Patient
+
+
+def generate_referral_id():
+    """
+    New backend-owned referral ID format.
+    Existing rows keep their current referral_id.
+    New rows get SNT-REF-YYYY-000001 style IDs.
+    """
+    year = timezone.now().year
+    prefix = f"SNT-REF-{year}-"
+
+    latest = (
+        HospitalReferral.objects.filter(referral_id__startswith=prefix)
+        .order_by("-id")
+        .first()
+    )
+
+    if not latest:
+        next_number = 1
+    else:
+        try:
+            next_number = int(str(latest.referral_id).split("-")[-1]) + 1
+        except Exception:
+            next_number = latest.id + 1
+
+    return f"{prefix}{str(next_number).zfill(6)}"
 
 
 class HospitalReferral(models.Model):
     STATUS_CHOICES = [
         ("submitted", "Submitted"),
         ("clinic_matched", "Clinic Matched"),
+        ("in_clinic", "In Clinic"),
+        ("report_issued", "Report Issued"),
         ("completed", "Completed"),
         ("cancelled", "Cancelled"),
     ]
@@ -18,7 +48,11 @@ class HospitalReferral(models.Model):
         ("paid", "Paid"),
     ]
 
-    referral_id = models.CharField(max_length=60, unique=True)
+    referral_id = models.CharField(
+        max_length=60,
+        unique=True,
+        default=generate_referral_id,
+    )
 
     source_hospital = models.ForeignKey(
         Organization,
@@ -34,13 +68,13 @@ class HospitalReferral(models.Model):
         related_name="hospital_referrals",
     )
 
-    patient_id_text = models.CharField(max_length=50)
+    patient_id_text = models.CharField(max_length=50, blank=True)
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
     dob = models.DateField()
     patient_sex = models.CharField(max_length=30)
     hospital_mrn = models.CharField(max_length=100, blank=True)
-    diabetes_type = models.CharField(max_length=50)
+    diabetes_type = models.CharField(max_length=50, blank=True)
     reason_for_referral = models.TextField()
     phone_number = models.CharField(max_length=30, blank=True)
     email = models.EmailField(blank=True)
@@ -84,6 +118,7 @@ class HospitalReferral(models.Model):
 
     payout_date = models.DateTimeField(null=True, blank=True)
 
+    # Kept temporarily for historical/basecrow rows during migration.
     baserow_row_id = models.IntegerField(null=True, blank=True)
     source_system = models.CharField(max_length=50, default="hospital_portal")
     notes = models.TextField(blank=True)
@@ -97,3 +132,7 @@ class HospitalReferral(models.Model):
 
     def __str__(self):
         return f"{self.referral_id} - {self.first_name} {self.last_name}"
+
+    @property
+    def patient_full_name(self):
+        return f"{self.first_name} {self.last_name}".strip()

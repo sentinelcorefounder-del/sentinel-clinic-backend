@@ -1,3 +1,4 @@
+
 from rest_framework import serializers
 from .models import HospitalReferral
 
@@ -7,9 +8,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     matched_clinic_name = serializers.CharField(source="matched_clinic.name", read_only=True)
     report_id_display = serializers.CharField(source="report.report_id", read_only=True)
     report_pk = serializers.IntegerField(source="report.id", read_only=True)
-
     patient_linked_id = serializers.CharField(source="patient.patient_id", read_only=True)
-
     report_pdf_url = serializers.SerializerMethodField()
 
     class Meta:

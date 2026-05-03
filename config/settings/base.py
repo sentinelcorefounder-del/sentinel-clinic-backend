@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     "audit",
     "dashboard",
     "payments",
+    "ops",
 ]
 
 MIDDLEWARE = [

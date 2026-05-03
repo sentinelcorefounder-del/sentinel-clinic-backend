@@ -14,9 +14,17 @@ DATABASES = {
 CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:3000",
+    "https://usesentinelhealth.com",
+    "https://www.usesentinelhealth.com",
+    "https://clinic.usesentinelhealth.com",
+    "https://ops.usesentinelhealth.com",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:3000",
+    "https://usesentinelhealth.com",
+    "https://www.usesentinelhealth.com",
+    "https://clinic.usesentinelhealth.com",
+    "https://ops.usesentinelhealth.com",
 ]

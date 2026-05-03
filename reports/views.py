@@ -730,55 +730,130 @@ class StructuredReportPDFView(APIView):
         y -= 28
 
         pdf.setFont("Helvetica-Bold", 13)
-        pdf.drawString(left, y, "Clinical Findings")
+        pdf.drawString(left, y, "Clinical Findings by Eye")
         y -= 10
 
-        findings_height = 72
+        findings_height = 126
         self._draw_section_box(
             pdf, left, y - findings_height, content_width, findings_height
         )
 
-        fy1 = y - 18
-        fy2 = y - 36
-        fy3 = y - 54
+        fy1 = y - 20
+        fy2 = y - 40
+        fy3 = y - 60
+        fy4 = y - 80
+        fy5 = y - 102
 
-        self._draw_label_value_pair(
-            pdf, left + 10, fy1, "DR Grade:", report.dr_grade or "-"
-        )
-        self._draw_label_value_pair(
-            pdf,
-            left + 280,
-            fy1,
-            "Maculopathy:",
-            report.maculopathy_grade or "-",
-            offset=78,
-        )
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(left + 10, fy1, "Left Eye")
+        pdf.drawString(left + 280, fy1, "Right Eye")
 
         self._draw_label_value_pair(
             pdf,
             left + 10,
             fy2,
-            "Ungradable:",
-            "Yes" if report.ungradable else "No",
+            "Unaided VA:",
+            report.left_unaided_va or "-",
+            offset=92,
+            size=10,
         )
         self._draw_label_value_pair(
             pdf,
             left + 280,
             fy2,
-            "Outcome:",
-            (report.urgency_outcome or "-").replace("_", " ").title(),
-            offset=56,
+            "Unaided VA:",
+            report.right_unaided_va or "-",
+            offset=92,
+            size=10,
         )
 
         self._draw_label_value_pair(
             pdf,
             left + 10,
             fy3,
-            "Follow-up:",
-            report.next_followup_interval or "-",
+            "Corrected VA:",
+            report.left_corrected_va or "-",
+            offset=92,
+            size=10,
+        )
+        self._draw_label_value_pair(
+            pdf,
+            left + 280,
+            fy3,
+            "Corrected VA:",
+            report.right_corrected_va or "-",
+            offset=92,
+            size=10,
         )
 
-        y -= findings_height + 24
+        self._draw_label_value_pair(
+            pdf,
+            left + 10,
+            fy4,
+            "DR Grade:",
+            report.left_dr_grade or "-",
+            offset=92,
+            size=10,
+        )
+        self._draw_label_value_pair(
+            pdf,
+            left + 280,
+            fy4,
+            "DR Grade:",
+            report.right_dr_grade or "-",
+            offset=92,
+            size=10,
+        )
+
+        self._draw_label_value_pair(
+            pdf,
+            left + 10,
+            fy5,
+            "Maculopathy:",
+            report.left_maculopathy_grade or "-",
+            offset=92,
+            size=10,
+        )
+        self._draw_label_value_pair(
+            pdf,
+            left + 280,
+            fy5,
+            "Maculopathy:",
+            report.right_maculopathy_grade or "-",
+            offset=92,
+            size=10,
+        )
+
+        y -= findings_height + 20
+
+        self._draw_label_value_pair(
+            pdf,
+            left,
+            y,
+            "Ungradable:",
+            "Yes" if report.ungradable else "No",
+            offset=82,
+        )
+        self._draw_label_value_pair(
+            pdf,
+            left + 280,
+            y,
+            "Outcome:",
+            (report.urgency_outcome or "-").replace("_", " ").title(),
+            offset=62,
+        )
+        y -= 18
+
+        self._draw_label_value_pair(
+            pdf,
+            left,
+            y,
+            "Follow-up:",
+            report.next_followup_interval or "-",
+            offset=82,
+        )
+
+        y -= 26
 
         pdf.setFont("Helvetica-Bold", 13)
         pdf.drawString(left, y, "Recommendation")
