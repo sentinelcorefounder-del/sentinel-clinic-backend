@@ -8,10 +8,30 @@ from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
 from organizations.models import Organization
+from users.models import UserOrganization
+
 from .models import Patient
-from .serializers import PatientSerializer
 from .permissions import CanManagePatients
+from .serializers import PatientSerializer
 from .sync_serializers import PatientSyncSerializer
+
+
+def get_user_clinic_organization(user):
+    org = get_user_organization(user)
+
+    if org:
+        return org
+
+    user_org = (
+        UserOrganization.objects.select_related("organization")
+        .filter(user=user)
+        .first()
+    )
+
+    if user_org:
+        return user_org.organization
+
+    return None
 
 
 class PatientListCreateView(generics.ListCreateAPIView):
@@ -20,11 +40,9 @@ class PatientListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        org = get_user_clinic_organization(user)
 
-        # 🔒 Always enforce clinic scoping
-        org = get_user_organization(user)
-
-        if not org:
+        if not org or org.organization_type != "clinic":
             return Patient.objects.none()
 
         queryset = (
@@ -55,19 +73,20 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        org = get_user_clinic_organization(user)
 
-        org = get_user_organization(user)
-
-        if not org:
+        if not org or org.organization_type != "clinic":
             return Patient.objects.none()
 
-        return Patient.objects.filter(assigned_clinic=org)
+        return Patient.objects.select_related("assigned_clinic").filter(
+            assigned_clinic=org
+        )
 
     def perform_update(self, serializer):
         user = self.request.user
-        org = get_user_organization(user)
+        org = get_user_clinic_organization(user)
 
-        if not org:
+        if not org or org.organization_type != "clinic":
             raise PermissionDenied("You are not linked to a clinic.")
 
         patient = self.get_object()
@@ -79,12 +98,13 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, instance):
         user = self.request.user
-        org = get_user_organization(user)
+        org = get_user_clinic_organization(user)
 
         if not org or instance.assigned_clinic_id != org.id:
             raise PermissionDenied("You cannot delete this patient.")
 
         instance.delete()
+
 
 class PatientSyncView(APIView):
     authentication_classes = []
