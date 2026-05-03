@@ -807,9 +807,12 @@ class OpsCreateOrganizationView(OpsOnlyMixin, APIView):
 
 class OpsCreateUserView(OpsOnlyMixin, APIView):
     def post(self, request):
-        if not request.user.is_superuser:
+        if not (
+            request.user.is_superuser
+            or request.user.groups.filter(name="super_admin").exists()
+        ):
             return Response(
-                {"detail": "Only super admin can create Ops users."},
+                {"detail": "Only Sentinel super admins can create Ops users."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
