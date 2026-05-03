@@ -19,15 +19,18 @@ class PatientListCreateView(generics.ListCreateAPIView):
     permission_classes = [CanManagePatients]
 
     def get_queryset(self):
-        queryset = Patient.objects.select_related("assigned_clinic").all()
-
         user = self.request.user
-        if not user.is_superuser:
-            org = get_user_organization(user)
-            if org:
-                queryset = queryset.filter(assigned_clinic=org)
-            else:
-                queryset = queryset.none()
+
+        # 🔒 Always enforce clinic scoping
+        org = get_user_organization(user)
+
+        if not org:
+            return Patient.objects.none()
+
+        queryset = (
+            Patient.objects.select_related("assigned_clinic")
+            .filter(assigned_clinic=org)
+        )
 
         search = self.request.query_params.get("search")
         if search:
@@ -38,17 +41,11 @@ class PatientListCreateView(generics.ListCreateAPIView):
                 | Q(phone__icontains=search)
             )
 
-        return queryset
+        return queryset.order_by("-created_at")
 
     def perform_create(self, serializer):
-        user = self.request.user
-
-        if user.is_superuser:
-            serializer.save()
-            return
-
         raise PermissionDenied(
-            "Patients should be created from Sentinel Ops sync, not manually in the clinic portal."
+            "Patients are created via Sentinel Ops, not manually."
         )
 
 
@@ -57,52 +54,37 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [CanManagePatients]
 
     def get_queryset(self):
-        queryset = Patient.objects.select_related("assigned_clinic").all()
-
         user = self.request.user
-        if not user.is_superuser:
-            org = get_user_organization(user)
-            if org:
-                queryset = queryset.filter(assigned_clinic=org)
-            else:
-                queryset = queryset.none()
 
-        return queryset
+        org = get_user_organization(user)
+
+        if not org:
+            return Patient.objects.none()
+
+        return Patient.objects.filter(assigned_clinic=org)
 
     def perform_update(self, serializer):
         user = self.request.user
-
-        if user.is_superuser:
-            serializer.save()
-            return
-
         org = get_user_organization(user)
+
         if not org:
-            raise PermissionDenied("You are not linked to a clinic organization.")
+            raise PermissionDenied("You are not linked to a clinic.")
 
         patient = self.get_object()
-        if patient.assigned_clinic_id != org.id:
-            raise PermissionDenied("You cannot update a patient outside your clinic.")
 
-        new_assigned_clinic = serializer.validated_data.get("assigned_clinic")
-        if new_assigned_clinic and new_assigned_clinic.id != org.id:
-            raise PermissionDenied("You cannot reassign a patient to another clinic.")
+        if patient.assigned_clinic_id != org.id:
+            raise PermissionDenied("You cannot update this patient.")
 
         serializer.save()
 
     def perform_destroy(self, instance):
         user = self.request.user
-
-        if user.is_superuser:
-            instance.delete()
-            return
-
         org = get_user_organization(user)
+
         if not org or instance.assigned_clinic_id != org.id:
-            raise PermissionDenied("You cannot delete a patient outside your clinic.")
+            raise PermissionDenied("You cannot delete this patient.")
 
         instance.delete()
-
 
 class PatientSyncView(APIView):
     authentication_classes = []
