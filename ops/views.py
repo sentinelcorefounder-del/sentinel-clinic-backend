@@ -268,15 +268,38 @@ class OpsAssignClinicView(OpsOnlyMixin, APIView):
         if not clinic:
             return Response({"detail": "Clinic not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        patient = referral.patient
+
+        if not patient:
+            base_patient_id = f"PAT-{referral.referral_id}"
+            patient, _ = Patient.objects.update_or_create(
+                patient_id=base_patient_id,
+                defaults={
+                    "first_name": referral.first_name or "Unknown",
+                    "last_name": referral.last_name or "Patient",
+                    "date_of_birth": referral.dob,
+                    "sex": referral.patient_sex or "",
+                    "phone": referral.phone_number or "",
+                    "email": referral.email or "",
+                    "country": "Nigeria",
+                    "consent_status": "pending",
+                    "assigned_clinic": clinic,
+                    "referral_id": referral.referral_id,
+                    "referral_status": "clinic_matched",
+                    "source_system": "sentinel_ops",
+                },
+            )
+            referral.patient = patient
+        else:
+            patient.assigned_clinic = clinic
+            patient.referral_status = "clinic_matched"
+            patient.referral_id = referral.referral_id
+            patient.save(update_fields=["assigned_clinic", "referral_status", "referral_id", "updated_at"])
+
         referral.matched_clinic = clinic
         referral.referral_status = "clinic_matched"
-        referral.notes = f"{referral.notes or ''}\nAssigned to clinic: {clinic.name}.".strip()
-        referral.save(update_fields=["matched_clinic", "referral_status", "notes", "updated_at"])
-
-        if referral.patient:
-            referral.patient.assigned_clinic = clinic
-            referral.patient.referral_status = "clinic_matched"
-            referral.patient.save(update_fields=["assigned_clinic", "referral_status", "updated_at"])
+        referral.notes = f"{referral.notes or ''}\nAssigned to clinic: {clinic.name}. Patient linked to clinic record.".strip()
+        referral.save(update_fields=["matched_clinic", "referral_status", "patient", "notes", "updated_at"])
 
         clinic_email_sent = False
         try:
@@ -295,6 +318,7 @@ class OpsAssignClinicView(OpsOnlyMixin, APIView):
             metadata={
                 "clinic_id": clinic.id,
                 "clinic_name": clinic.name,
+                "patient_id": patient.id,
                 "clinic_email_sent": clinic_email_sent,
             },
         )
@@ -311,8 +335,9 @@ class OpsAssignClinicView(OpsOnlyMixin, APIView):
 
         return Response(
             {
-                "message": "Clinic assigned successfully.",
+                "message": "Clinic assigned successfully and patient linked.",
                 "clinic_email_sent": clinic_email_sent,
+                "patient_id": patient.id,
                 "referral": OpsReferralSerializer(referral).data,
             }
         )
