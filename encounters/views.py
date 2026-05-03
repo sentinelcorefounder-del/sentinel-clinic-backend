@@ -11,37 +11,36 @@ from .serializers import ScreeningEncounterSerializer
 
 def get_user_clinic(user):
     org = get_user_organization(user)
+
     if org:
         return org
 
-    uo = (
+    user_org = (
         UserOrganization.objects.select_related("organization")
         .filter(user=user)
         .first()
     )
-    return uo.organization if uo else None
+
+    if user_org:
+        return user_org.organization
+
+    return None
 
 
 class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
     serializer_class = ScreeningEncounterSerializer
 
     def get_queryset(self):
-        queryset = ScreeningEncounter.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-        )
-
         user = self.request.user
-
-        # ✅ superuser / ops → see all
-        if user.is_superuser:
-            return queryset.order_by("-created_at")
-
         org = get_user_clinic(user)
+
         if not org or org.organization_type != "clinic":
             return ScreeningEncounter.objects.none()
 
-        queryset = queryset.filter(patient__assigned_clinic=org)
+        queryset = ScreeningEncounter.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+        ).filter(patient__assigned_clinic=org)
 
         search = self.request.query_params.get("search")
         status_value = self.request.query_params.get("status")
@@ -65,12 +64,8 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         user = self.request.user
-
-        if user.is_superuser:
-            serializer.save()
-            return
-
         org = get_user_clinic(user)
+
         if not org or org.organization_type != "clinic":
             raise PermissionDenied("You are not linked to a clinic.")
 
@@ -89,30 +84,21 @@ class ScreeningEncounterDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ScreeningEncounterSerializer
 
     def get_queryset(self):
-        queryset = ScreeningEncounter.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-        )
-
         user = self.request.user
-
-        if user.is_superuser:
-            return queryset
-
         org = get_user_clinic(user)
+
         if not org or org.organization_type != "clinic":
             return ScreeningEncounter.objects.none()
 
-        return queryset.filter(patient__assigned_clinic=org)
+        return ScreeningEncounter.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+        ).filter(patient__assigned_clinic=org)
 
     def perform_update(self, serializer):
         user = self.request.user
-
-        if user.is_superuser:
-            serializer.save()
-            return
-
         org = get_user_clinic(user)
+
         if not org or org.organization_type != "clinic":
             raise PermissionDenied("You are not linked to a clinic.")
 
@@ -129,19 +115,16 @@ class PatientEncounterListView(generics.ListAPIView):
 
     def get_queryset(self):
         patient_id = self.kwargs["patient_id"]
-
-        queryset = ScreeningEncounter.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-        ).filter(patient_id=patient_id)
-
         user = self.request.user
-
-        if user.is_superuser:
-            return queryset
-
         org = get_user_clinic(user)
+
         if not org or org.organization_type != "clinic":
             return ScreeningEncounter.objects.none()
 
-        return queryset.filter(patient__assigned_clinic=org)
+        return ScreeningEncounter.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+        ).filter(
+            patient_id=patient_id,
+            patient__assigned_clinic=org,
+        ).order_by("-created_at")

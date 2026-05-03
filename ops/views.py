@@ -185,6 +185,7 @@ class OpsDashboardView(OpsOnlyMixin, APIView):
         referrals = HospitalReferral.objects.all()
         payments = OpsPayment.objects.all()
         reports = StructuredReport.objects.all()
+        patients = Patient.objects.all()
 
         return Response(
             {
@@ -213,6 +214,7 @@ class OpsDashboardView(OpsOnlyMixin, APIView):
                     "issued": reports.filter(report_status="issued").count(),
                 },
                 "network": {
+                    "patients": patients.count(),
                     "clinics": Organization.objects.filter(organization_type="clinic").count(),
                     "hospitals": Organization.objects.filter(organization_type="hospital").count(),
                 },
