@@ -25,6 +25,7 @@ from .views import (
     OpsNotificationListView,
     OpsNotificationMarkReadView,
     OpsNotificationMarkAllReadView,
+    OpsNotificationDeleteView,
     PublicSelfReferralView,
 )
 
@@ -64,4 +65,5 @@ urlpatterns = [
     path("notifications/mark-all-read/", OpsNotificationMarkAllReadView.as_view()),
 
     path("self-referrals/", PublicSelfReferralView.as_view()),
+    path("notifications/<int:pk>/delete/", OpsNotificationDeleteView.as_view()),
 ]

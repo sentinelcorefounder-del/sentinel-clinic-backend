@@ -1219,6 +1219,23 @@ class OpsNotificationMarkAllReadView(OpsOnlyMixin, APIView):
         )
 
         return Response({"message": "All notifications marked as read."})
+    
+class OpsNotificationDeleteView(OpsOnlyMixin, APIView):
+    def delete(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        notification = OpsNotification.objects.filter(pk=pk).first()
+        if not notification:
+            return Response(
+                {"detail": "Notification not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        notification.delete()
+
+        return Response({"message": "Notification deleted."})
 
 class PublicSelfReferralView(APIView):
     authentication_classes = []
