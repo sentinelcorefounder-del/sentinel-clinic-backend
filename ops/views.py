@@ -1261,23 +1261,9 @@ class PublicSelfReferralView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        patient = Patient.objects.create(
-            patient_id=f"PAT-SELF-{timezone.now().strftime('%Y%m%d%H%M%S')}",
-            first_name=first_name,
-            last_name=last_name,
-            date_of_birth=dob,
-            sex=patient_sex,
-            phone=phone_number,
-            email=email,
-            country="Nigeria",
-            consent_status="pending",
-            referral_status="submitted",
-            source_system="self_referral",
-        )
-
         referral = HospitalReferral.objects.create(
             source_hospital=None,
-            patient=patient,
+            patient=None,
             first_name=first_name,
             last_name=last_name,
             dob=dob,
@@ -1293,9 +1279,22 @@ class PublicSelfReferralView(APIView):
             notes=f"Self-referred patient from usesentinelhealth.com.\n{notes}".strip(),
         )
 
-        patient.referral_id = referral.referral_id
-        patient.referral_status = referral.referral_status
-        patient.save(update_fields=["referral_id", "referral_status", "updated_at"])
+        patient_id = f"PAT-{referral.referral_id}"
+
+        patient = Patient.objects.create(
+            patient_id=patient_id,
+            first_name=first_name,
+            last_name=last_name,
+            date_of_birth=dob,
+            sex=patient_sex,
+            phone=phone_number,
+            email=email,
+            country="Nigeria",
+            consent_status="pending",
+        )
+
+        referral.patient = patient
+        referral.save(update_fields=["patient", "updated_at"])
 
         try:
             send_mail(
