@@ -1,4 +1,3 @@
-
 from django.db import models
 from django.utils import timezone
 from organizations.models import Organization
@@ -6,11 +5,6 @@ from patients.models import Patient
 
 
 def generate_referral_id():
-    """
-    New backend-owned referral ID format.
-    Existing rows keep their current referral_id.
-    New rows get SNT-REF-YYYY-000001 style IDs.
-    """
     year = timezone.now().year
     prefix = f"SNT-REF-{year}-"
 
@@ -56,7 +50,9 @@ class HospitalReferral(models.Model):
 
     source_hospital = models.ForeignKey(
         Organization,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="submitted_hospital_referrals",
     )
 
@@ -71,8 +67,8 @@ class HospitalReferral(models.Model):
     patient_id_text = models.CharField(max_length=50, blank=True)
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
-    dob = models.DateField()
-    patient_sex = models.CharField(max_length=30)
+    dob = models.DateField(null=True, blank=True)
+    patient_sex = models.CharField(max_length=30, blank=True)
     hospital_mrn = models.CharField(max_length=100, blank=True)
     diabetes_type = models.CharField(max_length=50, blank=True)
     reason_for_referral = models.TextField()
@@ -96,6 +92,7 @@ class HospitalReferral(models.Model):
     )
 
     referral_date = models.DateTimeField(null=True, blank=True)
+
     referral_status = models.CharField(
         max_length=30,
         choices=STATUS_CHOICES,
@@ -118,7 +115,6 @@ class HospitalReferral(models.Model):
 
     payout_date = models.DateTimeField(null=True, blank=True)
 
-    # Kept temporarily for historical/basecrow rows during migration.
     baserow_row_id = models.IntegerField(null=True, blank=True)
     source_system = models.CharField(max_length=50, default="hospital_portal")
     notes = models.TextField(blank=True)

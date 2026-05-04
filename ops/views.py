@@ -1262,6 +1262,7 @@ class PublicSelfReferralView(APIView):
             )
 
         referral = HospitalReferral.objects.create(
+            source_hospital=None,
             first_name=first_name,
             last_name=last_name,
             dob=dob,
@@ -1271,6 +1272,9 @@ class PublicSelfReferralView(APIView):
             reason_for_referral=reason_for_referral or "Self-referral from Sentinel website",
             diabetes_type=diabetes_type,
             referral_status="submitted",
+            referral_date=timezone.now(),
+            source_system="self_referral",
+            submitted_by_username="public_self_referral",
             notes=f"Self-referred patient from usesentinelhealth.com.\n{notes}".strip(),
         )
 
