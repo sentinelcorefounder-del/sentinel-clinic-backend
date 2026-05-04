@@ -1261,8 +1261,23 @@ class PublicSelfReferralView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        patient = Patient.objects.create(
+            patient_id=f"PAT-SELF-{timezone.now().strftime('%Y%m%d%H%M%S')}",
+            first_name=first_name,
+            last_name=last_name,
+            date_of_birth=dob,
+            sex=patient_sex,
+            phone=phone_number,
+            email=email,
+            country="Nigeria",
+            consent_status="pending",
+            referral_status="submitted",
+            source_system="self_referral",
+        )
+
         referral = HospitalReferral.objects.create(
             source_hospital=None,
+            patient=patient,
             first_name=first_name,
             last_name=last_name,
             dob=dob,
@@ -1278,6 +1293,32 @@ class PublicSelfReferralView(APIView):
             notes=f"Self-referred patient from usesentinelhealth.com.\n{notes}".strip(),
         )
 
+        patient.referral_id = referral.referral_id
+        patient.referral_status = referral.referral_status
+        patient.save(update_fields=["referral_id", "referral_status", "updated_at"])
+
+        try:
+            send_mail(
+                subject="Your Sentinel request has been received",
+                message=f"""
+Hello {first_name},
+
+Your retinal analysis request has been received.
+
+A Sentinel coordinator will review your referral and contact you with the next steps.
+
+Reference: {referral.referral_id}
+
+Thank you,
+Sentinel Health
+""".strip(),
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[email],
+                fail_silently=True,
+            )
+        except Exception:
+            pass
+
         create_audit_log(
             actor=None,
             action="self_referral_created",
@@ -1285,7 +1326,12 @@ class PublicSelfReferralView(APIView):
             entity_id=referral.id,
             entity_label=referral.referral_id,
             message=f"Self-referral created for {first_name} {last_name}.",
-            metadata={"email": email, "phone_number": phone_number},
+            metadata={
+                "email": email,
+                "phone_number": phone_number,
+                "patient_id": patient.id,
+                "source_system": "self_referral",
+            },
         )
 
         create_ops_notification(
@@ -1302,6 +1348,7 @@ class PublicSelfReferralView(APIView):
             {
                 "message": "Self-referral submitted successfully.",
                 "referral_id": referral.referral_id,
+                "patient_id": patient.patient_id,
             },
             status=status.HTTP_201_CREATED,
         )
