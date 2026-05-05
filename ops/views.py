@@ -851,6 +851,19 @@ class OpsCreateUserView(OpsOnlyMixin, APIView):
         group, _ = Group.objects.get_or_create(name="ops_admin")
         user.groups.add(group)
 
+        clinic_group, _ = Group.objects.get_or_create(name="clinic_admin")
+        user.groups.add(clinic_group)
+
+        sentinel_clinic = Organization.objects.filter(clinic_id="SNT-CLINIC").first()
+
+        if sentinel_clinic:
+            from users.models import UserOrganization
+
+            UserOrganization.objects.update_or_create(
+                user=user,
+                defaults={"organization": sentinel_clinic},
+            )
+
         profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
         profile.must_change_password = True
         profile.save(update_fields=["must_change_password"])
