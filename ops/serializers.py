@@ -17,6 +17,7 @@ class OpsPaymentSerializer(serializers.ModelSerializer):
             "id",
             "referral",
             "referral_id_display",
+            "source_system"
             "patient_name",
             "source_hospital_name",
             "matched_clinic_name",
