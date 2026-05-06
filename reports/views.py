@@ -80,6 +80,30 @@ class StructuredReportRulesMixin:
                 "Cannot create or update report until an image is uploaded. If no usable image is available, mark the report as Ungradable or Image Retake."
             )
 
+
+    def _apply_encounter_va_defaults(self, serializer, encounter):
+        """
+        Technician VA is captured on the encounter. The report should inherit it
+        by default, while still allowing the optometrist to override the report
+        values if clinically appropriate.
+        """
+        if not encounter:
+            return
+
+        data = serializer.validated_data
+
+        if not data.get("left_unaided_va"):
+            data["left_unaided_va"] = getattr(encounter, "left_unaided_va", "") or getattr(encounter, "visual_acuity_left", "")
+
+        if not data.get("right_unaided_va"):
+            data["right_unaided_va"] = getattr(encounter, "right_unaided_va", "") or getattr(encounter, "visual_acuity_right", "")
+
+        if not data.get("left_corrected_va"):
+            data["left_corrected_va"] = getattr(encounter, "left_corrected_pinhole_va", "")
+
+        if not data.get("right_corrected_va"):
+            data["right_corrected_va"] = getattr(encounter, "right_corrected_pinhole_va", "")
+
     def _validate_report_can_be_submitted_to_ops(self, report):
         missing_items = []
 
@@ -148,6 +172,7 @@ class StructuredReportListCreateView(
         encounter = serializer.validated_data.get("encounter")
 
         self._validate_report_prerequisites(serializer, patient, encounter)
+        self._apply_encounter_va_defaults(serializer, encounter)
 
         if user.is_superuser:
             serializer.save()
@@ -208,6 +233,7 @@ class StructuredReportDetailView(
         )
 
         self._validate_report_prerequisites(serializer, patient, encounter)
+        self._apply_encounter_va_defaults(serializer, encounter)
 
         if user.is_superuser:
             serializer.save()
@@ -771,7 +797,7 @@ class StructuredReportPDFView(APIView):
             pdf,
             left + 10,
             fy3,
-            "Corrected VA:",
+            "Corrected/Pinhole VA:",
             report.left_corrected_va or "-",
             offset=92,
             size=10,
@@ -780,7 +806,7 @@ class StructuredReportPDFView(APIView):
             pdf,
             left + 280,
             fy3,
-            "Corrected VA:",
+            "Corrected/Pinhole VA:",
             report.right_corrected_va or "-",
             offset=92,
             size=10,
