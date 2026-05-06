@@ -1,11 +1,14 @@
-
 from rest_framework import serializers
 from .models import ScreeningEncounter
 
 
 class ScreeningEncounterSerializer(serializers.ModelSerializer):
+    poor_va_flag = serializers.SerializerMethodField()
+    poor_va_reason = serializers.SerializerMethodField()
+
     class Meta:
         model = ScreeningEncounter
+
         fields = [
             "id",
             "encounter_id",
@@ -14,24 +17,85 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "encounter_type",
             "screening_status",
 
-            # VA fields intentionally not exposed here.
-            # VA is handled by StructuredReport by eye laterality.
+            # Legacy fields
+            "visual_acuity_left",
+            "visual_acuity_right",
+
+            # Technician VA capture
+            "left_unaided_va",
+            "right_unaided_va",
+            "left_corrected_pinhole_va",
+            "right_corrected_pinhole_va",
+            "left_va_method",
+            "right_va_method",
+
+            # technician/clinical intake
             "diabetes_duration",
             "symptoms_notes",
             "clinical_notes",
 
+            # IOP
             "iop_before_dilation_left",
             "iop_before_dilation_right",
             "iop_after_dilation_left",
             "iop_after_dilation_right",
+
             "dilation_drops_used",
             "dilation_notes",
+
+            # system flag
+            "poor_va_flag",
+            "poor_va_reason",
 
             "created_at",
             "updated_at",
         ]
+
         read_only_fields = [
             "screening_status",
+            "poor_va_flag",
+            "poor_va_reason",
             "created_at",
             "updated_at",
         ]
+
+    def _normalise_va(self, value):
+        return (value or "").strip().lower().replace(" ", "")
+
+    def _is_poor_va(self, value):
+        poor_values = {
+            "6/12",
+            "6/15",
+            "6/18",
+            "6/24",
+            "6/36",
+            "6/60",
+            "cf",
+            "countingfingers",
+            "hm",
+            "handmovements",
+            "pl",
+            "npl",
+            "nlp",
+        }
+
+        return self._normalise_va(value) in poor_values
+
+    def get_poor_va_flag(self, obj):
+        return (
+            self._is_poor_va(obj.left_corrected_pinhole_va)
+            or self._is_poor_va(obj.right_corrected_pinhole_va)
+        )
+
+    def get_poor_va_reason(self, obj):
+        reasons = []
+
+        if self._is_poor_va(obj.left_corrected_pinhole_va):
+            method = obj.left_va_method or "corrected/pinhole"
+            reasons.append(f"Left eye {method} VA is {obj.left_corrected_pinhole_va}")
+
+        if self._is_poor_va(obj.right_corrected_pinhole_va):
+            method = obj.right_va_method or "corrected/pinhole"
+            reasons.append(f"Right eye {method} VA is {obj.right_corrected_pinhole_va}")
+
+        return "; ".join(reasons)

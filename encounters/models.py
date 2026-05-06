@@ -1,4 +1,3 @@
-
 from django.db import models
 from patients.models import Patient
 
@@ -14,6 +13,12 @@ class ScreeningEncounter(models.Model):
         ("cancelled", "Cancelled"),
     ]
 
+    VA_METHOD_CHOICES = [
+        ("", "Not Recorded"),
+        ("corrected", "Corrected"),
+        ("pinhole", "Pinhole"),
+    ]
+
     encounter_id = models.CharField(max_length=30, unique=True)
 
     patient = models.ForeignKey(
@@ -23,7 +28,7 @@ class ScreeningEncounter(models.Model):
     )
 
     encounter_date = models.DateField()
-    encounter_type = models.CharField(max_length=50, default="diabetic_eye_screening")
+    encounter_type = models.CharField(max_length=50, default="retinal_assessment")
 
     screening_status = models.CharField(
         max_length=30,
@@ -31,10 +36,29 @@ class ScreeningEncounter(models.Model):
         default="scheduled",
     )
 
-    # Kept only for backwards compatibility.
-    # VA should now be captured in the report by laterality.
+    # Legacy fields retained for older rows. Do not use in active UI.
     visual_acuity_left = models.CharField(max_length=20, blank=True)
     visual_acuity_right = models.CharField(max_length=20, blank=True)
+
+    # VA should be captured by technicians on the encounter.
+    left_unaided_va = models.CharField(max_length=20, blank=True)
+    right_unaided_va = models.CharField(max_length=20, blank=True)
+
+    left_corrected_pinhole_va = models.CharField(max_length=20, blank=True)
+    right_corrected_pinhole_va = models.CharField(max_length=20, blank=True)
+
+    left_va_method = models.CharField(
+        max_length=20,
+        choices=VA_METHOD_CHOICES,
+        blank=True,
+        default="",
+    )
+    right_va_method = models.CharField(
+        max_length=20,
+        choices=VA_METHOD_CHOICES,
+        blank=True,
+        default="",
+    )
 
     # Clinical encounter fields
     diabetes_duration = models.CharField(max_length=50, blank=True)
@@ -59,13 +83,6 @@ class ScreeningEncounter(models.Model):
         return f"{self.encounter_id} - {self.patient}"
 
     def update_status_from_related_records(self):
-        """
-        Single source of truth for encounter status movement.
-
-        - image uploaded -> images_uploaded
-        - report created -> under_review
-        - report issued/submitted_to_ops/ops_approved -> completed
-        """
         if self.screening_status == "cancelled":
             return
 
