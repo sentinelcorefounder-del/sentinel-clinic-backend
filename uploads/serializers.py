@@ -3,15 +3,48 @@ from .models import ImageUpload, AIAnalysis, DatasetLabel
 
 
 class AIAnalysisSerializer(serializers.ModelSerializer):
+    provider_display = serializers.SerializerMethodField()
+
     class Meta:
         model = AIAnalysis
         fields = [
-            "id", "analysis_id", "provider", "ai_status", "fundus_status",
-            "prediction", "referable", "confidence", "severity", "severity_label",
-            "image_quality", "risk_flag", "suggested_review_priority", "message",
-            "draft_note", "disclaimer", "heatmap_url", "processed_image_url",
-            "model_version", "analyzed_at", "created_at",
+            "id",
+            "analysis_id",
+            "provider",
+            "provider_display",
+            "ai_status",
+            "fundus_status",
+            "prediction",
+            "referable",
+            "confidence",
+            "severity",
+            "severity_label",
+            "image_quality",
+            "risk_flag",
+            "suggested_review_priority",
+            "message",
+            "draft_note",
+            "disclaimer",
+            "heatmap_url",
+            "processed_image_url",
+            "model_version",
+            "analyzed_at",
+            "created_at",
         ]
+
+    def get_provider_display(self, obj):
+        provider = (obj.provider or "").lower()
+
+        if provider == "hybrid":
+            return "Hybrid AI"
+
+        if provider == "openai":
+            return "Hybrid AI"
+
+        if provider == "sentinel":
+            return "Sentinel AI"
+
+        return "AI Analysis"
 
 
 class DatasetLabelSerializer(serializers.ModelSerializer):

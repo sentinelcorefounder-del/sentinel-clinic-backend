@@ -162,34 +162,57 @@ def call_openai_for_observation(image_upload: ImageUpload, sentinel_context=None
     sentinel_text = ""
     if sentinel_context:
         sentinel_text = f"""
-Sentinel AI preliminary output for audit context only:
+Sentinel AI preliminary output:
 {json.dumps(sentinel_context, indent=2)}
 """
 
     prompt = f"""
-You are supporting a diabetic eye screening workflow.
+You are assisting a diabetic retinal screening clinician.
 
-You must not provide a final diagnosis.
-You must not claim certainty.
-You must provide observations for clinician review only.
-If there are visible bright focal lesions, haemorrhage-like spots, image quality concerns, or macular-area concerns, describe them cautiously.
-Do not say the patient has diabetic retinopathy.
-Do not make final referral decisions.
+Your task is to describe visible retinal findings from the uploaded fundus image.
+
+IMPORTANT RULES:
+- Do NOT provide a final diagnosis.
+- Do NOT claim certainty.
+- Do NOT state that the patient definitively has diabetic retinopathy.
+- Use cautious medical language such as:
+  "possible", "suggestive of", "appears", "may represent".
+- Do NOT recommend treatment.
+- You MAY suggest urgency level for clinician review.
+- Focus on retinal observations only.
+
+You should describe:
+- image quality
+- visibility of optic disc and macula
+- possible haemorrhages
+- microaneurysm-like lesions
+- exudate-like lesions
+- vessel abnormalities
+- blur/artifacts
+- possible macular involvement
+- whether image appears gradable
 
 {sentinel_text}
 
-Return JSON only with this exact structure:
+Return STRICT JSON ONLY:
+
 {{
   "success": true,
-  "fundus_status": "accepted | rejected | uncertain",
-  "image_quality": "good | acceptable | poor | ungradable",
+  "fundus_status": "accepted",
+  "image_quality": "good",
   "is_likely_fundus_image": true,
-  "visible_observations": [],
-  "possible_dr_related_features": [],
-  "risk_flag": "low | review_needed | urgent_review_needed",
-  "suggested_review_priority": "routine | priority | urgent",
-  "draft_note": "",
-  "limitations": "This is not a diagnosis. A qualified clinician must review the image."
+  "visible_observations": [
+    "Possible scattered microaneurysm-like red dots temporal to the macula",
+    "Mild vessel tortuosity noted"
+  ],
+  "possible_dr_related_features": [
+    "microaneurysm_like_lesions",
+    "small_haemorrhage_like_lesions"
+  ],
+  "risk_flag": "review_needed",
+  "suggested_review_priority": "priority",
+  "draft_note": "Fundus photograph appears adequately centred and reasonably gradable. Possible scattered small red-dot lesions are visible temporal to the macular region which may represent microaneurysm-like changes. No obvious dense vitreous haemorrhage identified. Clinical correlation and clinician review are advised.",
+  "limitations": "This is an AI-assisted observational summary only and not a diagnosis. A qualified clinician must review the image."
 }}
 """
 
@@ -204,6 +227,7 @@ Return JSON only with this exact structure:
                 ],
             }
         ],
+        max_output_tokens=700,
     )
 
     text_output = response.output_text
@@ -221,9 +245,8 @@ Return JSON only with this exact structure:
             "risk_flag": "review_needed",
             "suggested_review_priority": "priority",
             "draft_note": text_output,
-            "limitations": "AI response could not be parsed as JSON. Clinician review is required.",
+            "limitations": "AI response parsing failed. Clinician review required.",
         }
-
 
 def analyze_with_sentinel_ai(image_upload: ImageUpload):
     provider = "sentinel"
