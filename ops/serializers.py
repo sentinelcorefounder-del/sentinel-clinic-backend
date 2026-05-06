@@ -6,10 +6,17 @@ from .models import OpsAuditLog, OpsNotification, OpsPayment
 
 
 class OpsPaymentSerializer(serializers.ModelSerializer):
-    referral_id_display = serializers.CharField(source="referral.referral_id", read_only=True)
+    referral_id_display = serializers.CharField(
+        source="referral.referral_id",
+        read_only=True,
+    )
+    referral_source_system = serializers.CharField(
+        source="referral.source_system",
+        read_only=True,
+    )
     patient_name = serializers.SerializerMethodField()
-    source_hospital_name = serializers.CharField(source="referral.source_hospital.name", read_only=True)
-    matched_clinic_name = serializers.CharField(source="referral.matched_clinic.name", read_only=True)
+    source_hospital_name = serializers.SerializerMethodField()
+    matched_clinic_name = serializers.SerializerMethodField()
 
     class Meta:
         model = OpsPayment
@@ -17,7 +24,7 @@ class OpsPaymentSerializer(serializers.ModelSerializer):
             "id",
             "referral",
             "referral_id_display",
-            "source_system"
+            "referral_source_system",
             "patient_name",
             "source_hospital_name",
             "matched_clinic_name",
@@ -36,12 +43,22 @@ class OpsPaymentSerializer(serializers.ModelSerializer):
         ]
 
     def get_patient_name(self, obj):
+        if not obj.referral:
+            return ""
         return f"{obj.referral.first_name} {obj.referral.last_name}".strip()
+
+    def get_source_hospital_name(self, obj):
+        hospital = getattr(obj.referral, "source_hospital", None)
+        return hospital.name if hospital else ""
+
+    def get_matched_clinic_name(self, obj):
+        clinic = getattr(obj.referral, "matched_clinic", None)
+        return clinic.name if clinic else ""
 
 
 class OpsReferralSerializer(serializers.ModelSerializer):
-    source_hospital_name = serializers.CharField(source="source_hospital.name", read_only=True)
-    matched_clinic_name = serializers.CharField(source="matched_clinic.name", read_only=True)
+    source_hospital_name = serializers.SerializerMethodField()
+    matched_clinic_name = serializers.SerializerMethodField()
     patient_name = serializers.SerializerMethodField()
     payment_status = serializers.SerializerMethodField()
     payment_link = serializers.SerializerMethodField()
@@ -52,6 +69,7 @@ class OpsReferralSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "referral_id",
+            "source_system",
             "patient_name",
             "first_name",
             "last_name",
@@ -84,6 +102,12 @@ class OpsReferralSerializer(serializers.ModelSerializer):
     def get_patient_name(self, obj):
         return f"{obj.first_name} {obj.last_name}".strip()
 
+    def get_source_hospital_name(self, obj):
+        return obj.source_hospital.name if obj.source_hospital else ""
+
+    def get_matched_clinic_name(self, obj):
+        return obj.matched_clinic.name if obj.matched_clinic else ""
+
     def get_latest_payment(self, obj):
         return obj.ops_payments.order_by("-created_at").first()
 
@@ -102,8 +126,8 @@ class OpsReferralSerializer(serializers.ModelSerializer):
 
 class OpsReportSerializer(serializers.ModelSerializer):
     patient_name = serializers.SerializerMethodField()
-    clinic_name = serializers.CharField(source="patient.assigned_clinic.name", read_only=True)
-    encounter_id_display = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    clinic_name = serializers.SerializerMethodField()
+    encounter_id_display = serializers.SerializerMethodField()
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
 
@@ -132,7 +156,16 @@ class OpsReportSerializer(serializers.ModelSerializer):
         ]
 
     def get_patient_name(self, obj):
+        if not obj.patient:
+            return ""
         return f"{obj.patient.first_name} {obj.patient.last_name}".strip()
+
+    def get_clinic_name(self, obj):
+        clinic = getattr(obj.patient, "assigned_clinic", None) if obj.patient else None
+        return clinic.name if clinic else ""
+
+    def get_encounter_id_display(self, obj):
+        return obj.encounter.encounter_id if obj.encounter else ""
 
     def get_submitted_to_ops_by_display(self, obj):
         user = obj.submitted_to_ops_by
@@ -165,7 +198,8 @@ class OpsAuditLogSerializer(serializers.ModelSerializer):
         if not obj.actor:
             return "System"
         return obj.actor.username or obj.actor.email or str(obj.actor)
-    
+
+
 class OpsNotificationSerializer(serializers.ModelSerializer):
     created_by_display = serializers.SerializerMethodField()
 
