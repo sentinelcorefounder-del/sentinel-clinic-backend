@@ -370,7 +370,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
 
                 analysis.ai_status = "completed"
                 analysis.fundus_status = openai_data.get("fundus_status") or "uncertain"
-                analysis.prediction = "OpenAI observation for clinician review"
+                analysis.prediction = "Hybrid AI clinician-support observation"
                 analysis.referable = None
                 analysis.confidence = sentinel_normalized.get("confidence")
                 analysis.severity = sentinel_normalized.get("severity")
@@ -381,7 +381,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
                     openai_data.get("suggested_review_priority") or "priority"
                 )
                 analysis.message = (
-                    "OpenAI clinician-support observation is shown as the primary AI note because Sentinel AI triggered the hybrid safety rule."
+                    "Hybrid AI clinician-support observation generated because Sentinel AI triggered the hybrid safety workflow."
                 )
                 analysis.draft_note = openai_data.get("draft_note")
                 analysis.disclaimer = GLOBAL_AI_DISCLAIMER 
@@ -421,7 +421,7 @@ def analyze_with_hybrid_ai(image_upload: ImageUpload):
             analysis.suggested_review_priority = "routine"
             analysis.draft_note = (
                 "Sentinel AI confidence was above the safety threshold and severity was normal. "
-                "No OpenAI support note was generated. Clinician review is still required."
+                "No Hybrid AI support note was generated. Clinician review is still required."
             )
 
         analysis.raw_response_json = raw_combined
