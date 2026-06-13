@@ -16,8 +16,19 @@ def initialize_transaction(email: str, amount_kobo: int, reference: str):
         },
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_response": response.text}
+
+    if response.status_code >= 400:
+        raise Exception(
+            f"Paystack returned {response.status_code}: "
+            f"{data.get('message', data)}"
+        )
+
+    return data
 
 
 def verify_transaction(reference: str):
@@ -29,5 +40,16 @@ def verify_transaction(reference: str):
         },
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_response": response.text}
+
+    if response.status_code >= 400:
+        raise Exception(
+            f"Paystack returned {response.status_code}: "
+            f"{data.get('message', data)}"
+        )
+
+    return data
