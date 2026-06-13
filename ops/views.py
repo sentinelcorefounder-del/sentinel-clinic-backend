@@ -369,8 +369,28 @@ class CreatePaymentForReferralView(OpsOnlyMixin, APIView):
         if not referral:
             return Response({"detail": "Referral not found."}, status=status.HTTP_404_NOT_FOUND)
 
+        hospital = referral.source_hospital
+
+        default_amount = (
+            hospital.screening_fee_amount
+            if hospital and hospital.screening_fee_amount
+            else Decimal("15000")
+        )
+
+        default_currency = (
+            hospital.currency
+            if hospital and hospital.currency
+            else "NGN"
+        )
+
+        # Ops can still override amount manually if needed.
+        # If no amount is sent, use the source hospital's configured screening fee.
         try:
-            amount = Decimal(str(request.data.get("amount", "15000")).replace(",", "").strip())
+            amount = Decimal(
+                str(
+                    request.data.get("amount", default_amount)
+                ).replace(",", "").strip()
+            )
         except Exception:
             return Response({"detail": "Invalid amount."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -387,7 +407,7 @@ class CreatePaymentForReferralView(OpsOnlyMixin, APIView):
             defaults={
                 "patient_email": patient_email,
                 "amount": amount,
-                "currency": "NGN",
+                "currency": default_currency,
                 "status": "draft",
             },
         )
@@ -395,7 +415,8 @@ class CreatePaymentForReferralView(OpsOnlyMixin, APIView):
         if not created:
             payment.patient_email = patient_email
             payment.amount = amount
-            payment.save(update_fields=["patient_email", "amount", "updated_at"])
+            payment.currency = default_currency
+            payment.save(update_fields=["patient_email", "amount", "currency", "updated_at"])
 
         create_audit_log(
             actor=request.user,
@@ -767,6 +788,9 @@ class OpsCreateOrganizationView(OpsOnlyMixin, APIView):
                 "admin_role": "hospital_admin",
                 "temporary_password": request.data.get("temporary_password", ""),
                 "is_active": True,
+                "screening_fee_amount": request.data.get("screening_fee_amount", "15000"),
+                "hospital_commission_amount": request.data.get("hospital_commission_amount", "0"),
+                "currency": request.data.get("currency", "NGN"),
             }
 
             if not payload["hospital_id"] or not payload["hospital_name"] or not payload["admin_username"] or not payload["admin_email"]:
@@ -776,6 +800,26 @@ class OpsCreateOrganizationView(OpsOnlyMixin, APIView):
                 )
 
             result = provision_hospital_with_admin(payload)
+
+            hospital_org = (
+                Organization.objects.filter(id=result.get("organization_id")).first()
+                or Organization.objects.filter(clinic_id=payload["hospital_id"]).first()
+            )
+
+            if hospital_org:
+                try:
+                    hospital_org.screening_fee_amount = Decimal(str(payload.get("screening_fee_amount", "15000")).replace(",", "").strip())
+                    hospital_org.hospital_commission_amount = Decimal(str(payload.get("hospital_commission_amount", "0")).replace(",", "").strip())
+                    hospital_org.currency = payload.get("currency") or "NGN"
+                    hospital_org.save(
+                        update_fields=[
+                            "screening_fee_amount",
+                            "hospital_commission_amount",
+                            "currency",
+                        ]
+                    )
+                except Exception as exc:
+                    print("Hospital pricing update failed:", exc)
 
             create_audit_log(
                 actor=request.user,
@@ -1059,6 +1103,9 @@ class OpsHospitalListView(OpsOnlyMixin, APIView):
                     "contact_email": h.contact_email,
                     "phone": h.phone,
                     "address": h.address,
+                    "screening_fee_amount": h.screening_fee_amount,
+                    "hospital_commission_amount": h.hospital_commission_amount,
+                    "currency": h.currency,
                     "referrals_count": referrals.count(),
                     "paid_payments": payments.filter(status="paid").count(),
                     "pending_payments": payments.filter(status="pending").count(),
@@ -1069,15 +1116,7 @@ class OpsHospitalListView(OpsOnlyMixin, APIView):
 
 
 class OpsHospitalDetailView(OpsOnlyMixin, APIView):
-    def get(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
-
-        hospital = Organization.objects.filter(pk=pk, organization_type="hospital").first()
-        if not hospital:
-            return Response({"detail": "Hospital not found."}, status=status.HTTP_404_NOT_FOUND)
-
+    def _build_response(self, request, hospital):
         referrals = HospitalReferral.objects.select_related("patient", "matched_clinic", "report").filter(source_hospital=hospital)
         payments = OpsPayment.objects.select_related("referral").filter(referral__source_hospital=hospital)
 
@@ -1090,11 +1129,85 @@ class OpsHospitalDetailView(OpsOnlyMixin, APIView):
                     "contact_email": hospital.contact_email,
                     "phone": hospital.phone,
                     "address": hospital.address,
+                    "screening_fee_amount": hospital.screening_fee_amount,
+                    "hospital_commission_amount": hospital.hospital_commission_amount,
+                    "currency": hospital.currency,
                 },
                 "referrals": OpsReferralSerializer(referrals, many=True).data,
                 "payments": OpsPaymentSerializer(payments, many=True).data,
             }
         )
+
+    def get(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        hospital = Organization.objects.filter(pk=pk, organization_type="hospital").first()
+        if not hospital:
+            return Response({"detail": "Hospital not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        return self._build_response(request, hospital)
+
+    def patch(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        hospital = Organization.objects.filter(pk=pk, organization_type="hospital").first()
+        if not hospital:
+            return Response({"detail": "Hospital not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        for field in ["name", "contact_email", "phone", "address", "currency"]:
+            if field in request.data:
+                value = request.data.get(field)
+                if field == "currency":
+                    value = (value or "NGN").strip().upper()
+                setattr(hospital, field, value)
+
+        for field in ["screening_fee_amount", "hospital_commission_amount"]:
+            if field in request.data:
+                try:
+                    value = Decimal(str(request.data.get(field) or "0").replace(",", "").strip())
+                except Exception:
+                    return Response(
+                        {"detail": f"{field.replace('_', ' ').title()} must be a valid number."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if value < 0:
+                    return Response(
+                        {"detail": f"{field.replace('_', ' ').title()} cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                setattr(hospital, field, value)
+
+        hospital.save(update_fields=[
+            "name",
+            "contact_email",
+            "phone",
+            "address",
+            "currency",
+            "screening_fee_amount",
+            "hospital_commission_amount",
+        ])
+
+        create_audit_log(
+            actor=request.user,
+            action="hospital_pricing_updated",
+            entity_type="hospital",
+            entity_id=hospital.id,
+            entity_label=hospital.clinic_id,
+            message=f"Hospital {hospital.name} charge updated.",
+            metadata={
+                "screening_fee_amount": str(hospital.screening_fee_amount),
+                "hospital_commission_amount": str(hospital.hospital_commission_amount),
+                "currency": hospital.currency,
+            },
+        )
+
+        return self._build_response(request, hospital)
 
 
 class OpsClinicListView(OpsOnlyMixin, APIView):

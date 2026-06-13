@@ -32,7 +32,7 @@ class HospitalReferralQuerysetMixin(HospitalScopedMixin):
             "patient",
             "matched_clinic",
             "report",
-        ).all()
+        ).prefetch_related("ops_payments").all()
 
         user = self.request.user
         if user.is_superuser:

@@ -1,4 +1,3 @@
-
 from rest_framework import serializers
 from .models import HospitalReferral
 
@@ -10,6 +9,11 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     report_pk = serializers.IntegerField(source="report.id", read_only=True)
     patient_linked_id = serializers.CharField(source="patient.patient_id", read_only=True)
     report_pdf_url = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    payment_amount = serializers.SerializerMethodField()
+    payment_currency = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
+    payment_paid_at = serializers.SerializerMethodField()
 
     class Meta:
         model = HospitalReferral
@@ -42,6 +46,11 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "hospital_commission_amount",
             "payout_status",
             "payout_date",
+            "payment_status",
+            "payment_amount",
+            "payment_currency",
+            "payment_reference",
+            "payment_paid_at",
             "baserow_row_id",
             "source_system",
             "notes",
@@ -61,3 +70,33 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(path)
 
         return path
+
+    def get_latest_payment(self, obj):
+        try:
+            return obj.ops_payments.order_by("-created_at").first()
+        except Exception:
+            return None
+
+    def get_payment_status(self, obj):
+        payment = self.get_latest_payment(obj)
+        return payment.status if payment else "not_created"
+
+    def get_payment_amount(self, obj):
+        payment = self.get_latest_payment(obj)
+        return str(payment.amount) if payment else ""
+
+    def get_payment_currency(self, obj):
+        payment = self.get_latest_payment(obj)
+        return payment.currency if payment else "NGN"
+
+    def get_payment_reference(self, obj):
+        payment = self.get_latest_payment(obj)
+        if not payment:
+            return ""
+        return payment.paystack_reference or payment.payment_id or ""
+
+    def get_payment_paid_at(self, obj):
+        payment = self.get_latest_payment(obj)
+        if not payment or not payment.paid_at:
+            return ""
+        return payment.paid_at

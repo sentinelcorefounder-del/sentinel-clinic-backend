@@ -17,5 +17,9 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "report_signatory_name",
             "report_signatory_title",
             "report_signatory_odorbn",
+            "report_footer_note",
+            "screening_fee_amount",
+            "hospital_commission_amount",
+            "currency",
             "created_at",
         ]
