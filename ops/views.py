@@ -1054,25 +1054,42 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                 | models.Q(phone__icontains=search)
                 | models.Q(email__icontains=search)
                 | models.Q(referral_id__icontains=search)
+                | models.Q(hospital_referrals__referral_id__icontains=search)
+                | models.Q(hospital_referrals__source_hospital__name__icontains=search)
+                | models.Q(hospital_referrals__source_hospital__clinic_id__icontains=search)
+                | models.Q(assigned_clinic__name__icontains=search)
+                | models.Q(assigned_clinic__clinic_id__icontains=search)
             )
 
-        clinic_id = request.query_params.get("clinic")
-        if clinic_id:
-            patients = patients.filter(assigned_clinic_id=clinic_id)
+        clinic = (request.query_params.get("clinic") or "").strip()
+        if clinic:
+            if clinic.isdigit():
+                patients = patients.filter(assigned_clinic_id=clinic)
+            else:
+                patients = patients.filter(
+                    models.Q(assigned_clinic__name__icontains=clinic)
+                    | models.Q(assigned_clinic__clinic_id__icontains=clinic)
+                )
 
-        hospital_id = request.query_params.get("hospital")
-        if hospital_id:
-            patients = patients.filter(hospital_referrals__source_hospital_id=hospital_id)
+        hospital = (request.query_params.get("hospital") or "").strip()
+        if hospital:
+            if hospital.isdigit():
+                patients = patients.filter(hospital_referrals__source_hospital_id=hospital)
+            else:
+                patients = patients.filter(
+                    models.Q(hospital_referrals__source_hospital__name__icontains=hospital)
+                    | models.Q(hospital_referrals__source_hospital__clinic_id__icontains=hospital)
+                )
 
-        referral_status = request.query_params.get("referral_status")
+        referral_status = (request.query_params.get("referral_status") or "").strip()
         if referral_status:
             patients = patients.filter(hospital_referrals__referral_status=referral_status)
 
-        report_status = request.query_params.get("report_status")
+        report_status = (request.query_params.get("report_status") or "").strip()
         if report_status:
             patients = patients.filter(reports__report_status=report_status)
 
-        payment_status = request.query_params.get("payment_status")
+        payment_status = (request.query_params.get("payment_status") or "").strip()
         if payment_status:
             patients = patients.filter(hospital_referrals__ops_payments__status=payment_status)
 
@@ -1111,8 +1128,10 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     "phone": p.phone,
                     "email": p.email,
                     "source_hospital": latest_referral.source_hospital.name if latest_referral and latest_referral.source_hospital else "",
+                    "source_hospital_code": latest_referral.source_hospital.clinic_id if latest_referral and latest_referral.source_hospital else "",
                     "source_hospital_id": latest_referral.source_hospital_id if latest_referral else None,
                     "assigned_clinic": p.assigned_clinic.name if p.assigned_clinic else "",
+                    "assigned_clinic_code": p.assigned_clinic.clinic_id if p.assigned_clinic else "",
                     "assigned_clinic_id": p.assigned_clinic_id,
                     "referral_status": latest_referral.referral_status if latest_referral else (p.referral_status or ""),
                     "referral_id": latest_referral.referral_id if latest_referral else (p.referral_id or ""),
