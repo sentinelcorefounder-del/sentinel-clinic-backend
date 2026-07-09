@@ -3,6 +3,7 @@ import hmac
 import json
 from decimal import Decimal
 
+from django.db import models
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
@@ -622,13 +623,46 @@ class OpsReportApprovalQueueView(OpsOnlyMixin, generics.ListAPIView):
         if not user_is_ops(self.request.user):
             return StructuredReport.objects.none()
 
-        return StructuredReport.objects.select_related(
+        queryset = StructuredReport.objects.select_related(
             "patient",
             "patient__assigned_clinic",
             "encounter",
             "submitted_to_ops_by",
             "ops_reviewed_by",
-        ).filter(report_status="submitted_to_ops").order_by("-submitted_to_ops_at", "-created_at")
+        ).prefetch_related(
+            "hospital_referrals",
+            "hospital_referrals__source_hospital",
+            "hospital_referrals__ops_payments",
+        )
+
+        report_status = (
+            self.request.query_params.get("status")
+            or self.request.query_params.get("report_status")
+            or "submitted_to_ops"
+        )
+
+        if report_status and report_status != "all":
+            queryset = queryset.filter(report_status=report_status)
+
+        clinic_id = self.request.query_params.get("clinic")
+        if clinic_id:
+            queryset = queryset.filter(patient__assigned_clinic_id=clinic_id)
+
+        hospital_id = self.request.query_params.get("hospital")
+        if hospital_id:
+            queryset = queryset.filter(hospital_referrals__source_hospital_id=hospital_id)
+
+        search = (self.request.query_params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(
+                models.Q(report_id__icontains=search)
+                | models.Q(patient__patient_id__icontains=search)
+                | models.Q(patient__first_name__icontains=search)
+                | models.Q(patient__last_name__icontains=search)
+                | models.Q(hospital_referrals__referral_id__icontains=search)
+            )
+
+        return queryset.distinct().order_by("-submitted_to_ops_at", "-created_at")
 
 
 class OpsReportApproveView(OpsOnlyMixin, APIView):
@@ -641,30 +675,45 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
         if not report:
             return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if report.report_status != "submitted_to_ops":
+        if report.report_status not in {"submitted_to_ops", "ops_rejected"}:
             return Response(
-                {"detail": f"Only submitted_to_ops reports can be approved. Current status: {report.report_status}"},
+                {
+                    "detail": f"Only submitted_to_ops or ops_rejected reports can be approved/issued. Current status: {report.report_status}"
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        report.report_status = "ops_approved"
+        report.report_status = "issued"
         report.ops_reviewed_at = timezone.now()
         report.ops_reviewed_by = request.user
         report.ops_review_note = (request.data.get("note") or "").strip()
-        report.save(update_fields=["report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note", "updated_at"])
+        report.save(
+            update_fields=[
+                "report_status",
+                "ops_reviewed_at",
+                "ops_reviewed_by",
+                "ops_review_note",
+                "updated_at",
+            ]
+        )
+
+        for referral in report.hospital_referrals.all():
+            referral.report_ready = True
+            referral.referral_status = "completed"
+            referral.save(update_fields=["report_ready", "referral_status", "updated_at"])
 
         create_audit_log(
             actor=request.user,
-            action="report_approved",
+            action="report_issued",
             entity_type="report",
             entity_id=report.id,
             entity_label=report.report_id,
-            message=f"Report {report.report_id} approved by Ops.",
+            message=f"Report {report.report_id} issued by Ops.",
         )
 
         create_ops_notification(
-            title="Report approved",
-            message=f"Report {report.report_id} was approved by Ops.",
+            title="Report issued",
+            message=f"Report {report.report_id} was issued by Ops.",
             level="success",
             entity_type="report",
             entity_id=report.id,
@@ -672,8 +721,12 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
             created_by=request.user,
         )
 
-        return Response({"message": "Report approved by Ops.", "report": OpsReportSerializer(report).data})
-
+        return Response(
+            {
+                "message": "Report issued by Ops.",
+                "report": OpsReportSerializer(report, context={"request": request}).data,
+            }
+        )
 
 class OpsReportRejectView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
@@ -990,12 +1043,63 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
         if denied:
             return denied
 
-        patients = Patient.objects.select_related("assigned_clinic").order_by("-created_at")
+        patients = Patient.objects.select_related("assigned_clinic").all().order_by("-created_at")
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            patients = patients.filter(
+                models.Q(patient_id__icontains=search)
+                | models.Q(first_name__icontains=search)
+                | models.Q(last_name__icontains=search)
+                | models.Q(phone__icontains=search)
+                | models.Q(email__icontains=search)
+                | models.Q(referral_id__icontains=search)
+            )
+
+        clinic_id = request.query_params.get("clinic")
+        if clinic_id:
+            patients = patients.filter(assigned_clinic_id=clinic_id)
+
+        hospital_id = request.query_params.get("hospital")
+        if hospital_id:
+            patients = patients.filter(hospital_referrals__source_hospital_id=hospital_id)
+
+        referral_status = request.query_params.get("referral_status")
+        if referral_status:
+            patients = patients.filter(hospital_referrals__referral_status=referral_status)
+
+        report_status = request.query_params.get("report_status")
+        if report_status:
+            patients = patients.filter(reports__report_status=report_status)
+
+        payment_status = request.query_params.get("payment_status")
+        if payment_status:
+            patients = patients.filter(hospital_referrals__ops_payments__status=payment_status)
+
+        patients = patients.distinct()
         data = []
 
         for p in patients:
-            referrals = HospitalReferral.objects.filter(patient=p)
-            payments = OpsPayment.objects.filter(referral__patient=p)
+            referrals = HospitalReferral.objects.select_related(
+                "source_hospital",
+                "matched_clinic",
+                "report",
+            ).filter(patient=p).order_by("-created_at")
+
+            latest_referral = referrals.first()
+
+            payments = OpsPayment.objects.filter(referral__patient=p).order_by("-created_at")
+            latest_payment = payments.first()
+
+            reports = StructuredReport.objects.filter(patient=p).select_related("encounter").order_by("-created_at")
+            latest_report = reports.first()
+
+            image_count = 0
+            if ImageUpload:
+                try:
+                    image_count = ImageUpload.objects.filter(patient=p).count()
+                except Exception:
+                    image_count = ImageUpload.objects.filter(encounter__patient=p).count()
 
             data.append(
                 {
@@ -1006,9 +1110,21 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     "sex": p.sex,
                     "phone": p.phone,
                     "email": p.email,
+                    "source_hospital": latest_referral.source_hospital.name if latest_referral and latest_referral.source_hospital else "",
+                    "source_hospital_id": latest_referral.source_hospital_id if latest_referral else None,
                     "assigned_clinic": p.assigned_clinic.name if p.assigned_clinic else "",
+                    "assigned_clinic_id": p.assigned_clinic_id,
+                    "referral_status": latest_referral.referral_status if latest_referral else (p.referral_status or ""),
+                    "referral_id": latest_referral.referral_id if latest_referral else (p.referral_id or ""),
+                    "payment_status": latest_payment.status if latest_payment else "not_created",
+                    "report_status": latest_report.report_status if latest_report else "not_created",
+                    "latest_report_id": latest_report.report_id if latest_report else "",
+                    "latest_report_pk": latest_report.id if latest_report else None,
+                    "latest_encounter_id": latest_report.encounter.encounter_id if latest_report and latest_report.encounter else "",
                     "referrals_count": referrals.count(),
                     "payments_count": payments.count(),
+                    "reports_count": reports.count(),
+                    "images_count": image_count,
                     "created_at": p.created_at,
                 }
             )
@@ -1076,7 +1192,7 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
                 },
                 "referrals": OpsReferralSerializer(referrals, many=True).data,
                 "payments": OpsPaymentSerializer(payments, many=True).data,
-                "reports": OpsReportSerializer(reports, many=True).data,
+                "reports": OpsReportSerializer(reports, many=True, context={"request": request}).data,
                 "uploads": uploads,
             }
         )

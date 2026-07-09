@@ -38,6 +38,7 @@ def serialize_user(user):
         "is_superuser": user.is_superuser,
         "must_change_password": get_must_change_password(user),
         "roles": get_user_role_names(user),
+        "can_access_ops": user.is_superuser or "ops_admin" in get_user_role_names(user) or "sentinel_ops" in get_user_role_names(user),
         "organization": {
             "id": org.id,
             "name": org.name,
@@ -45,6 +46,7 @@ def serialize_user(user):
             "organization_type": org.organization_type,
             "contact_email": org.contact_email,
             "is_active": org.is_active,
+            "is_sentinel_internal": org.organization_type == "sentinel" or org.clinic_id == "SNT-CLINIC",
         } if org else None,
     }
 

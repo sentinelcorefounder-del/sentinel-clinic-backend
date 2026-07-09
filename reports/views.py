@@ -348,8 +348,9 @@ def submit_report_to_ops(request, pk):
     mixin = StructuredReportRulesMixin()
     mixin._validate_report_can_be_submitted_to_ops(report)
 
-    # Clicking Submit to Ops now means the report is issued.
-    report.report_status = "issued"
+    # Clinic submission should enter the Sentinel Ops review queue.
+    # Ops will later approve/issue or reject the report.
+    report.report_status = "submitted_to_ops"
     report.submitted_to_ops_at = timezone.now()
     report.submitted_to_ops_by = user
     report.save(
@@ -375,7 +376,7 @@ def submit_report_to_ops(request, pk):
 
     return Response(
         {
-            "message": "Report issued and submitted to Ops successfully.",
+            "message": "Report submitted to Sentinel Ops successfully.",
             "report_id": report.report_id,
             "report_pk": report.pk,
             "report_status": report.report_status,

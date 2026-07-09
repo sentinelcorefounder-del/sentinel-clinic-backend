@@ -127,6 +127,9 @@ class OpsReferralSerializer(serializers.ModelSerializer):
 class OpsReportSerializer(serializers.ModelSerializer):
     patient_name = serializers.SerializerMethodField()
     clinic_name = serializers.SerializerMethodField()
+    source_hospital_name = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    report_pdf_url = serializers.SerializerMethodField()
     encounter_id_display = serializers.SerializerMethodField()
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
@@ -139,6 +142,9 @@ class OpsReportSerializer(serializers.ModelSerializer):
             "patient",
             "patient_name",
             "clinic_name",
+            "source_hospital_name",
+            "payment_status",
+            "report_pdf_url",
             "encounter",
             "encounter_id_display",
             "review_date",
@@ -163,6 +169,23 @@ class OpsReportSerializer(serializers.ModelSerializer):
     def get_clinic_name(self, obj):
         clinic = getattr(obj.patient, "assigned_clinic", None) if obj.patient else None
         return clinic.name if clinic else ""
+
+    def get_source_hospital_name(self, obj):
+        referral = obj.hospital_referrals.select_related("source_hospital").first()
+        hospital = referral.source_hospital if referral else None
+        return hospital.name if hospital else ""
+
+    def get_payment_status(self, obj):
+        referral = obj.hospital_referrals.prefetch_related("ops_payments").first()
+        if not referral:
+            return ""
+        payment = referral.ops_payments.order_by("-created_at").first()
+        return payment.status if payment else ""
+
+    def get_report_pdf_url(self, obj):
+        request = self.context.get("request")
+        path = f"/api/reports/{obj.id}/pdf/"
+        return request.build_absolute_uri(path) if request else path
 
     def get_encounter_id_display(self, obj):
         return obj.encounter.encounter_id if obj.encounter else ""
@@ -223,4 +246,4 @@ class OpsNotificationSerializer(serializers.ModelSerializer):
     def get_created_by_display(self, obj):
         if not obj.created_by:
             return "System"
-        return obj.created_by.username or obj.created_by.email or str(obj.created_by)
+        return obj.created_by.username or obj.created_by.email or str(obj)
