@@ -644,13 +644,25 @@ class OpsReportApprovalQueueView(OpsOnlyMixin, generics.ListAPIView):
         if report_status and report_status != "all":
             queryset = queryset.filter(report_status=report_status)
 
-        clinic_id = self.request.query_params.get("clinic")
-        if clinic_id:
-            queryset = queryset.filter(patient__assigned_clinic_id=clinic_id)
+        clinic = (self.request.query_params.get("clinic") or "").strip()
+        if clinic:
+            if clinic.isdigit():
+                queryset = queryset.filter(patient__assigned_clinic_id=clinic)
+            else:
+                queryset = queryset.filter(
+                    models.Q(patient__assigned_clinic__name__icontains=clinic)
+                    | models.Q(patient__assigned_clinic__clinic_id__icontains=clinic)
+                )
 
-        hospital_id = self.request.query_params.get("hospital")
-        if hospital_id:
-            queryset = queryset.filter(hospital_referrals__source_hospital_id=hospital_id)
+        hospital = (self.request.query_params.get("hospital") or "").strip()
+        if hospital:
+            if hospital.isdigit():
+                queryset = queryset.filter(hospital_referrals__source_hospital_id=hospital)
+            else:
+                queryset = queryset.filter(
+                    models.Q(hospital_referrals__source_hospital__name__icontains=hospital)
+                    | models.Q(hospital_referrals__source_hospital__clinic_id__icontains=hospital)
+                )
 
         search = (self.request.query_params.get("search") or "").strip()
         if search:
@@ -1043,9 +1055,15 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
         if denied:
             return denied
 
+        search = (request.query_params.get("search") or "").strip()
+        clinic = (request.query_params.get("clinic") or "").strip()
+        hospital = (request.query_params.get("hospital") or "").strip()
+        referral_status = (request.query_params.get("referral_status") or "").strip()
+        report_status = (request.query_params.get("report_status") or "").strip()
+        payment_status = (request.query_params.get("payment_status") or "").strip()
+
         patients = Patient.objects.select_related("assigned_clinic").all().order_by("-created_at")
 
-        search = (request.query_params.get("search") or "").strip()
         if search:
             patients = patients.filter(
                 models.Q(patient_id__icontains=search)
@@ -1061,7 +1079,6 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                 | models.Q(assigned_clinic__clinic_id__icontains=search)
             )
 
-        clinic = (request.query_params.get("clinic") or "").strip()
         if clinic:
             if clinic.isdigit():
                 patients = patients.filter(assigned_clinic_id=clinic)
@@ -1069,9 +1086,10 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                 patients = patients.filter(
                     models.Q(assigned_clinic__name__icontains=clinic)
                     | models.Q(assigned_clinic__clinic_id__icontains=clinic)
+                    | models.Q(hospital_referrals__matched_clinic__name__icontains=clinic)
+                    | models.Q(hospital_referrals__matched_clinic__clinic_id__icontains=clinic)
                 )
 
-        hospital = (request.query_params.get("hospital") or "").strip()
         if hospital:
             if hospital.isdigit():
                 patients = patients.filter(hospital_referrals__source_hospital_id=hospital)
@@ -1081,22 +1099,36 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     | models.Q(hospital_referrals__source_hospital__clinic_id__icontains=hospital)
                 )
 
-        referral_status = (request.query_params.get("referral_status") or "").strip()
         if referral_status:
             patients = patients.filter(hospital_referrals__referral_status=referral_status)
 
-        report_status = (request.query_params.get("report_status") or "").strip()
         if report_status:
-            patients = patients.filter(reports__report_status=report_status)
+            if report_status == "not_created":
+                patients = patients.filter(reports__isnull=True)
+            else:
+                patients = patients.filter(reports__report_status=report_status)
 
-        payment_status = (request.query_params.get("payment_status") or "").strip()
         if payment_status:
-            patients = patients.filter(hospital_referrals__ops_payments__status=payment_status)
+            if payment_status == "not_created":
+                patients = patients.filter(hospital_referrals__ops_payments__isnull=True)
+            else:
+                patients = patients.filter(hospital_referrals__ops_payments__status=payment_status)
 
         patients = patients.distinct()
         data = []
+        seen_patient_ids = set()
+
+        def image_count_for_patient(patient):
+            if not ImageUpload:
+                return 0
+            try:
+                return ImageUpload.objects.filter(patient=patient).count()
+            except Exception:
+                return ImageUpload.objects.filter(encounter__patient=patient).count()
 
         for p in patients:
+            seen_patient_ids.add(p.id)
+
             referrals = HospitalReferral.objects.select_related(
                 "source_hospital",
                 "matched_clinic",
@@ -1104,23 +1136,15 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
             ).filter(patient=p).order_by("-created_at")
 
             latest_referral = referrals.first()
-
             payments = OpsPayment.objects.filter(referral__patient=p).order_by("-created_at")
             latest_payment = payments.first()
-
             reports = StructuredReport.objects.filter(patient=p).select_related("encounter").order_by("-created_at")
             latest_report = reports.first()
-
-            image_count = 0
-            if ImageUpload:
-                try:
-                    image_count = ImageUpload.objects.filter(patient=p).count()
-                except Exception:
-                    image_count = ImageUpload.objects.filter(encounter__patient=p).count()
 
             data.append(
                 {
                     "id": p.id,
+                    "record_type": "patient",
                     "patient_id": p.patient_id,
                     "name": f"{p.first_name} {p.last_name}".strip(),
                     "dob": p.date_of_birth,
@@ -1130,9 +1154,21 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     "source_hospital": latest_referral.source_hospital.name if latest_referral and latest_referral.source_hospital else "",
                     "source_hospital_code": latest_referral.source_hospital.clinic_id if latest_referral and latest_referral.source_hospital else "",
                     "source_hospital_id": latest_referral.source_hospital_id if latest_referral else None,
-                    "assigned_clinic": p.assigned_clinic.name if p.assigned_clinic else "",
-                    "assigned_clinic_code": p.assigned_clinic.clinic_id if p.assigned_clinic else "",
-                    "assigned_clinic_id": p.assigned_clinic_id,
+                    "assigned_clinic": (
+                        latest_referral.matched_clinic.name
+                        if latest_referral and latest_referral.matched_clinic
+                        else (p.assigned_clinic.name if p.assigned_clinic else "")
+                    ),
+                    "assigned_clinic_code": (
+                        latest_referral.matched_clinic.clinic_id
+                        if latest_referral and latest_referral.matched_clinic
+                        else (p.assigned_clinic.clinic_id if p.assigned_clinic else "")
+                    ),
+                    "assigned_clinic_id": (
+                        latest_referral.matched_clinic_id
+                        if latest_referral and latest_referral.matched_clinic_id
+                        else p.assigned_clinic_id
+                    ),
                     "referral_status": latest_referral.referral_status if latest_referral else (p.referral_status or ""),
                     "referral_id": latest_referral.referral_id if latest_referral else (p.referral_id or ""),
                     "payment_status": latest_payment.status if latest_payment else "not_created",
@@ -1143,11 +1179,103 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     "referrals_count": referrals.count(),
                     "payments_count": payments.count(),
                     "reports_count": reports.count(),
-                    "images_count": image_count,
+                    "images_count": image_count_for_patient(p),
                     "created_at": p.created_at,
                 }
             )
 
+        # Include hospital referrals that are not currently linked to a Patient record.
+        # This prevents Ops from missing referrals/patients when patient linkage has not happened yet.
+        orphan_referrals = HospitalReferral.objects.select_related(
+            "source_hospital",
+            "matched_clinic",
+            "patient",
+            "report",
+        ).filter(patient__isnull=True)
+
+        if search:
+            orphan_referrals = orphan_referrals.filter(
+                models.Q(referral_id__icontains=search)
+                | models.Q(first_name__icontains=search)
+                | models.Q(last_name__icontains=search)
+                | models.Q(phone_number__icontains=search)
+                | models.Q(email__icontains=search)
+                | models.Q(source_hospital__name__icontains=search)
+                | models.Q(source_hospital__clinic_id__icontains=search)
+                | models.Q(matched_clinic__name__icontains=search)
+                | models.Q(matched_clinic__clinic_id__icontains=search)
+            )
+
+        if clinic:
+            if clinic.isdigit():
+                orphan_referrals = orphan_referrals.filter(matched_clinic_id=clinic)
+            else:
+                orphan_referrals = orphan_referrals.filter(
+                    models.Q(matched_clinic__name__icontains=clinic)
+                    | models.Q(matched_clinic__clinic_id__icontains=clinic)
+                )
+
+        if hospital:
+            if hospital.isdigit():
+                orphan_referrals = orphan_referrals.filter(source_hospital_id=hospital)
+            else:
+                orphan_referrals = orphan_referrals.filter(
+                    models.Q(source_hospital__name__icontains=hospital)
+                    | models.Q(source_hospital__clinic_id__icontains=hospital)
+                )
+
+        if referral_status:
+            orphan_referrals = orphan_referrals.filter(referral_status=referral_status)
+
+        if report_status:
+            if report_status == "not_created":
+                orphan_referrals = orphan_referrals.filter(report__isnull=True)
+            else:
+                orphan_referrals = orphan_referrals.filter(report__report_status=report_status)
+
+        if payment_status:
+            if payment_status == "not_created":
+                orphan_referrals = orphan_referrals.filter(ops_payments__isnull=True)
+            else:
+                orphan_referrals = orphan_referrals.filter(ops_payments__status=payment_status)
+
+        for referral in orphan_referrals.distinct().order_by("-created_at"):
+            latest_payment = referral.ops_payments.order_by("-created_at").first()
+            report = referral.report
+
+            data.append(
+                {
+                    "id": f"referral-{referral.id}",
+                    "record_type": "referral_only",
+                    "patient_id": referral.patient_id_text or referral.hospital_mrn or referral.referral_id,
+                    "name": f"{referral.first_name} {referral.last_name}".strip(),
+                    "dob": referral.dob,
+                    "sex": referral.patient_sex,
+                    "phone": referral.phone_number,
+                    "email": referral.email,
+                    "source_hospital": referral.source_hospital.name if referral.source_hospital else "",
+                    "source_hospital_code": referral.source_hospital.clinic_id if referral.source_hospital else "",
+                    "source_hospital_id": referral.source_hospital_id,
+                    "assigned_clinic": referral.matched_clinic.name if referral.matched_clinic else "",
+                    "assigned_clinic_code": referral.matched_clinic.clinic_id if referral.matched_clinic else "",
+                    "assigned_clinic_id": referral.matched_clinic_id,
+                    "referral_status": referral.referral_status,
+                    "referral_id": referral.referral_id,
+                    "payment_status": latest_payment.status if latest_payment else "not_created",
+                    "report_status": report.report_status if report else "not_created",
+                    "latest_report_id": report.report_id if report else "",
+                    "latest_report_pk": report.id if report else None,
+                    "latest_encounter_id": report.encounter.encounter_id if report and report.encounter else "",
+                    "referrals_count": 1,
+                    "payments_count": referral.ops_payments.count(),
+                    "reports_count": 1 if report else 0,
+                    "images_count": 0,
+                    "created_at": referral.created_at,
+                    "cannot_open_patient_detail": True,
+                }
+            )
+
+        data.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return Response(data)
 
 
@@ -1172,17 +1300,20 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
             except Exception:
                 image_qs = ImageUpload.objects.filter(encounter__patient=patient)
 
-            for img in image_qs:
-                image_file = getattr(img, "image", None)
+            for img in image_qs.select_related("encounter").order_by("-uploaded_at"):
+                image_file = getattr(img, "image_file", None) or getattr(img, "image", None)
                 uploads.append(
                     {
                         "id": img.id,
+                        "image_upload_id": getattr(img, "image_upload_id", ""),
                         "encounter_id": getattr(getattr(img, "encounter", None), "encounter_id", ""),
+                        "encounter_pk": getattr(img, "encounter_id", None),
                         "eye_laterality": getattr(img, "eye_laterality", ""),
                         "image_type": getattr(img, "image_type", ""),
                         "uploaded_at": getattr(img, "uploaded_at", ""),
                         "image_quality": getattr(img, "image_quality", ""),
                         "gradable": getattr(img, "gradable", ""),
+                        "retake_required": getattr(img, "retake_required", False),
                         "url": request.build_absolute_uri(image_file.url) if image_file else "",
                     }
                 )
