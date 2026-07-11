@@ -10,6 +10,7 @@ class StructuredReport(models.Model):
         ("under_review", "Under Review"),
         ("signed_off", "Signed Off"),
         ("submitted_to_ops", "Submitted to Ops"),
+        ("returned_to_clinic", "Returned to Clinic"),
         ("ops_approved", "Ops Approved"),
         ("ops_rejected", "Ops Rejected"),
         ("issued", "Issued"),
@@ -128,6 +129,11 @@ class StructuredReport(models.Model):
     )
 
     ops_review_note = models.TextField(blank=True, default="")
+    return_reason = models.TextField(blank=True, default="")
+    resubmission_count = models.PositiveIntegerField(default=0)
+    issued_at = models.DateTimeField(null=True, blank=True)
+    hospital_viewed_at = models.DateTimeField(null=True, blank=True)
+    hospital_downloaded_at = models.DateTimeField(null=True, blank=True)
     payout_email_sent_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -157,3 +163,40 @@ class StructuredReport(models.Model):
             sync_dataset_from_report(self)
         except Exception as exc:
             print("StructuredReport dataset sync failed:", exc)
+
+
+class ReportStatusEvent(models.Model):
+    EVENT_CHOICES = [
+        ("created", "Created"),
+        ("submitted_to_ops", "Submitted to Ops"),
+        ("returned_to_clinic", "Returned to Clinic"),
+        ("resubmitted", "Resubmitted"),
+        ("rejected", "Rejected"),
+        ("issued", "Issued"),
+        ("hospital_viewed", "Hospital Viewed"),
+        ("hospital_downloaded", "Hospital Downloaded"),
+    ]
+
+    report = models.ForeignKey(
+        StructuredReport,
+        on_delete=models.CASCADE,
+        related_name="status_events",
+    )
+    event_type = models.CharField(max_length=40, choices=EVENT_CHOICES)
+    from_status = models.CharField(max_length=30, blank=True, default="")
+    to_status = models.CharField(max_length=30, blank=True, default="")
+    note = models.TextField(blank=True, default="")
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="report_status_events",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.report.report_id} - {self.event_type}"

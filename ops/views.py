@@ -25,7 +25,7 @@ from organizations.services.provisioning import (
 from patients.models import Patient
 from payments.services.paystack import initialize_transaction, verify_transaction
 from referrals.models import HospitalReferral
-from reports.models import StructuredReport
+from reports.models import StructuredReport, ReportStatusEvent
 from users.models import UserSecurityProfile
 
 from .models import OpsAuditLog, OpsNotification, OpsPayment
@@ -677,6 +677,114 @@ class OpsReportApprovalQueueView(OpsOnlyMixin, generics.ListAPIView):
         return queryset.distinct().order_by("-submitted_to_ops_at", "-created_at")
 
 
+class OpsReportDetailView(OpsOnlyMixin, APIView):
+    def get(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        report = StructuredReport.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+            "encounter",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
+        ).prefetch_related(
+            "encounter__image_uploads",
+            "encounter__image_uploads__ai_analysis",
+            "hospital_referrals",
+            "hospital_referrals__source_hospital",
+            "hospital_referrals__matched_clinic",
+            "hospital_referrals__ops_payments",
+            "status_events",
+            "status_events__actor",
+        ).filter(pk=pk).first()
+
+        if not report:
+            return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(
+            OpsReportSerializer(report, context={"request": request}).data
+        )
+
+
+class OpsReportReturnView(OpsOnlyMixin, APIView):
+    def post(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        report = StructuredReport.objects.filter(pk=pk).first()
+        if not report:
+            return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if report.report_status != "submitted_to_ops":
+            return Response(
+                {"detail": f"Only submitted_to_ops reports can be returned. Current status: {report.report_status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = (request.data.get("reason") or request.data.get("note") or "").strip()
+        if not reason:
+            return Response(
+                {"detail": "A return reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        previous_status = report.report_status
+        report.report_status = "returned_to_clinic"
+        report.return_reason = reason
+        report.ops_review_note = reason
+        report.ops_reviewed_at = timezone.now()
+        report.ops_reviewed_by = request.user
+        report.save(
+            update_fields=[
+                "report_status",
+                "return_reason",
+                "ops_review_note",
+                "ops_reviewed_at",
+                "ops_reviewed_by",
+                "updated_at",
+            ]
+        )
+
+        ReportStatusEvent.objects.create(
+            report=report,
+            event_type="returned_to_clinic",
+            from_status=previous_status,
+            to_status="returned_to_clinic",
+            note=reason,
+            actor=request.user,
+        )
+
+        create_audit_log(
+            actor=request.user,
+            action="report_returned",
+            entity_type="report",
+            entity_id=report.id,
+            entity_label=report.report_id,
+            message=f"Report {report.report_id} returned to clinic.",
+            metadata={"reason": reason},
+        )
+
+        create_ops_notification(
+            title="Report returned to clinic",
+            message=f"Report {report.report_id} was returned for correction.",
+            level="warning",
+            entity_type="report",
+            entity_id=report.id,
+            entity_label=report.report_id,
+            created_by=request.user,
+        )
+
+        return Response(
+            {
+                "message": "Report returned to clinic.",
+                "report": OpsReportSerializer(report, context={"request": request}).data,
+            }
+        )
+
+
 class OpsReportApproveView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
         denied = self.check_ops_permission(request)
@@ -695,18 +803,30 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        previous_status = report.report_status
         report.report_status = "issued"
+        report.issued_at = timezone.now()
         report.ops_reviewed_at = timezone.now()
         report.ops_reviewed_by = request.user
         report.ops_review_note = (request.data.get("note") or "").strip()
         report.save(
             update_fields=[
                 "report_status",
+                "issued_at",
                 "ops_reviewed_at",
                 "ops_reviewed_by",
                 "ops_review_note",
                 "updated_at",
             ]
+        )
+
+        ReportStatusEvent.objects.create(
+            report=report,
+            event_type="issued",
+            from_status=previous_status,
+            to_status="issued",
+            note=report.ops_review_note or "Report approved and issued by Sentinel Ops.",
+            actor=request.user,
         )
 
         for referral in report.hospital_referrals.all():
@@ -761,6 +881,15 @@ class OpsReportRejectView(OpsOnlyMixin, APIView):
         report.ops_reviewed_by = request.user
         report.ops_review_note = (request.data.get("note") or "").strip()
         report.save(update_fields=["report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note", "updated_at"])
+
+        ReportStatusEvent.objects.create(
+            report=report,
+            event_type="rejected",
+            from_status="submitted_to_ops",
+            to_status="ops_rejected",
+            note=report.ops_review_note,
+            actor=request.user,
+        )
 
         create_audit_log(
             actor=request.user,

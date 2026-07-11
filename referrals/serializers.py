@@ -60,7 +60,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
         ]
 
     def get_report_pdf_url(self, obj):
-        if not obj.report_id:
+        if not obj.report_id or obj.report.report_status != "issued":
             return ""
 
         request = self.context.get("request")

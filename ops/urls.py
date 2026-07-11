@@ -10,6 +10,8 @@ from .views import (
     InitializeOpsPaymentView,
     VerifyOpsPaymentView,
     OpsReportApprovalQueueView,
+    OpsReportDetailView,
+    OpsReportReturnView,
     OpsReportApproveView,
     OpsReportRejectView,
     OpsCreateOrganizationView,
@@ -43,6 +45,8 @@ urlpatterns = [
     path("payments/webhook/", PaystackOpsWebhookView.as_view()),
 
     path("reports/approval-queue/", OpsReportApprovalQueueView.as_view()),
+    path("reports/<int:pk>/", OpsReportDetailView.as_view()),
+    path("reports/<int:pk>/return/", OpsReportReturnView.as_view()),
     path("reports/<int:pk>/approve/", OpsReportApproveView.as_view()),
     path("reports/<int:pk>/reject/", OpsReportRejectView.as_view()),
 

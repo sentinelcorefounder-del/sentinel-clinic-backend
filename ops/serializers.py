@@ -131,6 +131,10 @@ class OpsReportSerializer(serializers.ModelSerializer):
     payment_status = serializers.SerializerMethodField()
     report_pdf_url = serializers.SerializerMethodField()
     encounter_id_display = serializers.SerializerMethodField()
+    patient_id_display = serializers.SerializerMethodField()
+    images = serializers.SerializerMethodField()
+    referral = serializers.SerializerMethodField()
+    status_events = serializers.SerializerMethodField()
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
 
@@ -147,6 +151,10 @@ class OpsReportSerializer(serializers.ModelSerializer):
             "report_pdf_url",
             "encounter",
             "encounter_id_display",
+            "patient_id_display",
+            "images",
+            "referral",
+            "status_events",
             "review_date",
             "report_status",
             "urgency_outcome",
@@ -156,6 +164,11 @@ class OpsReportSerializer(serializers.ModelSerializer):
             "ops_reviewed_at",
             "ops_reviewed_by_display",
             "ops_review_note",
+            "return_reason",
+            "resubmission_count",
+            "issued_at",
+            "hospital_viewed_at",
+            "hospital_downloaded_at",
             "payout_email_sent_at",
             "created_at",
             "updated_at",
@@ -186,6 +199,73 @@ class OpsReportSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         path = f"/api/reports/{obj.id}/pdf/"
         return request.build_absolute_uri(path) if request else path
+
+    def get_patient_id_display(self, obj):
+        return obj.patient.patient_id if obj.patient else ""
+
+    def get_images(self, obj):
+        request = self.context.get("request")
+        images = []
+        for upload in obj.encounter.image_uploads.all().order_by("eye_laterality"):
+            file_obj = getattr(upload, "image_file", None)
+            url = ""
+            if file_obj:
+                try:
+                    url = file_obj.url
+                    if request:
+                        url = request.build_absolute_uri(url)
+                except Exception:
+                    url = ""
+            analysis = getattr(upload, "ai_analysis", None)
+            images.append(
+                {
+                    "id": upload.id,
+                    "image_upload_id": upload.image_upload_id,
+                    "eye_laterality": upload.eye_laterality,
+                    "image_quality": upload.image_quality,
+                    "gradable": upload.gradable,
+                    "url": url,
+                    "ai_prediction": getattr(analysis, "prediction", "") if analysis else "",
+                    "ai_confidence": getattr(analysis, "confidence", None) if analysis else None,
+                }
+            )
+        return images
+
+    def get_referral(self, obj):
+        referral = obj.hospital_referrals.select_related(
+            "source_hospital", "matched_clinic"
+        ).prefetch_related("ops_payments").first()
+        if not referral:
+            return None
+        payment = referral.ops_payments.order_by("-created_at").first()
+        return {
+            "id": referral.id,
+            "referral_id": referral.referral_id,
+            "source_hospital_name": referral.source_hospital.name if referral.source_hospital else "",
+            "matched_clinic_name": referral.matched_clinic.name if referral.matched_clinic else "",
+            "referral_status": referral.referral_status,
+            "payment_status": payment.status if payment else "not_created",
+        }
+
+    def get_status_events(self, obj):
+        return [
+            {
+                "id": event.id,
+                "event_type": event.event_type,
+                "from_status": event.from_status,
+                "to_status": event.to_status,
+                "note": event.note,
+                "actor_display": (
+                    event.actor.get_full_name()
+                    or event.actor.username
+                    or event.actor.email
+                    if event.actor
+                    else "System"
+                ),
+                "created_at": event.created_at,
+            }
+            for event in obj.status_events.select_related("actor").all()
+        ]
 
     def get_encounter_id_display(self, obj):
         return obj.encounter.encounter_id if obj.encounter else ""

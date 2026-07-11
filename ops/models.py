@@ -47,6 +47,8 @@ class OpsAuditLog(models.Model):
         ("payment_verified", "Payment Verified"),
         ("clinic_assigned", "Clinic Assigned"),
         ("report_approved", "Report Approved"),
+        ("report_returned", "Report Returned to Clinic"),
+        ("report_issued", "Report Issued"),
         ("report_rejected", "Report Rejected"),
     ]
 

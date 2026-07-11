@@ -17,7 +17,7 @@ from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
 from uploads.models import ImageUpload
-from .models import StructuredReport
+from .models import StructuredReport, ReportStatusEvent
 from .permissions import (
     CanManageReports,
     CanReviewOpsReports,
@@ -337,10 +337,10 @@ def submit_report_to_ops(request, pk):
             if not org or report.patient.assigned_clinic_id != org.id:
                 raise PermissionDenied("You cannot submit this report to Ops.")
 
-    if report.report_status not in {"draft", "under_review", "signed_off", "ops_rejected"}:
+    if report.report_status not in {"draft", "under_review", "signed_off", "ops_rejected", "returned_to_clinic"}:
         return Response(
             {
-                "detail": f"Only draft, under_review, signed_off, or ops_rejected reports can be submitted to Ops. Current status: {report.report_status}"
+                "detail": f"Only draft, under_review, signed_off, ops_rejected, or returned_to_clinic reports can be submitted to Ops. Current status: {report.report_status}"
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
@@ -350,16 +350,33 @@ def submit_report_to_ops(request, pk):
 
     # Clinic submission should enter the Sentinel Ops review queue.
     # Ops will later approve/issue or reject the report.
+    previous_status = report.report_status
+    is_resubmission = previous_status in {"ops_rejected", "returned_to_clinic"}
+
     report.report_status = "submitted_to_ops"
     report.submitted_to_ops_at = timezone.now()
+    report.return_reason = ""
+    if is_resubmission:
+        report.resubmission_count += 1
     report.submitted_to_ops_by = user
     report.save(
         update_fields=[
             "report_status",
             "submitted_to_ops_at",
             "submitted_to_ops_by",
+            "return_reason",
+            "resubmission_count",
             "updated_at",
         ]
+    )
+
+    ReportStatusEvent.objects.create(
+        report=report,
+        event_type="resubmitted" if is_resubmission else "submitted_to_ops",
+        from_status=previous_status,
+        to_status="submitted_to_ops",
+        note="Report resubmitted to Sentinel Ops." if is_resubmission else "Report submitted to Sentinel Ops.",
+        actor=user,
     )
 
     local_referral = sync_report_to_local_hospital_referral(report)
@@ -622,6 +639,31 @@ class StructuredReportPDFView(APIView):
 
                 if not is_clinic_match and not is_hospital_match:
                     raise PermissionDenied("You cannot access this report.")
+
+                if is_hospital_match:
+                    if report.report_status != "issued":
+                        raise PermissionDenied("This report has not been issued to the hospital yet.")
+
+                    now = timezone.now()
+                    event_type = "hospital_downloaded"
+                    if not report.hospital_viewed_at:
+                        report.hospital_viewed_at = now
+                    report.hospital_downloaded_at = now
+                    report.save(
+                        update_fields=[
+                            "hospital_viewed_at",
+                            "hospital_downloaded_at",
+                            "updated_at",
+                        ]
+                    )
+                    ReportStatusEvent.objects.create(
+                        report=report,
+                        event_type=event_type,
+                        from_status=report.report_status,
+                        to_status=report.report_status,
+                        note="Hospital opened/downloaded the issued report PDF.",
+                        actor=request.user,
+                    )
 
         patient = report.patient
         encounter = report.encounter

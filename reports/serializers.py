@@ -1,10 +1,33 @@
 from rest_framework import serializers
-from .models import StructuredReport
+from .models import StructuredReport, ReportStatusEvent
+
+
+class ReportStatusEventSerializer(serializers.ModelSerializer):
+    actor_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReportStatusEvent
+        fields = [
+            "id",
+            "event_type",
+            "from_status",
+            "to_status",
+            "note",
+            "actor",
+            "actor_display",
+            "created_at",
+        ]
+
+    def get_actor_display(self, obj):
+        if not obj.actor:
+            return "System"
+        return obj.actor.get_full_name() or obj.actor.username or obj.actor.email
 
 
 class StructuredReportSerializer(serializers.ModelSerializer):
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
+    status_events = ReportStatusEventSerializer(many=True, read_only=True)
 
     class Meta:
         model = StructuredReport
@@ -14,8 +37,6 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "encounter",
             "patient",
             "review_date",
-
-            # Laterality-aware clinical fields
             "left_unaided_va",
             "left_corrected_va",
             "left_dr_grade",
@@ -24,14 +45,12 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "right_corrected_va",
             "right_dr_grade",
             "right_maculopathy_grade",
-
             "ungradable",
             "urgency_outcome",
             "recommendation",
             "next_followup_interval",
             "report_status",
             "notes",
-
             "submitted_to_ops_at",
             "submitted_to_ops_by",
             "submitted_to_ops_by_display",
@@ -39,7 +58,13 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "ops_reviewed_by",
             "ops_reviewed_by_display",
             "ops_review_note",
+            "return_reason",
+            "resubmission_count",
+            "issued_at",
+            "hospital_viewed_at",
+            "hospital_downloaded_at",
             "payout_email_sent_at",
+            "status_events",
             "created_at",
             "updated_at",
         ]
@@ -52,7 +77,13 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "ops_reviewed_by",
             "ops_reviewed_by_display",
             "ops_review_note",
+            "return_reason",
+            "resubmission_count",
+            "issued_at",
+            "hospital_viewed_at",
+            "hospital_downloaded_at",
             "payout_email_sent_at",
+            "status_events",
             "created_at",
             "updated_at",
         ]

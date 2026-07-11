@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from common.tenant import get_user_organization
 from organizations.models import Organization
 from patients.models import Patient
-from reports.models import StructuredReport
+from reports.models import StructuredReport, ReportStatusEvent
 from .models import HospitalReferral, generate_referral_id
 from .permissions import IsHospitalUser
 from .serializers import HospitalReferralSerializer
@@ -53,6 +53,25 @@ class HospitalReferralListView(HospitalReferralQuerysetMixin, generics.ListAPIVi
 class HospitalReferralDetailView(HospitalReferralQuerysetMixin, generics.RetrieveAPIView):
     serializer_class = HospitalReferralSerializer
     permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def retrieve(self, request, *args, **kwargs):
+        referral = self.get_object()
+        report = referral.report
+
+        if report and report.report_status == "issued" and not report.hospital_viewed_at:
+            report.hospital_viewed_at = timezone.now()
+            report.save(update_fields=["hospital_viewed_at", "updated_at"])
+            ReportStatusEvent.objects.create(
+                report=report,
+                event_type="hospital_viewed",
+                from_status="issued",
+                to_status="issued",
+                note="Hospital opened the referral containing the issued report.",
+                actor=request.user,
+            )
+
+        serializer = self.get_serializer(referral)
+        return Response(serializer.data)
 
 
 class HospitalPayoutListView(HospitalReferralQuerysetMixin, generics.ListAPIView):
