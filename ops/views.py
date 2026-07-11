@@ -831,7 +831,7 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
 
         for referral in report.hospital_referrals.all():
             referral.report_ready = True
-            referral.referral_status = "completed"
+            referral.referral_status = "report_issued"
             referral.save(update_fields=["report_ready", "referral_status", "updated_at"])
 
         create_audit_log(
@@ -876,10 +876,17 @@ class OpsReportRejectView(OpsOnlyMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        rejection_note = (request.data.get("note") or "").strip()
+        if not rejection_note:
+            return Response(
+                {"detail": "A rejection reason is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         report.report_status = "ops_rejected"
         report.ops_reviewed_at = timezone.now()
         report.ops_reviewed_by = request.user
-        report.ops_review_note = (request.data.get("note") or "").strip()
+        report.ops_review_note = rejection_note
         report.save(update_fields=["report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note", "updated_at"])
 
         ReportStatusEvent.objects.create(

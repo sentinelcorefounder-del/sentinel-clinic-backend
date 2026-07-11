@@ -14,6 +14,8 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     payment_currency = serializers.SerializerMethodField()
     payment_reference = serializers.SerializerMethodField()
     payment_paid_at = serializers.SerializerMethodField()
+    report_status = serializers.SerializerMethodField()
+    report_issued_at = serializers.SerializerMethodField()
 
     class Meta:
         model = HospitalReferral
@@ -43,6 +45,8 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "referral_date",
             "referral_status",
             "report_ready",
+            "report_status",
+            "report_issued_at",
             "hospital_commission_amount",
             "payout_status",
             "payout_date",
@@ -58,6 +62,46 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_report_status(self, obj):
+        return obj.report.report_status if obj.report_id else "not_created"
+
+    def get_report_issued_at(self, obj):
+        if not obj.report_id or not obj.report.issued_at:
+            return ""
+        return obj.report.issued_at
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        report = instance.report
+
+        if not report:
+            data["report_ready"] = False
+            return data
+
+        status_map = {
+            "under_review": "report_created",
+            "signed_off": "report_created",
+            "submitted_to_ops": "submitted_to_ops",
+            "returned_to_clinic": "returned_to_clinic",
+            "ops_rejected": "returned_to_clinic",
+            "ops_approved": "submitted_to_ops",
+            "issued": "report_issued",
+        }
+
+        if report.report_status != "issued":
+            data["report_ready"] = False
+            data["report_pdf_url"] = ""
+            data["referral_status"] = status_map.get(
+                report.report_status,
+                data.get("referral_status", "in_clinic"),
+            )
+        else:
+            data["report_ready"] = True
+            if instance.referral_status != "completed":
+                data["referral_status"] = "report_issued"
+
+        return data
 
     def get_report_pdf_url(self, obj):
         if not obj.report_id or obj.report.report_status != "issued":

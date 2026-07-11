@@ -4,6 +4,7 @@ from .views import (
     StructuredReportDetailView,
     EncounterReportListView,
     PatientReportListView,
+    ClinicReportListView,
     StructuredReportPDFView,
     submit_report_to_ops,
     approve_report_by_ops,
@@ -19,4 +20,5 @@ urlpatterns = [
     path("<int:pk>/ops-reject/", reject_report_by_ops, name="report-ops-reject"),
     path("encounter/<int:encounter_id>/", EncounterReportListView.as_view(), name="encounter-reports"),
     path("patient/<int:patient_id>/", PatientReportListView.as_view(), name="patient-reports"),
+    path("clinic/", ClinicReportListView.as_view(), name="clinic-reports"),
 ]

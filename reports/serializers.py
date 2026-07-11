@@ -88,6 +88,26 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def validate(self, attrs):
+        encounter = attrs.get("encounter") or getattr(self.instance, "encounter", None)
+        patient = attrs.get("patient") or getattr(self.instance, "patient", None)
+
+        if encounter and patient and encounter.patient_id != patient.id:
+            raise serializers.ValidationError(
+                {"encounter": "The selected encounter does not belong to this patient."}
+            )
+
+        if encounter:
+            duplicate_qs = StructuredReport.objects.filter(encounter=encounter)
+            if self.instance:
+                duplicate_qs = duplicate_qs.exclude(pk=self.instance.pk)
+            if duplicate_qs.exists():
+                raise serializers.ValidationError(
+                    {"encounter": "A structured report already exists for this encounter. Edit the existing report instead."}
+                )
+
+        return attrs
+
     def get_submitted_to_ops_by_display(self, obj):
         user = obj.submitted_to_ops_by
         if not user:

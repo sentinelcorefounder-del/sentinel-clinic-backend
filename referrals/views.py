@@ -74,6 +74,143 @@ class HospitalReferralDetailView(HospitalReferralQuerysetMixin, generics.Retriev
         return Response(serializer.data)
 
 
+class HospitalIssuedReportListView(APIView):
+    permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def get(self, request):
+        org = get_user_organization(request.user)
+        if not request.user.is_superuser and not org:
+            return Response(
+                {"detail": "You are not linked to a hospital organization."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        referrals = HospitalReferral.objects.select_related(
+            "patient",
+            "matched_clinic",
+            "report",
+            "source_hospital",
+        ).filter(
+            report__report_status="issued",
+        )
+
+        if not request.user.is_superuser:
+            referrals = referrals.filter(source_hospital=org)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            from django.db import models as db_models
+            referrals = referrals.filter(
+                db_models.Q(report__report_id__icontains=search)
+                | db_models.Q(referral_id__icontains=search)
+                | db_models.Q(first_name__icontains=search)
+                | db_models.Q(last_name__icontains=search)
+                | db_models.Q(patient__patient_id__icontains=search)
+            )
+
+        data = []
+        for referral in referrals.order_by("-report__issued_at", "-updated_at"):
+            report = referral.report
+            data.append(
+                {
+                    "id": report.id,
+                    "report_id": report.report_id,
+                    "referral_id": referral.referral_id,
+                    "referral_pk": referral.id,
+                    "patient_id": referral.patient.patient_id if referral.patient else referral.patient_id_text,
+                    "patient_name": f"{referral.first_name} {referral.last_name}".strip(),
+                    "clinic_name": referral.matched_clinic.name if referral.matched_clinic else "",
+                    "issued_at": report.issued_at,
+                    "review_date": report.review_date,
+                    "report_status": report.report_status,
+                    "hospital_viewed_at": report.hospital_viewed_at,
+                    "hospital_downloaded_at": report.hospital_downloaded_at,
+                    "pdf_url": request.build_absolute_uri(f"/api/reports/{report.id}/pdf/"),
+                }
+            )
+
+        return Response(data)
+
+
+class HospitalIssuedReportDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def get(self, request, pk):
+        org = get_user_organization(request.user)
+
+        referral_qs = HospitalReferral.objects.select_related(
+            "patient",
+            "matched_clinic",
+            "report",
+            "source_hospital",
+        ).filter(
+            report_id=pk,
+            report__report_status="issued",
+        )
+
+        if not request.user.is_superuser:
+            if not org:
+                raise PermissionDenied("You are not linked to a hospital organization.")
+            referral_qs = referral_qs.filter(source_hospital=org)
+
+        referral = referral_qs.first()
+        if not referral:
+            return Response(
+                {"detail": "Issued report not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        report = referral.report
+        if not report.hospital_viewed_at:
+            report.hospital_viewed_at = timezone.now()
+            report.save(update_fields=["hospital_viewed_at", "updated_at"])
+            ReportStatusEvent.objects.create(
+                report=report,
+                event_type="hospital_viewed",
+                from_status="issued",
+                to_status="issued",
+                note="Hospital opened the issued report detail page.",
+                actor=request.user,
+            )
+
+        images = []
+        for upload in report.encounter.image_uploads.all().order_by("eye_laterality"):
+            image_file = getattr(upload, "image_file", None)
+            images.append(
+                {
+                    "id": upload.id,
+                    "image_upload_id": upload.image_upload_id,
+                    "eye_laterality": upload.eye_laterality,
+                    "image_quality": upload.image_quality,
+                    "url": request.build_absolute_uri(image_file.url) if image_file else "",
+                }
+            )
+
+        return Response(
+            {
+                "id": report.id,
+                "report_id": report.report_id,
+                "referral_id": referral.referral_id,
+                "referral_pk": referral.id,
+                "patient_id": referral.patient.patient_id if referral.patient else referral.patient_id_text,
+                "patient_name": f"{referral.first_name} {referral.last_name}".strip(),
+                "clinic_name": referral.matched_clinic.name if referral.matched_clinic else "",
+                "review_date": report.review_date,
+                "issued_at": report.issued_at,
+                "report_status": report.report_status,
+                "left_dr_grade": report.left_dr_grade,
+                "left_maculopathy_grade": report.left_maculopathy_grade,
+                "right_dr_grade": report.right_dr_grade,
+                "right_maculopathy_grade": report.right_maculopathy_grade,
+                "urgency_outcome": report.urgency_outcome,
+                "recommendation": report.recommendation,
+                "next_followup_interval": report.next_followup_interval,
+                "images": images,
+                "pdf_url": request.build_absolute_uri(f"/api/reports/{report.id}/pdf/"),
+            }
+        )
+
+
 class HospitalPayoutListView(HospitalReferralQuerysetMixin, generics.ListAPIView):
     serializer_class = HospitalReferralSerializer
     permission_classes = [IsAuthenticated, IsHospitalUser]
@@ -298,7 +435,7 @@ class HospitalReferralStatusSyncView(APIView):
             report = StructuredReport.objects.filter(report_id=report_id).first()
             if report and hospital_referral.report_id != report.id:
                 hospital_referral.report = report
-                hospital_referral.report_ready = True
+                hospital_referral.report_ready = report.report_status == "issued"
                 updated_fields.extend(["report", "report_ready"])
 
         if "report_ready" in data:
@@ -320,8 +457,23 @@ class HospitalReferralStatusSyncView(APIView):
         if requested_status:
             hospital_referral.referral_status = requested_status
         else:
-            if hospital_referral.report_ready or hospital_referral.report_id:
-                hospital_referral.referral_status = "completed"
+            if (
+                hospital_referral.report_id
+                and hospital_referral.report.report_status == "issued"
+            ):
+                hospital_referral.referral_status = "report_issued"
+            elif (
+                hospital_referral.report_id
+                and hospital_referral.report.report_status == "submitted_to_ops"
+            ):
+                hospital_referral.referral_status = "submitted_to_ops"
+            elif (
+                hospital_referral.report_id
+                and hospital_referral.report.report_status in {"returned_to_clinic", "ops_rejected"}
+            ):
+                hospital_referral.referral_status = "returned_to_clinic"
+            elif hospital_referral.report_id:
+                hospital_referral.referral_status = "report_created"
             elif hospital_referral.matched_clinic_id:
                 hospital_referral.referral_status = "clinic_matched"
             else:

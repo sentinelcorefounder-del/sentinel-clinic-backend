@@ -104,6 +104,27 @@ class StructuredReportRulesMixin:
         if not data.get("right_corrected_va"):
             data["right_corrected_va"] = getattr(encounter, "right_corrected_pinhole_va", "")
 
+    def _validate_report_editable(self, report, user):
+        if user.is_superuser:
+            return
+
+        user_groups = set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in user_groups:
+            return
+
+        editable_statuses = {
+            "draft",
+            "under_review",
+            "signed_off",
+            "returned_to_clinic",
+            "ops_rejected",
+        }
+        if report.report_status not in editable_statuses:
+            raise PermissionDenied(
+                f"This report cannot be edited while its status is {report.report_status}. "
+                "Reports submitted to Ops or already issued are read-only."
+            )
+
     def _validate_report_can_be_submitted_to_ops(self, report):
         missing_items = []
 
@@ -174,25 +195,34 @@ class StructuredReportListCreateView(
         self._validate_report_prerequisites(serializer, patient, encounter)
         self._apply_encounter_va_defaults(serializer, encounter)
 
-        if user.is_superuser:
-            serializer.save()
-            return
-
-        user_groups = set(user.groups.values_list("name", flat=True))
-        if "ops_admin" in user_groups:
-            serializer.save()
-            return
-
-        org = get_user_organization(user)
-        if not org:
-            raise PermissionDenied("You are not linked to a clinic organization.")
-
-        if patient.assigned_clinic_id != org.id:
+        if StructuredReport.objects.filter(encounter=encounter).exists():
             raise PermissionDenied(
-                "You cannot create reports for another clinic's patient."
+                "A structured report already exists for this encounter. Open and edit the existing report."
             )
 
-        serializer.save()
+        if not user.is_superuser:
+            user_groups = set(user.groups.values_list("name", flat=True))
+            if "ops_admin" not in user_groups:
+                org = get_user_organization(user)
+                if not org:
+                    raise PermissionDenied("You are not linked to a clinic organization.")
+
+                if patient.assigned_clinic_id != org.id:
+                    raise PermissionDenied(
+                        "You cannot create reports for another clinic's patient."
+                    )
+
+        report = serializer.save()
+        ReportStatusEvent.objects.get_or_create(
+            report=report,
+            event_type="created",
+            defaults={
+                "from_status": "",
+                "to_status": report.report_status,
+                "note": "Structured report created by clinic.",
+                "actor": user,
+            },
+        )
 
 
 class StructuredReportDetailView(
@@ -227,6 +257,8 @@ class StructuredReportDetailView(
 
     def perform_update(self, serializer):
         user = self.request.user
+        self._validate_report_editable(serializer.instance, user)
+
         patient = serializer.validated_data.get("patient", serializer.instance.patient)
         encounter = serializer.validated_data.get(
             "encounter", serializer.instance.encounter
@@ -254,6 +286,46 @@ class StructuredReportDetailView(
             )
 
         serializer.save()
+
+
+class ClinicReportListView(generics.ListAPIView):
+    serializer_class = StructuredReportSerializer
+    permission_classes = [CanManageReports]
+
+    def get_queryset(self):
+        queryset = StructuredReport.objects.select_related(
+            "patient",
+            "patient__assigned_clinic",
+            "encounter",
+            "submitted_to_ops_by",
+            "ops_reviewed_by",
+        ).prefetch_related("status_events").all()
+
+        user = self.request.user
+        if not user.is_superuser:
+            user_groups = set(user.groups.values_list("name", flat=True))
+            if "ops_admin" not in user_groups:
+                org = get_user_organization(user)
+                if not org:
+                    return StructuredReport.objects.none()
+                queryset = queryset.filter(patient__assigned_clinic=org)
+
+        report_status = (self.request.query_params.get("status") or "").strip()
+        if report_status and report_status != "all":
+            queryset = queryset.filter(report_status=report_status)
+
+        search = (self.request.query_params.get("search") or "").strip()
+        if search:
+            from django.db import models as db_models
+            queryset = queryset.filter(
+                db_models.Q(report_id__icontains=search)
+                | db_models.Q(patient__patient_id__icontains=search)
+                | db_models.Q(patient__first_name__icontains=search)
+                | db_models.Q(patient__last_name__icontains=search)
+                | db_models.Q(encounter__encounter_id__icontains=search)
+            )
+
+        return queryset.order_by("-updated_at")
 
 
 class EncounterReportListView(generics.ListAPIView):
@@ -663,6 +735,14 @@ class StructuredReportPDFView(APIView):
                         to_status=report.report_status,
                         note="Hospital opened/downloaded the issued report PDF.",
                         actor=request.user,
+                    )
+
+                    report.hospital_referrals.filter(
+                        source_hospital=org
+                    ).update(
+                        referral_status="completed",
+                        report_ready=True,
+                        updated_at=now,
                     )
 
         patient = report.patient

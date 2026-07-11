@@ -62,10 +62,10 @@ class StructuredReport(models.Model):
 
     report_id = models.CharField(max_length=30, unique=True)
 
-    encounter = models.ForeignKey(
+    encounter = models.OneToOneField(
         ScreeningEncounter,
         on_delete=models.CASCADE,
-        related_name="reports",
+        related_name="structured_report",
     )
 
     patient = models.ForeignKey(
