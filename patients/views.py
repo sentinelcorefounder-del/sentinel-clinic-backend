@@ -14,6 +14,7 @@ from .models import Patient
 from .permissions import CanManagePatients
 from .serializers import PatientSerializer
 from .sync_serializers import PatientSyncSerializer
+from audit.services import record_patient_event
 
 
 def get_user_clinic_organization(user):
@@ -94,7 +95,20 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
         if patient.assigned_clinic_id != org.id:
             raise PermissionDenied("You cannot update this patient.")
 
-        serializer.save()
+        updated_patient = serializer.save()
+        record_patient_event(
+            patient=updated_patient,
+            event_key=f"patient:{updated_patient.pk}:manual_update:{updated_patient.updated_at}",
+            category="registration",
+            event_type="patient_updated",
+            title="Patient record updated",
+            description="Patient details were updated by a clinic user.",
+            source_type="patient",
+            source_id=updated_patient.pk,
+            actor=user,
+            organization=org,
+            occurred_at=updated_patient.updated_at,
+        )
 
     def perform_destroy(self, instance):
         user = self.request.user

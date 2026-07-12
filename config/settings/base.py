@@ -15,6 +15,8 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
 
+    "audit.apps.AuditConfig",
+
     # Project apps
     "users",
     "organizations",
@@ -25,7 +27,6 @@ INSTALLED_APPS = [
     "uploads",
     "reports",
     "consents",
-    "audit",
     "dashboard",
     "payments",
     "ops",
@@ -39,8 +40,10 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "audit.middleware.AuditActorMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    
 ]
 
 ROOT_URLCONF = "config.urls"
