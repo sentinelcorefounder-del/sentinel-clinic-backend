@@ -9,10 +9,14 @@ from .views import (
     MatchClinicView,
     HospitalIssuedReportListView,
     HospitalIssuedReportDetailView,
+    HospitalPatientListView,
+    HospitalPatientDetailView,
 )
 
 urlpatterns = [
     path("hospital/dashboard/", HospitalDashboardView.as_view(), name="hospital-dashboard"),
+    path("hospital/patients/", HospitalPatientListView.as_view(), name="hospital-patients"),
+    path("hospital/patients/<int:pk>/", HospitalPatientDetailView.as_view(), name="hospital-patient-detail"),
     path("hospital/referrals/", HospitalReferralListView.as_view(), name="hospital-referrals"),
     path("hospital/referrals/<int:pk>/", HospitalReferralDetailView.as_view(), name="hospital-referral-detail"),
     path("hospital/payouts/", HospitalPayoutListView.as_view(), name="hospital-payouts"),

@@ -1,5 +1,6 @@
 
 from django.utils import timezone
+from django.db.models import Q, Max
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
@@ -211,6 +212,288 @@ class HospitalIssuedReportDetailView(APIView):
         )
 
 
+
+class HospitalPatientListView(APIView):
+    """
+    Hospital-scoped patient registry.
+
+    A hospital only sees patients linked to referrals submitted by its own
+    organisation. Duplicate referrals for the same patient are collapsed into
+    one patient row using the latest referral.
+    """
+
+    permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def get(self, request):
+        org = get_user_organization(request.user)
+
+        if not request.user.is_superuser:
+            if not org:
+                return Response(
+                    {"detail": "You are not linked to a hospital organization."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if org.organization_type != "hospital":
+                return Response(
+                    {"detail": "Only hospital users can access hospital patients."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        referrals = HospitalReferral.objects.select_related(
+            "patient",
+            "matched_clinic",
+            "report",
+            "source_hospital",
+        ).prefetch_related("ops_payments").filter(patient__isnull=False)
+
+        if not request.user.is_superuser:
+            referrals = referrals.filter(source_hospital=org)
+
+        search = (request.query_params.get("search") or "").strip()
+        referral_status = (request.query_params.get("status") or "").strip()
+
+        if search:
+            referrals = referrals.filter(
+                Q(patient__patient_id__icontains=search)
+                | Q(patient__first_name__icontains=search)
+                | Q(patient__last_name__icontains=search)
+                | Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+                | Q(hospital_mrn__icontains=search)
+                | Q(referral_id__icontains=search)
+            )
+
+        if referral_status and referral_status != "all":
+            if referral_status == "report_ready":
+                referrals = referrals.filter(
+                    report__report_status="issued",
+                    report_ready=True,
+                )
+            else:
+                referrals = referrals.filter(referral_status=referral_status)
+
+        referrals = referrals.order_by("patient_id", "-updated_at", "-id")
+
+        seen_patient_ids = set()
+        data = []
+
+        for referral in referrals:
+            patient = referral.patient
+            if not patient or patient.id in seen_patient_ids:
+                continue
+
+            seen_patient_ids.add(patient.id)
+            payment = referral.ops_payments.order_by("-created_at").first()
+            report = referral.report
+
+            data.append(
+                {
+                    "patient_pk": patient.id,
+                    "patient_id": patient.patient_id,
+                    "patient_name": f"{patient.first_name} {patient.last_name}".strip(),
+                    "date_of_birth": patient.date_of_birth,
+                    "sex": patient.sex,
+                    "phone": patient.phone,
+                    "email": patient.email,
+                    "hospital_mrn": referral.hospital_mrn,
+                    "referral_pk": referral.id,
+                    "referral_id": referral.referral_id,
+                    "referral_status": referral.referral_status,
+                    "clinic_name": (
+                        referral.matched_clinic.name
+                        if referral.matched_clinic
+                        else ""
+                    ),
+                    "payment_status": payment.status if payment else "not_created",
+                    "report_pk": report.id if report else None,
+                    "report_id": report.report_id if report else "",
+                    "report_status": report.report_status if report else "not_created",
+                    "report_ready": bool(
+                        report
+                        and report.report_status == "issued"
+                        and referral.report_ready
+                    ),
+                    "latest_activity": referral.updated_at,
+                }
+            )
+
+        return Response(data)
+
+
+class HospitalPatientDetailView(APIView):
+    """
+    Hospital-scoped patient detail.
+
+    Only data linked to the authenticated hospital is returned. Clinical
+    reports and fundus images are exposed only for reports issued by Ops.
+    """
+
+    permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def get(self, request, pk):
+        org = get_user_organization(request.user)
+
+        referrals = HospitalReferral.objects.select_related(
+            "patient",
+            "matched_clinic",
+            "report",
+            "source_hospital",
+            "report__encounter",
+        ).prefetch_related(
+            "ops_payments",
+            "report__encounter__image_uploads",
+            "report__encounter__image_uploads__ai_analysis",
+        ).filter(
+            patient_id=pk,
+        )
+
+        if not request.user.is_superuser:
+            if not org:
+                return Response(
+                    {"detail": "You are not linked to a hospital organization."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            referrals = referrals.filter(source_hospital=org)
+
+        referrals = referrals.order_by("-updated_at", "-id")
+        latest_referral = referrals.first()
+
+        if not latest_referral or not latest_referral.patient:
+            return Response(
+                {"detail": "Patient not found for this hospital."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        patient = latest_referral.patient
+
+        referral_rows = []
+        report_rows = []
+        encounter_rows = []
+        upload_rows = []
+
+        seen_report_ids = set()
+        seen_encounter_ids = set()
+        seen_upload_ids = set()
+
+        for referral in referrals:
+            payment = referral.ops_payments.order_by("-created_at").first()
+            report = referral.report
+
+            referral_rows.append(
+                {
+                    "id": referral.id,
+                    "referral_id": referral.referral_id,
+                    "hospital_mrn": referral.hospital_mrn,
+                    "clinic_name": (
+                        referral.matched_clinic.name
+                        if referral.matched_clinic
+                        else ""
+                    ),
+                    "referral_status": referral.referral_status,
+                    "payment_status": payment.status if payment else "not_created",
+                    "report_status": report.report_status if report else "not_created",
+                    "created_at": referral.created_at,
+                    "updated_at": referral.updated_at,
+                }
+            )
+
+            if not report or report.report_status != "issued":
+                continue
+
+            if report.id not in seen_report_ids:
+                seen_report_ids.add(report.id)
+                report_rows.append(
+                    {
+                        "id": report.id,
+                        "report_id": report.report_id,
+                        "review_date": report.review_date,
+                        "report_status": report.report_status,
+                        "issued_at": report.issued_at,
+                        "left_dr_grade": report.left_dr_grade,
+                        "right_dr_grade": report.right_dr_grade,
+                        "left_maculopathy_grade": report.left_maculopathy_grade,
+                        "right_maculopathy_grade": report.right_maculopathy_grade,
+                        "urgency_outcome": report.urgency_outcome,
+                        "recommendation": report.recommendation,
+                        "pdf_url": request.build_absolute_uri(
+                            f"/api/reports/{report.id}/pdf/"
+                        ),
+                    }
+                )
+
+            encounter = report.encounter
+            if encounter and encounter.id not in seen_encounter_ids:
+                seen_encounter_ids.add(encounter.id)
+                encounter_rows.append(
+                    {
+                        "id": encounter.id,
+                        "encounter_id": encounter.encounter_id,
+                        "encounter_date": encounter.encounter_date,
+                        "screening_status": encounter.screening_status,
+                        "encounter_type": encounter.encounter_type,
+                    }
+                )
+
+            if encounter:
+                for upload in encounter.image_uploads.all():
+                    if upload.id in seen_upload_ids:
+                        continue
+                    seen_upload_ids.add(upload.id)
+
+                    image_file = getattr(upload, "image_file", None)
+                    analysis = getattr(upload, "ai_analysis", None)
+
+                    upload_rows.append(
+                        {
+                            "id": upload.id,
+                            "image_upload_id": upload.image_upload_id,
+                            "encounter": encounter.id,
+                            "encounter_display": encounter.encounter_id,
+                            "eye_laterality": upload.eye_laterality,
+                            "image_quality": upload.image_quality,
+                            "uploaded_at": upload.uploaded_at,
+                            "image_file": (
+                                request.build_absolute_uri(image_file.url)
+                                if image_file
+                                else ""
+                            ),
+                            "ai_analysis": (
+                                {
+                                    "prediction": getattr(
+                                        analysis, "prediction", ""
+                                    ),
+                                    "confidence": getattr(
+                                        analysis, "confidence", None
+                                    ),
+                                }
+                                if analysis
+                                else None
+                            ),
+                        }
+                    )
+
+        return Response(
+            {
+                "patient": {
+                    "id": patient.id,
+                    "patient_id": patient.patient_id,
+                    "first_name": patient.first_name,
+                    "last_name": patient.last_name,
+                    "date_of_birth": patient.date_of_birth,
+                    "sex": patient.sex,
+                    "phone": patient.phone,
+                    "email": patient.email,
+                    "consent_status": patient.consent_status,
+                    "referral_id": patient.referral_id,
+                },
+                "referrals": referral_rows,
+                "encounters": encounter_rows,
+                "reports": report_rows,
+                "uploads": upload_rows,
+            }
+        )
+
+
 class HospitalPayoutListView(HospitalReferralQuerysetMixin, generics.ListAPIView):
     serializer_class = HospitalReferralSerializer
     permission_classes = [IsAuthenticated, IsHospitalUser]
@@ -233,7 +516,12 @@ class HospitalDashboardView(APIView):
             else:
                 referrals = referrals.filter(source_hospital=org)
 
+        patient_count = referrals.exclude(
+            patient__isnull=True
+        ).values("patient_id").distinct().count()
+
         data = {
+            "total_patients": patient_count,
             "total_referrals": referrals.count(),
             "submitted": referrals.filter(referral_status="submitted").count(),
             "clinic_matched": referrals.filter(referral_status="clinic_matched").count(),
