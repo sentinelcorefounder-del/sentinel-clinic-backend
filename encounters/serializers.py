@@ -5,6 +5,8 @@ from .models import ScreeningEncounter
 class ScreeningEncounterSerializer(serializers.ModelSerializer):
     poor_va_flag = serializers.SerializerMethodField()
     poor_va_reason = serializers.SerializerMethodField()
+    source_hospital_name = serializers.SerializerMethodField()
+    originating_organization_name = serializers.SerializerMethodField()
 
     class Meta:
         model = ScreeningEncounter
@@ -15,6 +17,14 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "patient",
             "encounter_date",
             "encounter_type",
+            "programme",
+            "source_type",
+            "workflow_route",
+            "payment_responsibility",
+            "originating_organization",
+            "originating_organization_name",
+            "hospital_referral",
+            "source_hospital_name",
             "screening_status",
 
             # Legacy fields
@@ -53,6 +63,9 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
 
         read_only_fields = [
             "screening_status",
+            "originating_organization",
+            "originating_organization_name",
+            "source_hospital_name",
             "poor_va_flag",
             "poor_va_reason",
             "created_at",
@@ -99,3 +112,12 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             reasons.append(f"Right eye {method} VA is {obj.right_corrected_pinhole_va}")
 
         return "; ".join(reasons)
+
+    def get_source_hospital_name(self, obj):
+        referral = getattr(obj, "hospital_referral", None)
+        hospital = getattr(referral, "source_hospital", None) if referral else None
+        return hospital.name if hospital else ""
+
+    def get_originating_organization_name(self, obj):
+        organization = getattr(obj, "originating_organization", None)
+        return organization.name if organization else ""

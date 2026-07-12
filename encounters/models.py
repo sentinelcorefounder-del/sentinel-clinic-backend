@@ -1,8 +1,13 @@
 from django.db import models
 from patients.models import Patient
+from organizations.models import Organization
 
 
 class ScreeningEncounter(models.Model):
+    PROGRAMME_CHOICES = [("diabetic_screening", "Diabetic Retinal Assessment")]
+    SOURCE_TYPE_CHOICES = [("hospital_referral", "Hospital Referral"), ("clinic_direct", "Clinic Direct")]
+    WORKFLOW_ROUTE_CHOICES = [("sentinel_managed", "Sentinel Managed"), ("clinic_managed", "Clinic Managed")]
+    PAYMENT_RESPONSIBILITY_CHOICES = [("patient", "Patient"), ("clinic", "Clinic"), ("hospital", "Hospital"), ("programme", "Programme Sponsor"), ("waived", "Waived")]
     STATUS_CHOICES = [
         ("scheduled", "Scheduled"),
         ("in_progress", "In Progress"),
@@ -29,6 +34,13 @@ class ScreeningEncounter(models.Model):
 
     encounter_date = models.DateField()
     encounter_type = models.CharField(max_length=50, default="retinal_assessment")
+
+    programme = models.CharField(max_length=40, choices=PROGRAMME_CHOICES, default="diabetic_screening")
+    source_type = models.CharField(max_length=30, choices=SOURCE_TYPE_CHOICES, default="hospital_referral")
+    workflow_route = models.CharField(max_length=30, choices=WORKFLOW_ROUTE_CHOICES, default="sentinel_managed")
+    payment_responsibility = models.CharField(max_length=20, choices=PAYMENT_RESPONSIBILITY_CHOICES, default="hospital")
+    originating_organization = models.ForeignKey(Organization, on_delete=models.SET_NULL, null=True, blank=True, related_name="originated_screening_encounters")
+    hospital_referral = models.ForeignKey("referrals.HospitalReferral", on_delete=models.SET_NULL, null=True, blank=True, related_name="screening_encounters")
 
     screening_status = models.CharField(
         max_length=30,

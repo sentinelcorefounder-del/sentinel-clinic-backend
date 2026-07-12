@@ -12,9 +12,11 @@ from users.models import UserOrganization
 
 from .models import Patient
 from .permissions import CanManagePatients
-from .serializers import PatientSerializer
+from .serializers import PatientSerializer, ClinicDirectPatientCreateSerializer
 from .sync_serializers import PatientSyncSerializer
 from audit.services import record_patient_event
+from organizations.models import OrganizationProfile
+from django.db import transaction
 
 
 def get_user_clinic_organization(user):
@@ -118,6 +120,56 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
             raise PermissionDenied("You cannot delete this patient.")
 
         instance.delete()
+
+
+def generate_clinic_patient_id(clinic):
+    prefix = f"{(clinic.clinic_id or 'CLINIC').upper().replace(' ', '-')}-PAT-"
+    latest = Patient.objects.filter(patient_id__startswith=prefix).order_by("-id").first()
+    try:
+        number = int(latest.patient_id.split("-")[-1]) + 1 if latest else 1
+    except Exception:
+        number = (latest.id + 1) if latest else 1
+    candidate = f"{prefix}{number:06d}"
+    while Patient.objects.filter(patient_id=candidate).exists():
+        number += 1
+        candidate = f"{prefix}{number:06d}"
+    return candidate
+
+
+class ClinicDirectPatientCreateView(APIView):
+    permission_classes = [CanManagePatients]
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        org = get_user_clinic_organization(user)
+        if not org or org.organization_type != "clinic":
+            raise PermissionDenied("You are not linked to a clinic.")
+
+        profile, _ = OrganizationProfile.objects.get_or_create(organization=org)
+        if not profile.clinic_direct_screening_enabled:
+            raise PermissionDenied("Clinic-direct diabetic retinal assessment is not enabled for this clinic.")
+        if not profile.can_create_direct_patients:
+            raise PermissionDenied("This clinic is not permitted to create direct patient records.")
+
+        serializer = ClinicDirectPatientCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        patient = serializer.save(
+            patient_id=generate_clinic_patient_id(org),
+            assigned_clinic=org, consent_status="pending",
+            referral_id="", referral_status="clinic_direct",
+            source_system="clinic_direct",
+        )
+        record_patient_event(
+            patient=patient, event_key=f"patient:{patient.pk}:clinic_direct_created",
+            category="registration", event_type="clinic_direct_patient_created",
+            title="Clinic-direct patient registered",
+            description=f"Patient registered directly by {org.name} for diabetic retinal assessment.",
+            source_type="patient", source_id=patient.pk, actor=user, organization=org,
+            visibility="clinic_ops", metadata={"source_type":"clinic_direct"},
+            occurred_at=patient.created_at,
+        )
+        return Response(PatientSerializer(patient).data, status=status.HTTP_201_CREATED)
 
 
 class PatientSyncView(APIView):
