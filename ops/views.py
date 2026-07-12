@@ -17,7 +17,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from organizations.models import Organization
+from organizations.models import Organization, OrganizationProfile
 from organizations.services.provisioning import (
     provision_clinic_with_admin,
     provision_hospital_with_admin,
@@ -35,6 +35,7 @@ from .serializers import (
     OpsPaymentSerializer,
     OpsReferralSerializer,
     OpsReportSerializer,
+    OpsOrganizationCapabilitySerializer,
 )
 
 try:
@@ -51,6 +52,19 @@ def user_is_ops(user):
         return True
     roles = set(user.groups.values_list("name", flat=True))
     return bool({"ops_admin", "sentinel_ops", "super_admin"} & roles)
+
+
+
+def get_or_create_capability_profile(organization):
+    profile, _ = OrganizationProfile.objects.get_or_create(
+        organization=organization
+    )
+    return profile
+
+
+def capability_profile_data(organization):
+    profile = get_or_create_capability_profile(organization)
+    return OpsOrganizationCapabilitySerializer(profile).data
 
 
 def generate_payment_id(referral):
@@ -953,6 +967,76 @@ class OpsCreateOrganizationView(OpsOnlyMixin, APIView):
 
             result = provision_clinic_with_admin(payload)
 
+            clinic_org = (
+                Organization.objects.filter(
+                    id=result.get("organization_id")
+                ).first()
+                or Organization.objects.filter(
+                    clinic_id=payload["clinic_id"]
+                ).first()
+            )
+
+            if clinic_org:
+                profile = get_or_create_capability_profile(clinic_org)
+
+                requested_mode = (
+                    request.data.get("workflow_mode")
+                    or "sentinel_managed"
+                )
+                profile.workflow_mode = requested_mode
+                profile.referral_requirement = (
+                    request.data.get("referral_requirement")
+                    or "required"
+                )
+                profile.patient_ownership = (
+                    request.data.get("patient_ownership")
+                    or "shared"
+                )
+                profile.can_create_direct_patients = bool(
+                    request.data.get("can_create_direct_patients", False)
+                )
+                profile.electronic_signature_required = bool(
+                    request.data.get(
+                        "electronic_signature_required",
+                        False,
+                    )
+                )
+                profile.default_payment_responsibility = (
+                    request.data.get(
+                        "default_payment_responsibility"
+                    )
+                    or "hospital"
+                )
+                profile.branding_policy = (
+                    request.data.get("branding_policy")
+                    or "organization_and_sentinel"
+                )
+                profile.subscription_tier = (
+                    request.data.get("subscription_tier")
+                    or "pilot"
+                )
+                profile.ai_enabled = bool(
+                    request.data.get("ai_enabled", True)
+                )
+                profile.clinic_direct_screening_enabled = bool(
+                    request.data.get(
+                        "clinic_direct_screening_enabled",
+                        False,
+                    )
+                )
+
+                if requested_mode == "sentinel_managed":
+                    profile.can_issue_reports_directly = False
+                    profile.sentinel_review_policy = "mandatory"
+                elif requested_mode == "clinic_managed":
+                    profile.can_issue_reports_directly = True
+                    profile.sentinel_review_policy = "unavailable"
+                else:
+                    profile.can_issue_reports_directly = True
+                    profile.sentinel_review_policy = "optional"
+
+                profile.save()
+
             create_audit_log(
                 actor=request.user,
                 action="clinic_created",
@@ -1637,6 +1721,7 @@ class OpsClinicListView(OpsOnlyMixin, APIView):
                     "assigned_referrals": referrals.count(),
                     "reports_count": reports.count(),
                     "paid_payments": payments.filter(status="paid").count(),
+                    "capability_profile": capability_profile_data(c),
                 }
             )
 
@@ -1644,19 +1729,20 @@ class OpsClinicListView(OpsOnlyMixin, APIView):
 
 
 class OpsClinicDetailView(OpsOnlyMixin, APIView):
-    def get(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
-
-        clinic = Organization.objects.filter(pk=pk, organization_type="clinic").first()
-        if not clinic:
-            return Response({"detail": "Clinic not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        referrals = HospitalReferral.objects.select_related("patient", "source_hospital", "report").filter(matched_clinic=clinic)
+    def _build_response(self, request, clinic):
+        referrals = HospitalReferral.objects.select_related(
+            "patient",
+            "source_hospital",
+            "report",
+        ).filter(matched_clinic=clinic)
         patients = Patient.objects.filter(assigned_clinic=clinic)
-        payments = OpsPayment.objects.select_related("referral").filter(referral__matched_clinic=clinic)
-        reports = StructuredReport.objects.select_related("patient", "encounter").filter(patient__assigned_clinic=clinic)
+        payments = OpsPayment.objects.select_related("referral").filter(
+            referral__matched_clinic=clinic
+        )
+        reports = StructuredReport.objects.select_related(
+            "patient",
+            "encounter",
+        ).filter(patient__assigned_clinic=clinic)
 
         return Response(
             {
@@ -1667,6 +1753,8 @@ class OpsClinicDetailView(OpsOnlyMixin, APIView):
                     "contact_email": clinic.contact_email,
                     "phone": clinic.phone,
                     "address": clinic.address,
+                    "is_active": clinic.is_active,
+                    "capability_profile": capability_profile_data(clinic),
                 },
                 "patients": [
                     {
@@ -1678,11 +1766,89 @@ class OpsClinicDetailView(OpsOnlyMixin, APIView):
                     }
                     for p in patients
                 ],
-                "referrals": OpsReferralSerializer(referrals, many=True).data,
-                "payments": OpsPaymentSerializer(payments, many=True).data,
-                "reports": OpsReportSerializer(reports, many=True).data,
+                "referrals": OpsReferralSerializer(
+                    referrals,
+                    many=True,
+                ).data,
+                "payments": OpsPaymentSerializer(
+                    payments,
+                    many=True,
+                ).data,
+                "reports": OpsReportSerializer(
+                    reports,
+                    many=True,
+                    context={"request": request},
+                ).data,
             }
         )
+
+    def get(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        clinic = Organization.objects.filter(
+            pk=pk,
+            organization_type="clinic",
+        ).first()
+
+        if not clinic:
+            return Response(
+                {"detail": "Clinic not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return self._build_response(request, clinic)
+
+    def patch(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        clinic = Organization.objects.filter(
+            pk=pk,
+            organization_type="clinic",
+        ).first()
+
+        if not clinic:
+            return Response(
+                {"detail": "Clinic not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        profile = get_or_create_capability_profile(clinic)
+        serializer = OpsOrganizationCapabilitySerializer(
+            profile,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        create_audit_log(
+            actor=request.user,
+            action="clinic_capabilities_updated",
+            entity_type="clinic",
+            entity_id=clinic.id,
+            entity_label=clinic.clinic_id,
+            message=f"Capability profile updated for {clinic.name}.",
+            metadata=serializer.data,
+        )
+
+        create_ops_notification(
+            title="Clinic capabilities updated",
+            message=(
+                f"{clinic.name} is configured as "
+                f"{serializer.data['workflow_mode'].replace('_', ' ')}."
+            ),
+            level="info",
+            entity_type="clinic",
+            entity_id=clinic.id,
+            entity_label=clinic.clinic_id,
+            created_by=request.user,
+        )
+
+        return self._build_response(request, clinic)
 
 
 class OpsAuditLogListView(OpsOnlyMixin, generics.ListAPIView):

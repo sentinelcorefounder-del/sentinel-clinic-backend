@@ -1,16 +1,40 @@
 from django.contrib import admin
-from .models import Organization
+
+from .models import Organization, OrganizationProfile
 
 
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
     list_display = (
-        "name",
         "clinic_id",
+        "name",
         "organization_type",
-        "contact_email",
         "is_active",
-        "created_at",
+        "contact_email",
     )
     list_filter = ("organization_type", "is_active")
-    search_fields = ("name", "clinic_id", "contact_email")
+    search_fields = ("clinic_id", "name", "contact_email")
+
+
+@admin.register(OrganizationProfile)
+class OrganizationProfileAdmin(admin.ModelAdmin):
+    list_display = (
+        "organization",
+        "workflow_mode",
+        "referral_requirement",
+        "patient_ownership",
+        "sentinel_review_policy",
+        "subscription_tier",
+    )
+    list_filter = (
+        "workflow_mode",
+        "referral_requirement",
+        "patient_ownership",
+        "sentinel_review_policy",
+        "branding_policy",
+        "subscription_tier",
+    )
+    search_fields = (
+        "organization__name",
+        "organization__clinic_id",
+    )

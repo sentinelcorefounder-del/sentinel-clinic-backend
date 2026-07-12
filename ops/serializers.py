@@ -2,6 +2,8 @@ from rest_framework import serializers
 
 from referrals.models import HospitalReferral
 from reports.models import StructuredReport
+from organizations.models import OrganizationProfile
+from organizations.serializers import OrganizationProfileSerializer
 from .models import OpsAuditLog, OpsNotification, OpsPayment
 
 
@@ -327,3 +329,9 @@ class OpsNotificationSerializer(serializers.ModelSerializer):
         if not obj.created_by:
             return "System"
         return obj.created_by.username or obj.created_by.email or str(obj)
+
+
+
+class OpsOrganizationCapabilitySerializer(OrganizationProfileSerializer):
+    class Meta(OrganizationProfileSerializer.Meta):
+        pass

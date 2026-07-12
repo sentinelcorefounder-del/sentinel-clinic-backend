@@ -5,9 +5,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
-from .models import Organization
+from .models import Organization, OrganizationProfile
 from .provision_serializers import ClinicProvisionSerializer, HospitalProvisionSerializer
-from .serializers import OrganizationSerializer
+from .serializers import (
+    OrganizationSerializer,
+    OrganizationProfileSerializer,
+    OrganizationWithProfileSerializer,
+)
 from .services.provisioning import (
     provision_clinic_with_admin,
     provision_hospital_with_admin,
@@ -32,7 +36,7 @@ class OrganizationListView(generics.ListAPIView):
 
 
 class OrganizationDetailView(generics.RetrieveAPIView):
-    serializer_class = OrganizationSerializer
+    serializer_class = OrganizationWithProfileSerializer
 
     def get_queryset(self):
         queryset = Organization.objects.all()
@@ -101,4 +105,30 @@ class HospitalProvisionView(APIView):
                 **result,
             },
             status=status.HTTP_200_OK,
+        )
+
+
+class MyOrganizationCapabilityProfileView(APIView):
+    """
+    Read-only capability profile for the logged-in organisation.
+
+    Sentinel Ops remains the authority that changes commercial/workflow
+    capabilities. Clinic and hospital users can inspect their active profile.
+    """
+
+    def get(self, request):
+        org = get_user_organization(request.user)
+
+        if not org:
+            return Response(
+                {"detail": "You are not linked to an organization."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        profile, _ = OrganizationProfile.objects.get_or_create(
+            organization=org
+        )
+
+        return Response(
+            OrganizationProfileSerializer(profile).data
         )
