@@ -1,5 +1,6 @@
 import os
 
+from rest_framework.permissions import IsAuthenticated
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -109,15 +110,18 @@ class HospitalProvisionView(APIView):
 
 
 class MyOrganizationCapabilityProfileView(APIView):
-    """
-    Read-only capability profile for the logged-in organisation.
-
-    Sentinel Ops remains the authority that changes commercial/workflow
-    capabilities. Clinic and hospital users can inspect their active profile.
-    """
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         org = get_user_organization(request.user)
+
+        # Superusers may deliberately return no tenant from the shared
+        # tenant helper. Use their explicit UserOrganization link instead.
+        if not org:
+            try:
+                org = request.user.organization_link.organization
+            except Exception:
+                org = None
 
         if not org:
             return Response(
