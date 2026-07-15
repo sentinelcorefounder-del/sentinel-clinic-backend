@@ -9,6 +9,7 @@ from .views import (
     submit_report_to_ops,
     approve_report_by_ops,
     reject_report_by_ops,
+    clinic_issue_report,
 )
 
 urlpatterns = [
@@ -16,6 +17,7 @@ urlpatterns = [
     path("<int:pk>/", StructuredReportDetailView.as_view(), name="report-detail"),
     path("<int:pk>/pdf/", StructuredReportPDFView.as_view(), name="report-pdf"),
     path("<int:pk>/submit-to-ops/", submit_report_to_ops, name="report-submit-to-ops"),
+    path("<int:pk>/clinic-issue/", clinic_issue_report, name="report-clinic-issue"),
     path("<int:pk>/ops-approve/", approve_report_by_ops, name="report-ops-approve"),
     path("<int:pk>/ops-reject/", reject_report_by_ops, name="report-ops-reject"),
     path("encounter/<int:encounter_id>/", EncounterReportListView.as_view(), name="encounter-reports"),

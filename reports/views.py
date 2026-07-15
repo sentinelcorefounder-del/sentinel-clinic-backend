@@ -16,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
+from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
 from .models import StructuredReport, ReportStatusEvent
 from .permissions import (
@@ -125,6 +126,19 @@ class StructuredReportRulesMixin:
                 "Reports submitted to Ops or already issued are read-only."
             )
 
+    def _validate_report_can_be_clinic_issued(self, report):
+        missing_items = []
+        if not report.patient_id: missing_items.append("patient")
+        if not report.encounter_id: missing_items.append("assessment")
+        if not report.review_date: missing_items.append("review date")
+        if (report.patient.consent_status or "").strip().lower() != "completed": missing_items.append("patient consent")
+        has_uploaded_image = self._has_any_uploaded_image(report.encounter)
+        allowed_without_image = bool(report.ungradable) or ((report.urgency_outcome or "").strip().lower() == "image_retake")
+        if not has_uploaded_image and not allowed_without_image:
+            missing_items.append("uploaded image or valid ungradable/image retake outcome")
+        if missing_items:
+            raise PermissionDenied("Report cannot be signed and issued yet. Missing/incomplete: " + ", ".join(missing_items) + ".")
+
     def _validate_report_can_be_submitted_to_ops(self, report):
         missing_items = []
 
@@ -212,7 +226,7 @@ class StructuredReportListCreateView(
                         "You cannot create reports for another clinic's patient."
                     )
 
-        report = serializer.save()
+        report = serializer.save(report_owner="clinic" if getattr(encounter, "workflow_route", "") == "clinic_managed" else "sentinel")
         ReportStatusEvent.objects.get_or_create(
             report=report,
             event_type="created",
@@ -409,6 +423,9 @@ def submit_report_to_ops(request, pk):
             if not org or report.patient.assigned_clinic_id != org.id:
                 raise PermissionDenied("You cannot submit this report to Ops.")
 
+    if getattr(report.encounter, "workflow_route", "sentinel_managed") != "sentinel_managed":
+        return Response({"detail": "This is a Clinic Managed assessment. Use Sign and Issue Report instead of submitting to Sentinel Ops."}, status=status.HTTP_400_BAD_REQUEST)
+
     if report.report_status not in {"draft", "under_review", "signed_off", "ops_rejected", "returned_to_clinic"}:
         return Response(
             {
@@ -478,6 +495,75 @@ def submit_report_to_ops(request, pk):
         status=status.HTTP_200_OK,
     )
 
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, CanSubmitReportToOps])
+def clinic_issue_report(request, pk):
+    try:
+        report = StructuredReport.objects.select_related("patient", "patient__assigned_clinic", "encounter").get(pk=pk)
+    except StructuredReport.DoesNotExist:
+        raise Http404("Report not found.")
+
+    user = request.user
+    clinic = report.patient.assigned_clinic
+    if getattr(report.encounter, "workflow_route", "") != "clinic_managed":
+        return Response({"detail": "Only Clinic Managed assessments can be issued directly by the clinic."}, status=status.HTTP_400_BAD_REQUEST)
+    if not clinic:
+        raise PermissionDenied("This report is not linked to an assigned clinic.")
+    if not user.is_superuser:
+        groups=set(user.groups.values_list("name", flat=True))
+        if "ops_admin" in groups:
+            raise PermissionDenied("Sentinel Ops has read-only access to Clinic Managed reports.")
+        org=get_user_organization(user)
+        if not org or org.id != clinic.id:
+            raise PermissionDenied("You cannot sign or issue another clinic's report.")
+
+    profile,_=OrganizationProfile.objects.get_or_create(organization=clinic)
+    if not profile.can_issue_reports_directly:
+        raise PermissionDenied("This clinic is not permitted to issue reports directly.")
+    if report.report_status not in {"draft","under_review","signed_off","returned_to_clinic","ops_rejected"}:
+        return Response({"detail": f"Only an editable report can be signed and issued. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+
+    signer_name = (
+        request.data.get("signer_name")
+        or report.signer_name
+        or ""
+    ).strip()
+
+    signer_role = (
+        request.data.get("signer_role")
+        or report.signer_role
+        or ""
+    ).strip()
+
+    signer_registration_number = (
+        request.data.get("signer_registration_number")
+        or report.signer_registration_number
+        or ""
+    ).strip()
+    
+    if profile.electronic_signature_required and not signer_registration_number:
+        return Response({"detail": "Electronic signature is incomplete. Registration number is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+    StructuredReportRulesMixin()._validate_report_can_be_clinic_issued(report)
+    previous_status=report.report_status
+    now=timezone.now()
+    report.report_owner="clinic"
+    report.signed_by=user
+    report.signed_at=now
+    report.signer_name=signer_name
+    report.signer_role=signer_role
+    report.signer_registration_number=signer_registration_number
+    report.issued_by=user
+    report.issued_at=now
+    report.sentinel_archive_received_at=now
+    report.report_status="issued"
+    report.return_reason=""
+    report.save(update_fields=["report_owner","signed_by","signed_at","signer_name","signer_role","signer_registration_number","issued_by","issued_at","sentinel_archive_received_at","report_status","return_reason","updated_at"])
+    ReportStatusEvent.objects.create(report=report,event_type="clinic_signed",from_status=previous_status,to_status="issued",note=f"Report electronically signed by {signer_name}.",actor=user)
+    ReportStatusEvent.objects.create(report=report,event_type="clinic_issued",from_status=previous_status,to_status="issued",note="Clinic Managed report issued directly by the clinic. Sentinel retained a read-only audit copy.",actor=user)
+    return Response({"message":"Report signed and issued successfully.","report":StructuredReportSerializer(report,context={"request":request}).data,"report_status":report.report_status,"issued_at":report.issued_at,"report_pdf_url":build_report_pdf_url(request,report)},status=status.HTTP_200_OK)
 
 def _build_manual_payout_email(report):
     patient = report.patient
@@ -1046,21 +1132,9 @@ class StructuredReportPDFView(APIView):
         notes_bottom = y - notes_box_height
         y = min(notes_text_y, notes_bottom) - 26
 
-        sign_name = (
-            clinic.report_signatory_name
-            if clinic and clinic.report_signatory_name
-            else "Doctor Name"
-        )
-        sign_title = (
-            clinic.report_signatory_title
-            if clinic and clinic.report_signatory_title
-            else "Doctor / Reviewer"
-        )
-        sign_odorbn = (
-            clinic.report_signatory_odorbn
-            if clinic and clinic.report_signatory_odorbn
-            else "________________"
-        )
+        sign_name = report.signer_name or (clinic.report_signatory_name if clinic and clinic.report_signatory_name else "Doctor Name")
+        sign_title = report.signer_role or (clinic.report_signatory_title if clinic and clinic.report_signatory_title else "Doctor / Reviewer")
+        sign_odorbn = report.signer_registration_number or (clinic.report_signatory_odorbn if clinic and clinic.report_signatory_odorbn else "________________")
 
         pdf.setFont("Helvetica-Bold", 13)
         pdf.drawString(left, y, "Authorized Sign-off")

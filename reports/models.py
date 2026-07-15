@@ -5,6 +5,7 @@ from encounters.models import ScreeningEncounter
 
 
 class StructuredReport(models.Model):
+    REPORT_OWNER_CHOICES = [("clinic", "Clinic"), ("sentinel", "Sentinel")]
     REPORT_STATUS_CHOICES = [
         ("draft", "Draft"),
         ("under_review", "Under Review"),
@@ -14,6 +15,8 @@ class StructuredReport(models.Model):
         ("ops_approved", "Ops Approved"),
         ("ops_rejected", "Ops Rejected"),
         ("issued", "Issued"),
+        ("clinic_signed", "Clinic Signed"),
+        ("clinic_issued", "Clinic Issued"),
     ]
 
     URGENCY_OUTCOME_CHOICES = [
@@ -135,6 +138,15 @@ class StructuredReport(models.Model):
     hospital_viewed_at = models.DateTimeField(null=True, blank=True)
     hospital_downloaded_at = models.DateTimeField(null=True, blank=True)
     payout_email_sent_at = models.DateTimeField(null=True, blank=True)
+
+    report_owner = models.CharField(max_length=20, choices=REPORT_OWNER_CHOICES, default="sentinel")
+    signed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports_signed")
+    signed_at = models.DateTimeField(null=True, blank=True)
+    signer_name = models.CharField(max_length=255, blank=True, default="")
+    signer_role = models.CharField(max_length=255, blank=True, default="")
+    signer_registration_number = models.CharField(max_length=120, blank=True, default="")
+    issued_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports_issued")
+    sentinel_archive_received_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -27,6 +27,16 @@ class ReportStatusEventSerializer(serializers.ModelSerializer):
 class StructuredReportSerializer(serializers.ModelSerializer):
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
+    signed_by_display = serializers.SerializerMethodField()
+    issued_by_display = serializers.SerializerMethodField()
+    workflow_route = serializers.CharField(
+        source="encounter.workflow_route",
+        read_only=True,
+    )
+    source_type = serializers.CharField(
+        source="encounter.source_type",
+        read_only=True,
+    )
     status_events = ReportStatusEventSerializer(many=True, read_only=True)
 
     class Meta:
@@ -64,6 +74,18 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "hospital_viewed_at",
             "hospital_downloaded_at",
             "payout_email_sent_at",
+            "report_owner",
+            "workflow_route",
+            "source_type",
+            "signed_by",
+            "signed_by_display",
+            "signed_at",
+            "signer_name",
+            "signer_role",
+            "signer_registration_number",
+            "issued_by",
+            "issued_by_display",
+            "sentinel_archive_received_at",
             "status_events",
             "created_at",
             "updated_at",
@@ -83,6 +105,15 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "hospital_viewed_at",
             "hospital_downloaded_at",
             "payout_email_sent_at",
+            "report_owner",
+            "workflow_route",
+            "source_type",
+            "signed_by",
+            "signed_by_display",
+            "signed_at",
+            "issued_by",
+            "issued_by_display",
+            "sentinel_archive_received_at",
             "status_events",
             "created_at",
             "updated_at",
@@ -119,3 +150,26 @@ class StructuredReportSerializer(serializers.ModelSerializer):
         if not user:
             return ""
         return getattr(user, "username", "") or getattr(user, "email", "") or str(user)
+
+
+    def get_signed_by_display(self, obj):
+        user = obj.signed_by
+        if not user:
+            return ""
+        return (
+            user.get_full_name()
+            or getattr(user, "username", "")
+            or getattr(user, "email", "")
+            or str(user)
+        )
+
+    def get_issued_by_display(self, obj):
+        user = obj.issued_by
+        if not user:
+            return ""
+        return (
+            user.get_full_name()
+            or getattr(user, "username", "")
+            or getattr(user, "email", "")
+            or str(user)
+        )

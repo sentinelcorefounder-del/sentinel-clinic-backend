@@ -806,30 +806,107 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
             return denied
 
         report = StructuredReport.objects.filter(pk=pk).first()
-        if not report:
-            return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        if report.report_status not in {"submitted_to_ops", "ops_rejected"}:
+        if not report:
+            return Response(
+                {"detail": "Report not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if report.report_status not in {
+            "submitted_to_ops",
+            "ops_rejected",
+        }:
             return Response(
                 {
-                    "detail": f"Only submitted_to_ops or ops_rejected reports can be approved/issued. Current status: {report.report_status}"
+                    "detail": (
+                        "Only submitted_to_ops or ops_rejected "
+                        "reports can be approved and issued. "
+                        f"Current status: {report.report_status}"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        signer_name = (
+            request.data.get("signer_name") or ""
+        ).strip()
+
+        signer_role = (
+            request.data.get("signer_role") or ""
+        ).strip()
+
+        signer_registration_number = (
+            request.data.get(
+                "signer_registration_number"
+            )
+            or ""
+        ).strip()
+
+        missing_signature_fields = []
+
+        if not signer_name:
+            missing_signature_fields.append(
+                "clinician name"
+            )
+
+        if not signer_role:
+            missing_signature_fields.append(
+                "professional role"
+            )
+
+        if not signer_registration_number:
+            missing_signature_fields.append(
+                "registration number"
+            )
+
+        if missing_signature_fields:
+            return Response(
+                {
+                    "detail": (
+                        "Clinical sign-off is incomplete. Missing: "
+                        + ", ".join(missing_signature_fields)
+                        + "."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         previous_status = report.report_status
+        issued_time = timezone.now()
+
         report.report_status = "issued"
-        report.issued_at = timezone.now()
-        report.ops_reviewed_at = timezone.now()
+
+        report.ops_reviewed_at = issued_time
         report.ops_reviewed_by = request.user
-        report.ops_review_note = (request.data.get("note") or "").strip()
+        report.ops_review_note = (
+            request.data.get("note") or ""
+        ).strip()
+
+        report.signed_by = request.user
+        report.signed_at = issued_time
+        report.signer_name = signer_name
+        report.signer_role = signer_role
+        report.signer_registration_number = (
+            signer_registration_number
+        )
+
+        report.issued_by = request.user
+        report.issued_at = issued_time
+
         report.save(
             update_fields=[
                 "report_status",
-                "issued_at",
                 "ops_reviewed_at",
                 "ops_reviewed_by",
                 "ops_review_note",
+                "signed_by",
+                "signed_at",
+                "signer_name",
+                "signer_role",
+                "signer_registration_number",
+                "issued_by",
+                "issued_at",
                 "updated_at",
             ]
         )
@@ -839,14 +916,26 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
             event_type="issued",
             from_status=previous_status,
             to_status="issued",
-            note=report.ops_review_note or "Report approved and issued by Sentinel Ops.",
+            note=(
+                report.ops_review_note
+                or (
+                    "Report reviewed, electronically "
+                    "signed and issued by Sentinel Ops."
+                )
+            ),
             actor=request.user,
         )
 
         for referral in report.hospital_referrals.all():
             referral.report_ready = True
             referral.referral_status = "report_issued"
-            referral.save(update_fields=["report_ready", "referral_status", "updated_at"])
+            referral.save(
+                update_fields=[
+                    "report_ready",
+                    "referral_status",
+                    "updated_at",
+                ]
+            )
 
         create_audit_log(
             actor=request.user,
@@ -854,12 +943,25 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
             entity_type="report",
             entity_id=report.id,
             entity_label=report.report_id,
-            message=f"Report {report.report_id} issued by Ops.",
+            message=(
+                f"Report {report.report_id} reviewed, "
+                "signed and issued by Sentinel Ops."
+            ),
+            metadata={
+                "signer_name": signer_name,
+                "signer_role": signer_role,
+                "signer_registration_number": (
+                    signer_registration_number
+                ),
+            },
         )
 
         create_ops_notification(
             title="Report issued",
-            message=f"Report {report.report_id} was issued by Ops.",
+            message=(
+                f"Report {report.report_id} was reviewed, "
+                "signed and issued by Sentinel Ops."
+            ),
             level="success",
             entity_type="report",
             entity_id=report.id,
@@ -869,8 +971,14 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
 
         return Response(
             {
-                "message": "Report issued by Ops.",
-                "report": OpsReportSerializer(report, context={"request": request}).data,
+                "message": (
+                    "Report approved, signed and issued "
+                    "by Sentinel Ops."
+                ),
+                "report": OpsReportSerializer(
+                    report,
+                    context={"request": request},
+                ).data,
             }
         )
 

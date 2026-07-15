@@ -139,6 +139,7 @@ class OpsReportSerializer(serializers.ModelSerializer):
     status_events = serializers.SerializerMethodField()
     submitted_to_ops_by_display = serializers.SerializerMethodField()
     ops_reviewed_by_display = serializers.SerializerMethodField()
+    signed_by_display = serializers.SerializerMethodField()
 
     class Meta:
         model = StructuredReport
@@ -168,6 +169,11 @@ class OpsReportSerializer(serializers.ModelSerializer):
             "ops_review_note",
             "return_reason",
             "resubmission_count",
+            "signer_name",
+            "signer_role",
+            "signer_registration_number",
+            "signed_at",
+            "signed_by_display",
             "issued_at",
             "hospital_viewed_at",
             "hospital_downloaded_at",
@@ -279,6 +285,18 @@ class OpsReportSerializer(serializers.ModelSerializer):
     def get_ops_reviewed_by_display(self, obj):
         user = obj.ops_reviewed_by
         return user.username if user else ""
+
+
+    def get_signed_by_display(self, obj):
+        user = obj.signed_by
+        if not user:
+            return ""
+        return (
+            user.get_full_name()
+            or getattr(user, "username", "")
+            or getattr(user, "email", "")
+            or str(user)
+        )
 
 
 class OpsAuditLogSerializer(serializers.ModelSerializer):
