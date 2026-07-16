@@ -926,16 +926,35 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
             actor=request.user,
         )
 
-        for referral in report.hospital_referrals.all():
-            referral.report_ready = True
+        report.distribution_status = "awaiting_distribution"
+        report.save(update_fields=["distribution_status", "updated_at"])
+
+        encounter_referral = getattr(report.encounter, "hospital_referral", None)
+        if encounter_referral:
+            encounter_referral.report = report
+            encounter_referral.report_ready = False
+            encounter_referral.referral_status = "report_issued"
+            encounter_referral.save(update_fields=[
+                "report", "report_ready", "referral_status", "updated_at",
+            ])
+
+        for referral in report.hospital_referrals.exclude(
+            pk=getattr(encounter_referral, "pk", None)
+        ):
+            referral.report_ready = False
             referral.referral_status = "report_issued"
-            referral.save(
-                update_fields=[
-                    "report_ready",
-                    "referral_status",
-                    "updated_at",
-                ]
-            )
+            referral.save(update_fields=[
+                "report_ready", "referral_status", "updated_at",
+            ])
+
+        ReportStatusEvent.objects.create(
+            report=report,
+            event_type="queued_for_distribution",
+            from_status="issued",
+            to_status="issued",
+            note="Issued report queued for Sentinel distribution.",
+            actor=request.user,
+        )
 
         create_audit_log(
             actor=request.user,
@@ -1041,6 +1060,244 @@ class OpsReportRejectView(OpsOnlyMixin, APIView):
         )
 
         return Response({"message": "Report rejected by Ops.", "report": OpsReportSerializer(report).data})
+
+
+class OpsDistributionQueueView(OpsOnlyMixin, APIView):
+    def get(self, request):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        queue = (
+            StructuredReport.objects.select_related(
+                "patient",
+                "patient__assigned_clinic",
+                "encounter",
+                "hospital_released_by",
+            )
+            .prefetch_related(
+                "hospital_referrals",
+                "hospital_referrals__source_hospital",
+                "hospital_referrals__matched_clinic",
+            )
+            .filter(report_status="issued")
+        )
+
+        status_filter = (
+            request.query_params.get("status")
+            or "awaiting_distribution"
+        ).strip()
+
+        if status_filter and status_filter != "all":
+            queue = queue.filter(distribution_status=status_filter)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            queue = queue.filter(
+                models.Q(report_id__icontains=search)
+                | models.Q(patient__patient_id__icontains=search)
+                | models.Q(patient__first_name__icontains=search)
+                | models.Q(patient__last_name__icontains=search)
+                | models.Q(hospital_referrals__referral_id__icontains=search)
+                | models.Q(
+                    hospital_referrals__source_hospital__name__icontains=search
+                )
+            )
+
+        data = []
+        for report in queue.distinct().order_by("-issued_at", "-updated_at"):
+            referral = report.hospital_referrals.select_related(
+                "source_hospital", "matched_clinic"
+            ).first()
+
+            data.append({
+                "id": report.id,
+                "report_id": report.report_id,
+                "patient_id": report.patient.patient_id if report.patient else "",
+                "patient_name": (
+                    f"{report.patient.first_name} {report.patient.last_name}".strip()
+                    if report.patient else ""
+                ),
+                "clinic_name": (
+                    report.patient.assigned_clinic.name
+                    if report.patient and report.patient.assigned_clinic else ""
+                ),
+                "source_type": report.encounter.source_type if report.encounter else "",
+                "workflow_route": (
+                    report.encounter.workflow_route if report.encounter else ""
+                ),
+                "referral_id": referral.referral_id if referral else "",
+                "source_hospital_name": (
+                    referral.source_hospital.name
+                    if referral and referral.source_hospital else ""
+                ),
+                "has_hospital_recipient": bool(
+                    referral and referral.source_hospital
+                ),
+                "report_status": report.report_status,
+                "distribution_status": report.distribution_status,
+                "patient_delivery_required": report.patient_delivery_required,
+                "issued_at": report.issued_at,
+                "hospital_released_at": report.hospital_released_at,
+                "pdf_url": request.build_absolute_uri(
+                    f"/api/reports/{report.id}/pdf/?report_format=clinician"
+                ),
+            })
+
+        return Response(data)
+
+
+class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
+    def post(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        report = (
+            StructuredReport.objects.select_related(
+                "patient",
+                "patient__assigned_clinic",
+                "encounter",
+                "encounter__hospital_referral",
+            )
+            .prefetch_related(
+                "hospital_referrals",
+                "hospital_referrals__source_hospital",
+            )
+            .filter(pk=pk)
+            .first()
+        )
+
+        if not report:
+            return Response(
+                {"detail": "Report not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if report.report_status != "issued":
+            return Response(
+                {"detail": "Only clinically issued reports can be released."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        referral = getattr(report.encounter, "hospital_referral", None)
+        if not referral:
+            referral = report.hospital_referrals.select_related(
+                "source_hospital"
+            ).first()
+
+        if not referral or not referral.source_hospital:
+            return Response(
+                {"detail": "This report has no referring hospital."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        referral.report = report
+        referral.report_ready = True
+        referral.referral_status = "report_issued"
+        referral.save(update_fields=[
+            "report", "report_ready", "referral_status", "updated_at",
+        ])
+
+        now = timezone.now()
+        report.distribution_status = "released_to_hospital"
+        report.hospital_released_at = now
+        report.hospital_released_by = request.user
+        report.save(update_fields=[
+            "distribution_status",
+            "hospital_released_at",
+            "hospital_released_by",
+            "updated_at",
+        ])
+
+        ReportStatusEvent.objects.create(
+            report=report,
+            event_type="released_to_hospital",
+            from_status="issued",
+            to_status="issued",
+            note=f"Report released by Sentinel to {referral.source_hospital.name}.",
+            actor=request.user,
+        )
+
+        create_audit_log(
+            actor=request.user,
+            action="report_released_to_hospital",
+            entity_type="report",
+            entity_id=report.id,
+            entity_label=report.report_id,
+            message=(
+                f"Report {report.report_id} released to "
+                f"{referral.source_hospital.name}."
+            ),
+            metadata={
+                "referral_id": referral.referral_id,
+                "hospital_id": referral.source_hospital_id,
+                "hospital_name": referral.source_hospital.name,
+            },
+        )
+
+        create_ops_notification(
+            title="Report released to hospital",
+            message=(
+                f"Report {report.report_id} was released to "
+                f"{referral.source_hospital.name}."
+            ),
+            level="success",
+            entity_type="report",
+            entity_id=report.id,
+            entity_label=report.report_id,
+            created_by=request.user,
+        )
+
+        return Response({
+            "message": "Report released to hospital.",
+            "report_id": report.report_id,
+            "distribution_status": report.distribution_status,
+            "hospital_released_at": report.hospital_released_at,
+            "referral_id": referral.referral_id,
+            "hospital_name": referral.source_hospital.name,
+        })
+
+
+class OpsMarkPatientDeliveryRequiredView(OpsOnlyMixin, APIView):
+    def post(self, request, pk):
+        denied = self.check_ops_permission(request)
+        if denied:
+            return denied
+
+        report = StructuredReport.objects.filter(pk=pk).first()
+        if not report:
+            return Response(
+                {"detail": "Report not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        report.patient_delivery_required = True
+        if report.distribution_status == "not_ready":
+            report.distribution_status = "awaiting_distribution"
+        report.save(update_fields=[
+            "patient_delivery_required",
+            "distribution_status",
+            "updated_at",
+        ])
+
+        create_audit_log(
+            actor=request.user,
+            action="patient_delivery_required",
+            entity_type="report",
+            entity_id=report.id,
+            entity_label=report.report_id,
+            message=(
+                f"Patient delivery marked as required for "
+                f"report {report.report_id}."
+            ),
+        )
+
+        return Response({
+            "message": "Patient delivery marked as required.",
+            "report_id": report.report_id,
+            "patient_delivery_required": True,
+        })
 
 
 class OpsCreateOrganizationView(OpsOnlyMixin, APIView):

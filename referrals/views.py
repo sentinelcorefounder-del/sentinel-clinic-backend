@@ -93,6 +93,7 @@ class HospitalIssuedReportListView(APIView):
             "source_hospital",
         ).filter(
             report__report_status="issued",
+            report_ready=True,
         )
 
         if not request.user.is_superuser:
@@ -147,6 +148,7 @@ class HospitalIssuedReportDetailView(APIView):
         ).filter(
             report_id=pk,
             report__report_status="issued",
+            report_ready=True,
         )
 
         if not request.user.is_superuser:
@@ -397,7 +399,11 @@ class HospitalPatientDetailView(APIView):
                 }
             )
 
-            if not report or report.report_status != "issued":
+            if (
+                not report
+                or report.report_status != "issued"
+                or not referral.report_ready
+            ):
                 continue
 
             if report.id not in seen_report_ids:

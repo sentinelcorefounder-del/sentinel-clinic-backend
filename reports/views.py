@@ -560,7 +560,31 @@ def clinic_issue_report(request, pk):
     report.sentinel_archive_received_at=now
     report.report_status="issued"
     report.return_reason=""
-    report.save(update_fields=["report_owner","signed_by","signed_at","signer_name","signer_role","signer_registration_number","issued_by","issued_at","sentinel_archive_received_at","report_status","return_reason","updated_at"])
+    report.distribution_status = "awaiting_distribution"
+    report.save(update_fields=[
+        "report_owner", "signed_by", "signed_at", "signer_name",
+        "signer_role", "signer_registration_number", "issued_by",
+        "issued_at", "sentinel_archive_received_at", "report_status",
+        "return_reason", "distribution_status", "updated_at",
+    ])
+
+    referral = getattr(report.encounter, "hospital_referral", None)
+    if referral:
+        referral.report = report
+        referral.report_ready = False
+        referral.referral_status = "report_issued"
+        referral.save(update_fields=[
+            "report", "report_ready", "referral_status", "updated_at",
+        ])
+
+    ReportStatusEvent.objects.create(
+        report=report,
+        event_type="queued_for_distribution",
+        from_status="issued",
+        to_status="issued",
+        note="Issued report queued for Sentinel distribution.",
+        actor=user,
+    )
     ReportStatusEvent.objects.create(report=report,event_type="clinic_signed",from_status=previous_status,to_status="issued",note=f"Report electronically signed by {signer_name}.",actor=user)
     ReportStatusEvent.objects.create(report=report,event_type="clinic_issued",from_status=previous_status,to_status="issued",note="Clinic Managed report issued directly by the clinic. Sentinel retained a read-only audit copy.",actor=user)
     return Response({"message":"Report signed and issued successfully.","report":StructuredReportSerializer(report,context={"request":request}).data,"report_status":report.report_status,"issued_at":report.issued_at,"report_pdf_url":build_report_pdf_url(request,report)},status=status.HTTP_200_OK)

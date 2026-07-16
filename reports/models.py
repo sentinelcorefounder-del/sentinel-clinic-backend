@@ -19,6 +19,13 @@ class StructuredReport(models.Model):
         ("clinic_issued", "Clinic Issued"),
     ]
 
+    DISTRIBUTION_STATUS_CHOICES = [
+        ("not_ready", "Not Ready"),
+        ("awaiting_distribution", "Awaiting Distribution"),
+        ("released_to_hospital", "Released to Hospital"),
+        ("completed", "Completed"),
+    ]
+
     URGENCY_OUTCOME_CHOICES = [
         ("routine_followup", "Routine Follow-up"),
         ("early_review", "Early Review"),
@@ -148,6 +155,22 @@ class StructuredReport(models.Model):
     issued_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports_issued")
     sentinel_archive_received_at = models.DateTimeField(null=True, blank=True)
 
+    distribution_status = models.CharField(
+        max_length=40,
+        choices=DISTRIBUTION_STATUS_CHOICES,
+        default="not_ready",
+    )
+    hospital_released_at = models.DateTimeField(null=True, blank=True)
+    hospital_released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reports_released_to_hospital",
+    )
+    patient_delivery_required = models.BooleanField(default=False)
+    patient_delivered_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -187,6 +210,8 @@ class ReportStatusEvent(models.Model):
         ("issued", "Issued"),
         ("hospital_viewed", "Hospital Viewed"),
         ("hospital_downloaded", "Hospital Downloaded"),
+        ("queued_for_distribution", "Queued for Distribution"),
+        ("released_to_hospital", "Released to Hospital"),
     ]
 
     report = models.ForeignKey(

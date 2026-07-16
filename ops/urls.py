@@ -14,6 +14,9 @@ from .views import (
     OpsReportReturnView,
     OpsReportApproveView,
     OpsReportRejectView,
+    OpsDistributionQueueView,
+    OpsReleaseReportToHospitalView,
+    OpsMarkPatientDeliveryRequiredView,
     OpsCreateOrganizationView,
     OpsCreateUserView,
     PaystackOpsWebhookView,
@@ -49,6 +52,10 @@ urlpatterns = [
     path("reports/<int:pk>/return/", OpsReportReturnView.as_view()),
     path("reports/<int:pk>/approve/", OpsReportApproveView.as_view()),
     path("reports/<int:pk>/reject/", OpsReportRejectView.as_view()),
+
+    path("distribution/", OpsDistributionQueueView.as_view(), name="ops-distribution-queue"),
+    path("distribution/<int:pk>/release-hospital/", OpsReleaseReportToHospitalView.as_view(), name="ops-release-report-to-hospital"),
+    path("distribution/<int:pk>/patient-required/", OpsMarkPatientDeliveryRequiredView.as_view(), name="ops-mark-patient-delivery-required"),
 
     path("organizations/create/", OpsCreateOrganizationView.as_view()),
     path("users/create/", OpsCreateUserView.as_view()),
