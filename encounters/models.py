@@ -1,13 +1,27 @@
+from django.conf import settings
 from django.db import models
-from patients.models import Patient
+
 from organizations.models import Organization
+from patients.models import Patient
 
 
 class ScreeningEncounter(models.Model):
     PROGRAMME_CHOICES = [("diabetic_screening", "Diabetic Retinal Assessment")]
-    SOURCE_TYPE_CHOICES = [("hospital_referral", "Hospital Referral"), ("clinic_direct", "Clinic Direct")]
-    WORKFLOW_ROUTE_CHOICES = [("sentinel_managed", "Sentinel Managed"), ("clinic_managed", "Clinic Managed")]
-    PAYMENT_RESPONSIBILITY_CHOICES = [("patient", "Patient"), ("clinic", "Clinic"), ("hospital", "Hospital"), ("programme", "Programme Sponsor"), ("waived", "Waived")]
+    SOURCE_TYPE_CHOICES = [
+        ("hospital_referral", "Hospital Referral"),
+        ("clinic_direct", "Clinic Direct"),
+    ]
+    WORKFLOW_ROUTE_CHOICES = [
+        ("sentinel_managed", "Sentinel Managed"),
+        ("clinic_managed", "Clinic Managed"),
+    ]
+    PAYMENT_RESPONSIBILITY_CHOICES = [
+        ("patient", "Patient"),
+        ("clinic", "Clinic"),
+        ("hospital", "Hospital"),
+        ("programme", "Programme Sponsor"),
+        ("waived", "Waived"),
+    ]
     STATUS_CHOICES = [
         ("scheduled", "Scheduled"),
         ("in_progress", "In Progress"),
@@ -17,7 +31,6 @@ class ScreeningEncounter(models.Model):
         ("completed", "Completed"),
         ("cancelled", "Cancelled"),
     ]
-
     VA_METHOD_CHOICES = [
         ("", "Not Recorded"),
         ("corrected", "Corrected"),
@@ -25,59 +38,74 @@ class ScreeningEncounter(models.Model):
     ]
 
     encounter_id = models.CharField(max_length=30, unique=True)
-
     patient = models.ForeignKey(
-        Patient,
-        on_delete=models.CASCADE,
-        related_name="encounters",
+        Patient, on_delete=models.CASCADE, related_name="encounters"
     )
-
     encounter_date = models.DateField()
     encounter_type = models.CharField(max_length=50, default="retinal_assessment")
 
-    programme = models.CharField(max_length=40, choices=PROGRAMME_CHOICES, default="diabetic_screening")
-    source_type = models.CharField(max_length=30, choices=SOURCE_TYPE_CHOICES, default="hospital_referral")
-    workflow_route = models.CharField(max_length=30, choices=WORKFLOW_ROUTE_CHOICES, default="sentinel_managed")
-    payment_responsibility = models.CharField(max_length=20, choices=PAYMENT_RESPONSIBILITY_CHOICES, default="hospital")
-    originating_organization = models.ForeignKey(Organization, on_delete=models.SET_NULL, null=True, blank=True, related_name="originated_screening_encounters")
-    hospital_referral = models.ForeignKey("referrals.HospitalReferral", on_delete=models.SET_NULL, null=True, blank=True, related_name="screening_encounters")
+    programme = models.CharField(
+        max_length=40, choices=PROGRAMME_CHOICES, default="diabetic_screening"
+    )
+    source_type = models.CharField(
+        max_length=30, choices=SOURCE_TYPE_CHOICES, default="hospital_referral"
+    )
+    workflow_route = models.CharField(
+        max_length=30,
+        choices=WORKFLOW_ROUTE_CHOICES,
+        default="sentinel_managed",
+    )
+    payment_responsibility = models.CharField(
+        max_length=20,
+        choices=PAYMENT_RESPONSIBILITY_CHOICES,
+        default="hospital",
+    )
+    originating_organization = models.ForeignKey(
+        Organization,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="originated_screening_encounters",
+    )
+    hospital_referral = models.ForeignKey(
+        "referrals.HospitalReferral",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="screening_encounters",
+    )
+
+    source_override_reason = models.TextField(blank=True, default="")
+    source_overridden_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="encounter_source_overrides",
+    )
+    source_overridden_at = models.DateTimeField(null=True, blank=True)
 
     screening_status = models.CharField(
-        max_length=30,
-        choices=STATUS_CHOICES,
-        default="scheduled",
+        max_length=30, choices=STATUS_CHOICES, default="scheduled"
     )
 
-    # Legacy fields retained for older rows. Do not use in active UI.
     visual_acuity_left = models.CharField(max_length=20, blank=True)
     visual_acuity_right = models.CharField(max_length=20, blank=True)
-
-    # VA should be captured by technicians on the encounter.
     left_unaided_va = models.CharField(max_length=20, blank=True)
     right_unaided_va = models.CharField(max_length=20, blank=True)
-
     left_corrected_pinhole_va = models.CharField(max_length=20, blank=True)
     right_corrected_pinhole_va = models.CharField(max_length=20, blank=True)
-
     left_va_method = models.CharField(
-        max_length=20,
-        choices=VA_METHOD_CHOICES,
-        blank=True,
-        default="",
+        max_length=20, choices=VA_METHOD_CHOICES, blank=True, default=""
     )
     right_va_method = models.CharField(
-        max_length=20,
-        choices=VA_METHOD_CHOICES,
-        blank=True,
-        default="",
+        max_length=20, choices=VA_METHOD_CHOICES, blank=True, default=""
     )
 
-    # Clinical encounter fields
     diabetes_duration = models.CharField(max_length=50, blank=True)
     symptoms_notes = models.TextField(blank=True)
     clinical_notes = models.TextField(blank=True)
 
-    # IOP / dilation fields
     iop_before_dilation_left = models.CharField(max_length=20, blank=True)
     iop_before_dilation_right = models.CharField(max_length=20, blank=True)
     iop_after_dilation_left = models.CharField(max_length=20, blank=True)
@@ -99,10 +127,18 @@ class ScreeningEncounter(models.Model):
             return
 
         has_uploads = self.image_uploads.exists()
-        has_reports = self.reports.exists()
-        has_completed_report = self.reports.filter(
-            report_status__in=["issued", "submitted_to_ops", "ops_approved"]
-        ).exists()
+
+        try:
+            report = self.structured_report
+            has_reports = True
+            has_completed_report = report.report_status in {
+                "issued", "submitted_to_ops", "ops_approved"
+            }
+        except Exception:
+            has_reports = self.reports.exists()
+            has_completed_report = self.reports.filter(
+                report_status__in=["issued", "submitted_to_ops", "ops_approved"]
+            ).exists()
 
         if has_completed_report:
             new_status = "completed"

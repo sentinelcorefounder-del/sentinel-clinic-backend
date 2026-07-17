@@ -19,6 +19,8 @@ from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
 from .models import StructuredReport, ReportStatusEvent
+from .clinical_wording import apply_generated_wording
+from .recall_services import apply_recall_schedule
 from .permissions import (
     CanManageReports,
     CanReviewOpsReports,
@@ -226,7 +228,25 @@ class StructuredReportListCreateView(
                         "You cannot create reports for another clinic's patient."
                     )
 
-        report = serializer.save(report_owner="clinic" if getattr(encounter, "workflow_route", "") == "clinic_managed" else "sentinel")
+        report = serializer.save(
+            report_owner=(
+                "clinic"
+                if getattr(encounter, "workflow_route", "") == "clinic_managed"
+                else "sentinel"
+            )
+        )
+        apply_generated_wording(report)
+        apply_recall_schedule(report)
+        report.save(
+            update_fields=[
+                "generated_clinical_summary",
+                "final_clinical_summary",
+                "recall_due_date",
+                "recall_status",
+                "updated_at",
+            ]
+        )
+
         ReportStatusEvent.objects.get_or_create(
             report=report,
             event_type="created",
@@ -282,12 +302,34 @@ class StructuredReportDetailView(
         self._apply_encounter_va_defaults(serializer, encounter)
 
         if user.is_superuser:
-            serializer.save()
+            report = serializer.save()
+            apply_generated_wording(report)
+            apply_recall_schedule(report)
+            report.save(
+                update_fields=[
+                    "generated_clinical_summary",
+                    "final_clinical_summary",
+                    "recall_due_date",
+                    "recall_status",
+                    "updated_at",
+                ]
+            )
             return
 
         user_groups = set(user.groups.values_list("name", flat=True))
         if "ops_admin" in user_groups:
-            serializer.save()
+            report = serializer.save()
+            apply_generated_wording(report)
+            apply_recall_schedule(report)
+            report.save(
+                update_fields=[
+                    "generated_clinical_summary",
+                    "final_clinical_summary",
+                    "recall_due_date",
+                    "recall_status",
+                    "updated_at",
+                ]
+            )
             return
 
         org = get_user_organization(user)
@@ -299,7 +341,18 @@ class StructuredReportDetailView(
                 "You cannot update reports for another clinic's patient."
             )
 
-        serializer.save()
+        report = serializer.save()
+        apply_generated_wording(report)
+        apply_recall_schedule(report)
+        report.save(
+            update_fields=[
+                "generated_clinical_summary",
+                "final_clinical_summary",
+                "recall_due_date",
+                "recall_status",
+                "updated_at",
+            ]
+        )
 
 
 class ClinicReportListView(generics.ListAPIView):
@@ -559,13 +612,21 @@ def clinic_issue_report(request, pk):
     report.issued_at=now
     report.sentinel_archive_received_at=now
     report.report_status="issued"
-    report.return_reason=""
+    report.return_reason = ""
     report.distribution_status = "awaiting_distribution"
+    apply_generated_wording(report)
+    apply_recall_schedule(report)
     report.save(update_fields=[
         "report_owner", "signed_by", "signed_at", "signer_name",
         "signer_role", "signer_registration_number", "issued_by",
         "issued_at", "sentinel_archive_received_at", "report_status",
-        "return_reason", "distribution_status", "updated_at",
+        "return_reason",
+        "distribution_status",
+        "generated_clinical_summary",
+        "final_clinical_summary",
+        "recall_due_date",
+        "recall_status",
+        "updated_at",
     ])
 
     referral = getattr(report.encounter, "hospital_referral", None)
@@ -756,7 +817,8 @@ class StructuredReportPDFView(APIView):
 
                 is_clinic_match = report.patient.assigned_clinic_id == org.id
                 is_hospital_match = report.hospital_referrals.filter(
-                    source_hospital=org
+                    source_hospital=org,
+                    report_ready=True,
                 ).exists()
 
                 if not is_clinic_match and not is_hospital_match:
@@ -799,10 +861,15 @@ class StructuredReportPDFView(APIView):
             request.query_params.get("report_format")
         )
 
-        # Hospitals may only open the hospital or clinician presentation.
+        # Hospitals may open released hospital, clinician, and
+        # patient-friendly presentations only. Ops/Audit remains internal.
         org = get_user_organization(user) if not user.is_superuser else None
         if org and getattr(org, "organization_type", "") == "hospital":
-            if report_format not in {"hospital", "clinician"}:
+            if report_format not in {
+                "hospital",
+                "clinician",
+                "patient",
+            }:
                 report_format = "hospital"
 
         pdf_bytes = ReportPDFRenderer(

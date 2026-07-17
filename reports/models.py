@@ -1,4 +1,5 @@
 from django.db import models
+from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
@@ -24,6 +25,18 @@ class StructuredReport(models.Model):
         ("awaiting_distribution", "Awaiting Distribution"),
         ("released_to_hospital", "Released to Hospital"),
         ("completed", "Completed"),
+    ]
+
+    RECALL_STATUS_CHOICES = [
+        ("not_set", "Not Set"),
+        ("scheduled", "Scheduled"),
+        ("due_soon", "Due Soon"),
+        ("due", "Due"),
+        ("overdue", "Overdue"),
+        ("contacted", "Contacted"),
+        ("booked", "Booked"),
+        ("completed", "Completed"),
+        ("deferred", "Deferred"),
     ]
 
     URGENCY_OUTCOME_CHOICES = [
@@ -110,7 +123,28 @@ class StructuredReport(models.Model):
     )
 
     recommendation = models.TextField(blank=True)
+    # Legacy free-text field retained for compatibility.
     next_followup_interval = models.CharField(max_length=50, blank=True)
+
+    recall_months = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(24)],
+    )
+    recall_due_date = models.DateField(null=True, blank=True, db_index=True)
+    recall_status = models.CharField(
+        max_length=20,
+        choices=RECALL_STATUS_CHOICES,
+        default="not_set",
+    )
+    recall_contacted_at = models.DateTimeField(null=True, blank=True)
+    recall_booked_at = models.DateTimeField(null=True, blank=True)
+    recall_completed_at = models.DateTimeField(null=True, blank=True)
+    recall_note = models.TextField(blank=True, default="")
+
+    generated_clinical_summary = models.TextField(blank=True, default="")
+    final_clinical_summary = models.TextField(blank=True, default="")
+    clinical_summary_overridden = models.BooleanField(default=False)
 
     report_status = models.CharField(
         max_length=30,
@@ -200,6 +234,67 @@ class StructuredReport(models.Model):
             print("StructuredReport dataset sync failed:", exc)
 
 
+class PatientReportDelivery(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    CHANNEL_CHOICES = [
+        ("email", "Email"),
+    ]
+
+    report = models.ForeignKey(
+        StructuredReport,
+        on_delete=models.CASCADE,
+        related_name="patient_deliveries",
+    )
+    patient = models.ForeignKey(
+        Patient,
+        on_delete=models.CASCADE,
+        related_name="report_deliveries",
+    )
+    channel = models.CharField(
+        max_length=20,
+        choices=CHANNEL_CHOICES,
+        default="email",
+    )
+    recipient = models.EmailField()
+    include_images = models.BooleanField(default=False)
+    consent_confirmed = models.BooleanField(default=False)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="patient_report_deliveries_requested",
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="patient_report_deliveries_sent",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+    failure_reason = models.TextField(blank=True, default="")
+    sent_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.report.report_id} -> {self.recipient}"
+
+
 class ReportStatusEvent(models.Model):
     EVENT_CHOICES = [
         ("created", "Created"),
@@ -208,10 +303,12 @@ class ReportStatusEvent(models.Model):
         ("resubmitted", "Resubmitted"),
         ("rejected", "Rejected"),
         ("issued", "Issued"),
-        ("hospital_viewed", "Hospital Viewed"),
-        ("hospital_downloaded", "Hospital Downloaded"),
+        ("clinic_signed", "Clinic Signed"),
+        ("clinic_issued", "Clinic Issued"),
         ("queued_for_distribution", "Queued for Distribution"),
         ("released_to_hospital", "Released to Hospital"),
+        ("hospital_viewed", "Hospital Viewed"),
+        ("hospital_downloaded", "Hospital Downloaded"),
     ]
 
     report = models.ForeignKey(

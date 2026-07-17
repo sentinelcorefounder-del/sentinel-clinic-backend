@@ -345,9 +345,16 @@ class ReportPDFRenderer:
         return Paragraph(text, self.styles["SectionHeading"])
 
     def _patient_details_table(self, include_contact=True):
+        master_patient = getattr(self.patient, "master_patient", None)
+        sentinel_patient_id = (
+            getattr(master_patient, "sentinel_patient_id", "")
+            or getattr(self.patient, "sentinel_patient_id", "")
+            or self.patient.patient_id
+        )
         rows = [
-            ["Patient", f"{self.patient.first_name} {self.patient.last_name}", "Patient ID", self.patient.patient_id],
-            ["Date of birth", _display(self.patient.date_of_birth), "Sex", _human(self.patient.sex)],
+            ["Patient", f"{self.patient.first_name} {self.patient.last_name}", "Sentinel Patient ID", sentinel_patient_id],
+            ["Date of birth", _display(self.patient.date_of_birth), "Local Patient ID", self.patient.patient_id],
+            ["Sex", _human(self.patient.sex), "Report format", self.report_format.title()],
         ]
         if include_contact:
             rows.append(["Phone", _display(self.patient.phone), "Email", _display(self.patient.email)])
@@ -488,6 +495,15 @@ class ReportPDFRenderer:
             self._section_title("Patient details"),
             self._patient_details_table(),
             Spacer(1, 9),
+            self._section_title("Clinical interpretation"),
+            Paragraph(
+                _display(
+                    self.report.final_clinical_summary
+                    or self.report.generated_clinical_summary
+                ),
+                self.styles["Body"],
+            ),
+            Spacer(1, 8),
             self._section_title("Clinical findings"),
             self._clinical_findings_table(),
             Spacer(1, 9),

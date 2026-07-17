@@ -15,6 +15,7 @@ from users.models import UserOrganization
 
 from .models import Patient
 from .permissions import CanManagePatients
+from .identity_services import ensure_master_identity
 from .serializers import (
     ClinicDirectPatientCreateSerializer,
     PatientSerializer,
@@ -257,6 +258,11 @@ class ClinicDirectPatientCreateView(APIView):
         )
 
         request.clinic_organization = org
+        ensure_master_identity(
+            patient,
+            organization=org,
+            local_id=patient.patient_id,
+        )
 
         record_patient_event(
             patient=patient,
@@ -337,6 +343,12 @@ class PatientSyncView(APIView):
                 "appointment_date": data.get("appointment_date"),
                 "source_system": "sentinel_ops",
             },
+        )
+
+        ensure_master_identity(
+            patient,
+            organization=clinic,
+            local_id=patient.patient_id,
         )
 
         return Response(

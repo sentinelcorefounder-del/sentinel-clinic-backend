@@ -1,4 +1,12 @@
 from django.urls import path
+from .delivery_views import (
+    PatientDeliveryListCreateView,
+    PatientDeliverySendView,
+)
+from .recall_views import (
+    RecallActionView,
+    RecallQueueView,
+)
 from .views import (
     StructuredReportListCreateView,
     StructuredReportDetailView,
@@ -13,6 +21,27 @@ from .views import (
 )
 
 urlpatterns = [
+    path(
+        "patient-deliveries/",
+        PatientDeliveryListCreateView.as_view(),
+        name="patient-delivery-list-create",
+    ),
+    path(
+        "patient-deliveries/<int:pk>/send/",
+        PatientDeliverySendView.as_view(),
+        name="patient-delivery-send",
+    ),
+    path(
+        "recalls/",
+        RecallQueueView.as_view(),
+        name="recall-queue",
+    ),
+    path(
+        "recalls/<int:pk>/action/",
+        RecallActionView.as_view(),
+        name="recall-action",
+    ),
+
     path("", StructuredReportListCreateView.as_view(), name="report-list-create"),
     path("<int:pk>/", StructuredReportDetailView.as_view(), name="report-detail"),
     path("<int:pk>/pdf/", StructuredReportPDFView.as_view(), name="report-pdf"),

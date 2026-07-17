@@ -25,6 +25,9 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "originating_organization_name",
             "hospital_referral",
             "source_hospital_name",
+            "source_override_reason",
+            "source_overridden_by",
+            "source_overridden_at",
             "screening_status",
 
             # Legacy fields
@@ -66,11 +69,52 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "originating_organization",
             "originating_organization_name",
             "source_hospital_name",
+            "source_overridden_by",
+            "source_overridden_at",
             "poor_va_flag",
             "poor_va_reason",
             "created_at",
             "updated_at",
         ]
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+
+        if instance is not None:
+            immutable_fields = {
+                "patient",
+                "source_type",
+                "hospital_referral",
+                "originating_organization",
+                "workflow_route",
+                "payment_responsibility",
+            }
+            changed = []
+
+            for field in immutable_fields:
+                if field not in attrs:
+                    continue
+
+                old_value = getattr(instance, field)
+                new_value = attrs[field]
+                old_pk = getattr(old_value, "pk", old_value)
+                new_pk = getattr(new_value, "pk", new_value)
+
+                if old_pk != new_pk:
+                    changed.append(field)
+
+            if changed:
+                raise serializers.ValidationError({
+                    "detail": (
+                        "Encounter source and routing are fixed when the "
+                        "assessment is created. Create a new assessment "
+                        "episode instead of changing: "
+                        + ", ".join(sorted(changed))
+                        + "."
+                    )
+                })
+
+        return attrs
 
     def _normalise_va(self, value):
         return (value or "").strip().lower().replace(" ", "")

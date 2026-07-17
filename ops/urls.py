@@ -1,5 +1,12 @@
 from django.urls import path
 
+from .identity_views import (
+    OpsHistoricalAccessDecisionView,
+    OpsHistoricalAccessRequestListView,
+    OpsIdentityReviewDecisionView,
+    OpsIdentityReviewListView,
+    OpsMasterPatientListView,
+)
 from .views import (
     OpsDashboardView,
     OpsReferralListView,
@@ -62,6 +69,32 @@ urlpatterns = [
 
     path("patients/", OpsPatientListView.as_view()),
     path("patients/<int:pk>/", OpsPatientDetailView.as_view()),
+
+    path(
+        "master-patients/",
+        OpsMasterPatientListView.as_view(),
+        name="ops-master-patients",
+    ),
+    path(
+        "identity-reviews/",
+        OpsIdentityReviewListView.as_view(),
+        name="ops-identity-reviews",
+    ),
+    path(
+        "identity-reviews/<int:pk>/decision/",
+        OpsIdentityReviewDecisionView.as_view(),
+        name="ops-identity-review-decision",
+    ),
+    path(
+        "historical-access/",
+        OpsHistoricalAccessRequestListView.as_view(),
+        name="ops-historical-access",
+    ),
+    path(
+        "historical-access/<int:pk>/decision/",
+        OpsHistoricalAccessDecisionView.as_view(),
+        name="ops-historical-access-decision",
+    ),
 
     path("hospitals/", OpsHospitalListView.as_view()),
     path("hospitals/<int:pk>/", OpsHospitalDetailView.as_view()),
