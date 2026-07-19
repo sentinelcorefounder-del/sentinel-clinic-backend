@@ -24,5 +24,6 @@ urlpatterns = [
     path("api/payments/", include("payments.urls")),
     path("api/ops/", include("ops.urls")),
     path("api/audit/", include("audit.urls")),
+    path("api/finance/", include("finance.urls")),
     re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
 ]
