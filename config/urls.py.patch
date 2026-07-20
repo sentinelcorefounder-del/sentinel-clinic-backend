@@ -1,0 +1,6 @@
+--- a/config/urls.py
++++ b/config/urls.py
+@@
+     path("api/payments/", include("payments.urls")),
++    path("api/finance/", include("finance.urls")),
+     path("api/ops/", include("ops.urls")),

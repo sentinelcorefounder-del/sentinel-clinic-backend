@@ -20,10 +20,38 @@ def _active_for_date(queryset, value):
     )
 
 
+def resolve_payer_organization(encounter):
+    """Return the organisation that should fund the encounter.
+
+    Hospital referrals are paid from the referring hospital wallet when the
+    payment responsibility is hospital. Clinic-direct activity is paid from
+    the originating clinic wallet when responsibility is clinic. Patient and
+    waived pathways do not use an organisation wallet.
+    """
+    responsibility = (encounter.payment_responsibility or "").strip()
+
+    if responsibility == "hospital":
+        referral = getattr(encounter, "hospital_referral", None)
+
+        if referral and getattr(referral, "source_hospital_id", None):
+            return referral.source_hospital
+
+        # Backward-compatible fallback:
+        # older and directly-created hospital encounters may not have a
+        # linked HospitalReferral record, but their originating organisation
+        # is still the hospital responsible for payment.
+        return encounter.originating_organization
+
+    if responsibility in {"clinic", "programme"}:
+        return encounter.originating_organization
+
+    return None
+
+
 def resolve_contract(encounter):
-    organization = encounter.originating_organization
+    organization = resolve_payer_organization(encounter)
     if organization is None:
-        raise ValidationError("Encounter has no originating organisation.")
+        raise ValidationError("Encounter has no organisation responsible for payment.")
 
     contracts = PartnerContract.objects.filter(
         organization=organization,
@@ -119,6 +147,7 @@ def price_encounter(encounter, actor=None, force=False):
     record.allocations.all().delete()
     record.contract = contract
     record.pricing_rule = rule
+    record.payer_organization = resolve_payer_organization(encounter)
     record.currency = contract.currency
     record.gross_amount = rule.gross_amount
     record.allocated_amount = allocated_total
@@ -471,7 +500,8 @@ def reserve_financial_record_from_originating_wallet(financial_record, actor=Non
     from .models import OrganizationWallet, WalletReservation
 
     record = EncounterFinancialRecord.objects.select_for_update().select_related(
-        "encounter", "encounter__originating_organization"
+        "encounter", "encounter__originating_organization",
+        "payer_organization"
     ).get(pk=financial_record.pk)
     if record.status not in {
         EncounterFinancialRecord.Status.AWAITING_PAYMENT,
@@ -486,9 +516,9 @@ def reserve_financial_record_from_originating_wallet(financial_record, actor=Non
         if existing:
             return existing
         raise ValidationError("This financial record is not eligible for an automatic wallet reservation.")
-    organization = record.encounter.originating_organization
+    organization = record.payer_organization or resolve_payer_organization(record.encounter)
     if organization is None:
-        raise ValidationError("Encounter has no originating organisation.")
+        raise ValidationError("No organisation wallet applies to this payment pathway.")
     try:
         wallet = OrganizationWallet.objects.get(
             organization=organization, currency=record.currency, is_active=True
@@ -604,3 +634,114 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None):
                 details={"settlement_batch_id": batch.id, "external_reference": external_reference},
             )
     return batch
+
+
+@transaction.atomic
+def approve_financial_record_credit(financial_record, actor=None):
+    record = EncounterFinancialRecord.objects.select_for_update().select_related("contract").get(
+        pk=financial_record.pk
+    )
+    if not record.contract or not record.contract.credit_allowed:
+        raise ValidationError("The active contract does not permit credit.")
+    previous_status = record.status
+    record.status = EncounterFinancialRecord.Status.APPROVED_CREDIT
+    record.secured_at = record.secured_at or timezone.now()
+    record.financially_releasable = False
+    record.exception_reason = ""
+    record.save(update_fields=[
+        "status", "secured_at", "financially_releasable", "exception_reason", "updated_at"
+    ])
+    _audit(record, "credit_approved", actor=actor, previous_status=previous_status)
+    return record
+
+
+@transaction.atomic
+def cancel_financial_record(financial_record, actor=None, reason="Encounter cancelled"):
+    from .models import WalletReservation
+
+    record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    for reservation in record.wallet_reservations.filter(
+        status__in=[WalletReservation.Status.ACTIVE, WalletReservation.Status.PARTIALLY_CAPTURED]
+    ):
+        if reservation.remaining_amount > 0:
+            release_wallet_reservation(
+                reservation,
+                amount=reservation.remaining_amount,
+                idempotency_key=f"financial-record:{record.id}:cancel-release:{reservation.id}",
+                actor=actor,
+                reference=f"EFR-{record.id}-CANCEL",
+            )
+    previous_status = record.status
+    record.refresh_from_db()
+    if record.status != EncounterFinancialRecord.Status.CAPTURED:
+        record.status = EncounterFinancialRecord.Status.CANCELLED
+        record.financially_releasable = False
+        record.exception_reason = reason
+        record.save(update_fields=["status", "financially_releasable", "exception_reason", "updated_at"] )
+        _audit(record, "encounter_finance_cancelled", actor=actor, previous_status=previous_status, details={"reason": reason})
+    return record
+
+
+@transaction.atomic
+def sync_encounter_finance_lifecycle(encounter, actor=None):
+    """Idempotently align finance with the encounter clinical lifecycle.
+
+    scheduled/in-progress: price and secure by wallet or approved credit
+    completed: capture an active wallet reservation
+    cancelled: release unused reservation and cancel finance record
+
+    Clinical work is not deleted when finance cannot progress. Instead the
+    financial record is placed in exception for Ops follow-up.
+    """
+    record = ensure_financial_record(encounter)
+
+    if encounter.screening_status == "cancelled":
+        return cancel_financial_record(record, actor=actor)
+
+    if record.status in {
+        EncounterFinancialRecord.Status.UNPRICED,
+        EncounterFinancialRecord.Status.EXCEPTION,
+    }:
+        record = price_encounter(encounter, actor=actor, force=True)
+
+    responsibility = (encounter.payment_responsibility or "").strip()
+    if responsibility == "waived":
+        previous_status = record.status
+        record.status = EncounterFinancialRecord.Status.FINANCIALLY_SECURED
+        record.outstanding_amount = Decimal("0.00")
+        record.secured_at = record.secured_at or timezone.now()
+        record.exception_reason = ""
+        record.save(update_fields=["status", "outstanding_amount", "secured_at", "exception_reason", "updated_at"] )
+        _audit(record, "payment_waived", actor=actor, previous_status=previous_status)
+        return record
+
+    if responsibility in {"hospital", "clinic", "programme"} and record.status in {
+        EncounterFinancialRecord.Status.AWAITING_PAYMENT,
+        EncounterFinancialRecord.Status.PRICED,
+    }:
+        try:
+            reserve_financial_record_from_originating_wallet(
+                record, actor=actor, reference=f"EFR-{record.id}-AUTO"
+            )
+        except ValidationError:
+            if record.contract and record.contract.credit_allowed:
+                approve_financial_record_credit(record, actor=actor)
+            else:
+                raise
+        record.refresh_from_db()
+
+    if encounter.screening_status == "completed":
+        if record.status == EncounterFinancialRecord.Status.WALLET_RESERVED:
+            capture_financial_record_wallet_reservation(
+                record, actor=actor, reference=f"EFR-{record.id}-COMPLETE"
+            )
+            record.refresh_from_db()
+        elif record.status == EncounterFinancialRecord.Status.APPROVED_CREDIT:
+            previous_status = record.status
+            record.status = EncounterFinancialRecord.Status.READY_FOR_RELEASE
+            record.financially_releasable = True
+            record.captured_at = record.captured_at or timezone.now()
+            record.save(update_fields=["status", "financially_releasable", "captured_at", "updated_at"] )
+            _audit(record, "credit_service_completed", actor=actor, previous_status=previous_status)
+
+    return record

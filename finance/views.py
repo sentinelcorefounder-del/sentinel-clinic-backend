@@ -2,7 +2,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
 from .models import (
@@ -21,11 +21,27 @@ from .services import (
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
     reserve_financial_record_from_originating_wallet, capture_financial_record_wallet_reservation,
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
+    sync_encounter_finance_lifecycle,
 )
 
 
+
+
+class IsSentinelFinanceOps(BasePermission):
+    message = "You do not have permission to access Sentinel Finance."
+    allowed_groups = {"ops_admin", "sentinel_ops", "super_admin", "finance_tester"}
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser:
+            return True
+        return user.groups.filter(name__in=self.allowed_groups).exists()
+
+
 class FinanceAdminViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
 
 
 class PartnerContractViewSet(FinanceAdminViewSet):
@@ -46,7 +62,7 @@ class AllocationRuleViewSet(FinanceAdminViewSet):
 
 
 class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
     serializer_class = EncounterFinancialRecordSerializer
     queryset = EncounterFinancialRecord.objects.select_related(
         "encounter",
@@ -54,6 +70,26 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
         "contract",
         "pricing_rule",
     ).prefetch_related("allocations", "allocations__beneficiary_organization")
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        encounter_id = (self.request.query_params.get("encounter_id") or "").strip()
+        status_value = (self.request.query_params.get("status") or "").strip()
+        if encounter_id:
+            queryset = queryset.filter(encounter__encounter_id=encounter_id)
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        return queryset
+
+    @action(detail=True, methods=["post"], url_path="sync-lifecycle")
+    def sync_lifecycle(self, request, pk=None):
+        record = self.get_object()
+        try:
+            record = sync_encounter_finance_lifecycle(record.encounter, actor=request.user)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(record).data)
 
     @action(detail=True, methods=["post"])
     def price(self, request, pk=None):
@@ -180,7 +216,7 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
 
 
 class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
     serializer_class = WalletLedgerEntrySerializer
     queryset = WalletLedgerEntry.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "reservation", "actor"
@@ -188,7 +224,7 @@ class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
     serializer_class = WalletReservationSerializer
     queryset = WalletReservation.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "financial_record__encounter"
@@ -297,7 +333,7 @@ def _active_contract_for(organization):
 
 
 class FinanceDashboardSummaryView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
 
     def get(self, request):
         wallet_totals = WalletLedgerEntry.objects.aggregate(
@@ -350,7 +386,7 @@ class PartnerFinanceView(APIView):
 
 
 class FinanceOrganizationOptionsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
 
     def get(self, request):
         organizations = Organization.objects.filter(is_active=True).order_by("name")

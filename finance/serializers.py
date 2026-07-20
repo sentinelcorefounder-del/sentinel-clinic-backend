@@ -59,6 +59,15 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(
         source="encounter.originating_organization.name", read_only=True
     )
+    payer_organization_name = serializers.CharField(
+        source="payer_organization.name", read_only=True, allow_null=True
+    )
+    payment_responsibility = serializers.CharField(
+        source="encounter.payment_responsibility", read_only=True
+    )
+    clinical_status = serializers.CharField(
+        source="encounter.screening_status", read_only=True
+    )
     contract_name = serializers.CharField(source="contract.name", read_only=True)
     pricing_rule_name = serializers.CharField(source="pricing_rule.name", read_only=True)
     allocations = EncounterAllocationSerializer(many=True, read_only=True)

@@ -177,6 +177,14 @@ class EncounterFinancialRecord(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="financial_record",
     )
+    payer_organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="payer_financial_records",
+        help_text="Organisation financially responsible for this encounter.",
+    )
     contract = models.ForeignKey(
         PartnerContract,
         on_delete=models.PROTECT,

@@ -1,0 +1,7 @@
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@
+     "payments",
++    "finance.apps.FinanceConfig",
+     "ops",
+ ]
