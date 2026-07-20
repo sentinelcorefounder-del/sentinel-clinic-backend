@@ -1,4 +1,5 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAdminUser
@@ -6,18 +7,20 @@ from rest_framework.response import Response
 
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
-    OrganizationWallet, WalletLedgerEntry, WalletReservation,
+    OrganizationWallet, WalletLedgerEntry, WalletReservation, SettlementBatch,
 )
 from .serializers import (
     AllocationRuleSerializer,
     EncounterFinancialRecordSerializer,
     PartnerContractSerializer,
     PricingRuleSerializer,
-    OrganizationWalletSerializer, WalletLedgerEntrySerializer, WalletReservationSerializer,
+    OrganizationWalletSerializer, WalletLedgerEntrySerializer, WalletReservationSerializer, SettlementBatchSerializer,
 )
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
+    reserve_financial_record_from_originating_wallet, capture_financial_record_wallet_reservation,
+    create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
 )
 
 
@@ -65,6 +68,30 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
             message = exc.messages if hasattr(exc, "messages") else [str(exc)]
             return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(record).data)
+
+    @action(detail=True, methods=["post"], url_path="reserve-originating-wallet")
+    def reserve_originating_wallet(self, request, pk=None):
+        record = self.get_object()
+        try:
+            reservation = reserve_financial_record_from_originating_wallet(
+                record, actor=request.user, reference=request.data.get("reference", "")
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(WalletReservationSerializer(reservation).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="capture-wallet")
+    def capture_wallet(self, request, pk=None):
+        record = self.get_object()
+        try:
+            reservation = capture_financial_record_wallet_reservation(
+                record, actor=request.user, reference=request.data.get("reference", "")
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(WalletReservationSerializer(reservation).data)
 
 
 class OrganizationWalletViewSet(FinanceAdminViewSet):
@@ -198,3 +225,48 @@ class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
             message = exc.messages if hasattr(exc, "messages") else [str(exc)]
             return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(reservation).data)
+
+
+class SettlementBatchViewSet(FinanceAdminViewSet):
+    serializer_class = SettlementBatchSerializer
+    queryset = SettlementBatch.objects.select_related(
+        "beneficiary_organization", "approved_by"
+    ).prefetch_related("items", "items__allocation", "items__allocation__financial_record")
+
+    def create(self, request, *args, **kwargs):
+        try:
+            from organizations.models import Organization
+            organization = Organization.objects.get(pk=request.data.get("beneficiary_organization"))
+            batch = create_settlement_batch(
+                beneficiary_organization=organization,
+                period_start=parse_date(request.data.get("period_start", "")),
+                period_end=parse_date(request.data.get("period_end", "")),
+                currency=request.data.get("currency", "NGN"),
+                actor=request.user,
+            )
+        except Organization.DoesNotExist:
+            return Response({"detail": "Beneficiary organisation not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(batch).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            batch = approve_settlement_batch(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(batch).data)
+
+    @action(detail=True, methods=["post"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        try:
+            batch = mark_settlement_batch_paid(
+                self.get_object(),
+                external_reference=request.data.get("external_reference", ""),
+                actor=request.user,
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(batch).data)

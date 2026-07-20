@@ -198,3 +198,40 @@ class WalletEngineTests(FinanceEngineTests):
             entry.save()
         with self.assertRaises(ValidationError):
             entry.delete()
+
+
+class NegotiatedPricingAndAutomationTests(WalletEngineTests):
+    def test_negotiated_price_is_reserved_not_global_default(self):
+        negotiated_rule = PricingRule.objects.create(
+            contract=self.contract,
+            name="Negotiated Hospital Rate",
+            service_type="retinal_assessment",
+            source_type="hospital_referral",
+            gross_amount=Decimal("12500.00"),
+            effective_from=date(2026, 1, 1),
+            priority=1,
+        )
+        AllocationRule.objects.create(
+            pricing_rule=negotiated_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("12500.00"),
+        )
+        self.record = price_encounter(self.encounter, force=True)
+        top_up_wallet(self.wallet, Decimal("20000.00"), "negotiated-topup")
+        from .services import reserve_financial_record_from_originating_wallet
+        reservation = reserve_financial_record_from_originating_wallet(self.record)
+        self.assertEqual(reservation.amount, Decimal("12500.00"))
+        self.assertEqual(self.wallet.available_balance, Decimal("7500.00"))
+
+    def test_automatic_capture_uses_existing_reservation(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "automation-topup")
+        from .services import (
+            reserve_financial_record_from_originating_wallet,
+            capture_financial_record_wallet_reservation,
+        )
+        reserve_financial_record_from_originating_wallet(self.record)
+        capture_financial_record_wallet_reservation(self.record)
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
+        self.assertEqual(self.record.outstanding_amount, Decimal("0.00"))

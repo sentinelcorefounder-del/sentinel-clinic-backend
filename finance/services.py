@@ -464,3 +464,143 @@ def refund_to_wallet(wallet, amount, idempotency_key, financial_record=None, act
             details={"amount": str(amount), "wallet_id": wallet.id},
         )
     return entry
+
+
+@transaction.atomic
+def reserve_financial_record_from_originating_wallet(financial_record, actor=None, reference=""):
+    from .models import OrganizationWallet, WalletReservation
+
+    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+        "encounter", "encounter__originating_organization"
+    ).get(pk=financial_record.pk)
+    if record.status not in {
+        EncounterFinancialRecord.Status.AWAITING_PAYMENT,
+        EncounterFinancialRecord.Status.PRICED,
+    }:
+        existing = record.wallet_reservations.filter(
+            status__in=[
+                WalletReservation.Status.ACTIVE,
+                WalletReservation.Status.PARTIALLY_CAPTURED,
+            ]
+        ).first()
+        if existing:
+            return existing
+        raise ValidationError("This financial record is not eligible for an automatic wallet reservation.")
+    organization = record.encounter.originating_organization
+    if organization is None:
+        raise ValidationError("Encounter has no originating organisation.")
+    try:
+        wallet = OrganizationWallet.objects.get(
+            organization=organization, currency=record.currency, is_active=True
+        )
+    except OrganizationWallet.DoesNotExist as exc:
+        raise ValidationError("The originating organisation has no active wallet for this currency.") from exc
+    return reserve_wallet_funds(
+        wallet=wallet,
+        financial_record=record,
+        amount=record.outstanding_amount,
+        idempotency_key=f"financial-record:{record.id}:auto-reserve",
+        actor=actor,
+        reference=reference or f"EFR-{record.id}",
+    )
+
+
+@transaction.atomic
+def capture_financial_record_wallet_reservation(financial_record, actor=None, reference=""):
+    from .models import WalletReservation
+
+    record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    reservation = record.wallet_reservations.filter(
+        status__in=[WalletReservation.Status.ACTIVE, WalletReservation.Status.PARTIALLY_CAPTURED]
+    ).order_by("created_at").first()
+    if not reservation:
+        raise ValidationError("No active wallet reservation exists for this financial record.")
+    return capture_wallet_reservation(
+        reservation,
+        amount=reservation.remaining_amount,
+        idempotency_key=f"financial-record:{record.id}:auto-capture",
+        actor=actor,
+        reference=reference or reservation.reference,
+    )
+
+
+@transaction.atomic
+def create_settlement_batch(beneficiary_organization, period_start, period_end, currency="NGN", actor=None):
+    from .models import EncounterAllocation, SettlementBatch, SettlementItem
+
+    if not period_start or not period_end:
+        raise ValidationError("Valid settlement period_start and period_end dates are required.")
+    if period_end < period_start:
+        raise ValidationError("Settlement period end cannot precede its start.")
+    allocations = EncounterAllocation.objects.select_for_update().filter(
+        beneficiary_organization=beneficiary_organization,
+        currency=currency,
+        financial_record__financially_releasable=True,
+        financial_record__captured_at__date__gte=period_start,
+        financial_record__captured_at__date__lte=period_end,
+        settlement_item__isnull=True,
+    )
+    if not allocations.exists():
+        raise ValidationError("No unsettled allocations were found for this beneficiary and period.")
+    batch = SettlementBatch.objects.create(
+        beneficiary_organization=beneficiary_organization,
+        currency=currency,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    items = [
+        SettlementItem(batch=batch, allocation=a, amount=a.amount, currency=a.currency)
+        for a in allocations
+    ]
+    SettlementItem.objects.bulk_create(items)
+    batch.total_amount = sum((item.amount for item in items), Decimal("0.00"))
+    batch.save(update_fields=["total_amount", "updated_at"])
+    return batch
+
+
+@transaction.atomic
+def approve_settlement_batch(batch, actor=None):
+    from .models import SettlementBatch
+
+    batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
+    if batch.status != SettlementBatch.Status.DRAFT:
+        raise ValidationError("Only draft settlement batches can be approved.")
+    batch.status = SettlementBatch.Status.APPROVED
+    batch.approved_by = actor
+    batch.approved_at = timezone.now()
+    batch.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+    return batch
+
+
+@transaction.atomic
+def mark_settlement_batch_paid(batch, external_reference, actor=None):
+    from .models import EncounterFinancialRecord, SettlementBatch
+
+    batch = SettlementBatch.objects.select_for_update().prefetch_related(
+        "items__allocation__financial_record"
+    ).get(pk=batch.pk)
+    if batch.status != SettlementBatch.Status.APPROVED:
+        raise ValidationError("Only approved settlement batches can be marked paid.")
+    external_reference = str(external_reference or "").strip()
+    if not external_reference:
+        raise ValidationError("An external settlement reference is required.")
+    batch.status = SettlementBatch.Status.PAID
+    batch.external_reference = external_reference
+    batch.paid_at = timezone.now()
+    batch.save(update_fields=["status", "external_reference", "paid_at", "updated_at"])
+
+    record_ids = {item.allocation.financial_record_id for item in batch.items.all()}
+    for record in EncounterFinancialRecord.objects.select_for_update().filter(id__in=record_ids):
+        if not record.allocations.exclude(settlement_item__batch__status=SettlementBatch.Status.PAID).exists():
+            previous_status = record.status
+            record.status = EncounterFinancialRecord.Status.SETTLED
+            record.settled_at = timezone.now()
+            record.save(update_fields=["status", "settled_at", "updated_at"])
+            _audit(
+                record,
+                "settlement_paid",
+                actor=actor,
+                previous_status=previous_status,
+                details={"settlement_batch_id": batch.id, "external_reference": external_reference},
+            )
+    return batch

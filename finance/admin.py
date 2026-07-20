@@ -10,6 +10,8 @@ from .models import (
     OrganizationWallet,
     WalletLedgerEntry,
     WalletReservation,
+    SettlementBatch,
+    SettlementItem,
 )
 
 
@@ -83,3 +85,19 @@ class WalletLedgerEntryAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+class SettlementItemInline(admin.TabularInline):
+    model = SettlementItem
+    extra = 0
+    readonly_fields = ("allocation", "amount", "currency", "created_at", "updated_at")
+    can_delete = False
+
+
+@admin.register(SettlementBatch)
+class SettlementBatchAdmin(admin.ModelAdmin):
+    list_display = ("id", "beneficiary_organization", "period_start", "period_end", "total_amount", "currency", "status")
+    list_filter = ("status", "currency", "period_end")
+    search_fields = ("beneficiary_organization__name", "external_reference")
+    readonly_fields = ("total_amount", "approved_by", "approved_at", "paid_at", "created_at", "updated_at")
+    inlines = [SettlementItemInline]

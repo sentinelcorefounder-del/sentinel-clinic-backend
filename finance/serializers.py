@@ -9,6 +9,8 @@ from .models import (
     OrganizationWallet,
     WalletLedgerEntry,
     WalletReservation,
+    SettlementBatch,
+    SettlementItem,
 )
 
 
@@ -106,4 +108,26 @@ class WalletReservationSerializer(serializers.ModelSerializer):
             "wallet", "financial_record", "amount", "captured_amount", "released_amount",
             "currency", "status", "idempotency_key", "reference", "reserved_at",
             "captured_at", "released_at", "created_at", "updated_at",
+        )
+
+
+class SettlementItemSerializer(serializers.ModelSerializer):
+    encounter_id = serializers.CharField(source="allocation.financial_record.encounter.encounter_id", read_only=True)
+
+    class Meta:
+        model = SettlementItem
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in SettlementItem._meta.fields)
+
+
+class SettlementBatchSerializer(serializers.ModelSerializer):
+    beneficiary_organization_name = serializers.CharField(source="beneficiary_organization.name", read_only=True)
+    items = SettlementItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SettlementBatch
+        fields = "__all__"
+        read_only_fields = (
+            "status", "total_amount", "approved_by", "approved_at", "paid_at",
+            "created_at", "updated_at",
         )

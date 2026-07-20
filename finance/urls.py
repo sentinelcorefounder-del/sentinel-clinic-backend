@@ -8,6 +8,7 @@ from .views import (
     OrganizationWalletViewSet,
     WalletLedgerEntryViewSet,
     WalletReservationViewSet,
+    SettlementBatchViewSet,
 )
 
 router = DefaultRouter()
@@ -18,5 +19,6 @@ router.register("financial-records", EncounterFinancialRecordViewSet, basename="
 router.register("wallets", OrganizationWalletViewSet, basename="finance-wallet")
 router.register("wallet-ledger", WalletLedgerEntryViewSet, basename="finance-wallet-ledger")
 router.register("wallet-reservations", WalletReservationViewSet, basename="finance-wallet-reservation")
+router.register("settlements", SettlementBatchViewSet, basename="finance-settlement")
 
 urlpatterns = router.urls

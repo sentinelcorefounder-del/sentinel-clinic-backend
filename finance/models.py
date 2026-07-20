@@ -446,3 +446,73 @@ class WalletLedgerEntry(models.Model):
 
     def __str__(self):
         return f"{self.get_entry_type_display()} - {self.wallet}"
+
+
+class SettlementBatch(TimeStampedModel):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        APPROVED = "approved", "Approved"
+        PAID = "paid", "Paid"
+        CANCELLED = "cancelled", "Cancelled"
+
+    beneficiary_organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.PROTECT,
+        related_name="finance_settlement_batches",
+    )
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    period_start = models.DateField()
+    period_end = models.DateField()
+    total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    external_reference = models.CharField(max_length=120, blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_finance_settlements",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-period_end", "-created_at"]
+        indexes = [
+            models.Index(fields=["beneficiary_organization", "status"], name="fin_set_org_status_idx"),
+        ]
+
+    def clean(self):
+        if self.period_end < self.period_start:
+            raise ValidationError({"period_end": "Period end cannot precede period start."})
+
+    def __str__(self):
+        return f"Settlement {self.id or 'new'} - {self.beneficiary_organization}"
+
+
+class SettlementItem(TimeStampedModel):
+    batch = models.ForeignKey(
+        SettlementBatch,
+        on_delete=models.PROTECT,
+        related_name="items",
+    )
+    allocation = models.OneToOneField(
+        EncounterAllocation,
+        on_delete=models.PROTECT,
+        related_name="settlement_item",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+
+    class Meta:
+        ordering = ["id"]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Settlement amount must be greater than zero."})
+        if self.batch_id and self.currency != self.batch.currency:
+            raise ValidationError({"currency": "Settlement item currency must match its batch."})
+
+    def __str__(self):
+        return f"Settlement item {self.id or 'new'} - {self.amount} {self.currency}"
