@@ -270,3 +270,96 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(batch).data)
+
+
+from django.db import models
+from django.db.models import Sum
+from django.utils import timezone
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
+from common.tenant import get_user_organization
+from organizations.models import Organization
+from .serializers import PartnerFinanceSummarySerializer
+
+
+def _active_contract_for(organization):
+    today = timezone.localdate()
+    return (
+        PartnerContract.objects.filter(
+            organization=organization,
+            status=PartnerContract.Status.ACTIVE,
+            effective_from__lte=today,
+        )
+        .filter(models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=today))
+        .order_by("-effective_from")
+        .first()
+    )
+
+
+class FinanceDashboardSummaryView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        wallet_totals = WalletLedgerEntry.objects.aggregate(
+            available=Sum("available_delta"), reserved=Sum("reserved_delta")
+        )
+        settlement_totals = SettlementBatch.objects.values("status").annotate(total=Sum("total_amount"))
+        return Response({
+            "contracts": PartnerContract.objects.count(),
+            "active_contracts": PartnerContract.objects.filter(status=PartnerContract.Status.ACTIVE).count(),
+            "pricing_rules": PricingRule.objects.filter(is_active=True).count(),
+            "wallets": OrganizationWallet.objects.filter(is_active=True).count(),
+            "wallet_available": str(wallet_totals["available"] or 0),
+            "wallet_reserved": str(wallet_totals["reserved"] or 0),
+            "financial_records": EncounterFinancialRecord.objects.count(),
+            "awaiting_payment": EncounterFinancialRecord.objects.filter(status=EncounterFinancialRecord.Status.AWAITING_PAYMENT).count(),
+            "captured": EncounterFinancialRecord.objects.filter(status=EncounterFinancialRecord.Status.CAPTURED).count(),
+            "settlements": {row["status"]: str(row["total"] or 0) for row in settlement_totals},
+        })
+
+
+class PartnerFinanceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        organization = get_user_organization(request.user)
+        if not organization:
+            return Response({"detail": "No organisation is linked to this account."}, status=status.HTTP_403_FORBIDDEN)
+        wallet = OrganizationWallet.objects.filter(organization=organization, currency="NGN", is_active=True).first()
+        contract = _active_contract_for(organization)
+        rules = PricingRule.objects.none()
+        if contract:
+            rules = contract.pricing_rules.filter(is_active=True).prefetch_related("allocation_rules")
+        ledger = WalletLedgerEntry.objects.none()
+        if wallet:
+            ledger = wallet.ledger_entries.select_related("financial_record")[:50]
+        records = EncounterFinancialRecord.objects.select_related(
+            "encounter", "contract", "pricing_rule", "encounter__originating_organization"
+        ).filter(encounter__originating_organization=organization)[:25]
+        data = {
+            "organization_id": organization.id,
+            "organization_name": organization.name,
+            "organization_type": organization.organization_type,
+            "wallet": wallet,
+            "active_contract": contract,
+            "active_pricing_rules": rules,
+            "recent_ledger": ledger,
+            "recent_financial_records": records,
+        }
+        return Response(PartnerFinanceSummarySerializer(data).data)
+
+
+class FinanceOrganizationOptionsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        organizations = Organization.objects.filter(is_active=True).order_by("name")
+        return Response([
+            {
+                "id": organization.id,
+                "name": organization.name,
+                "organization_type": organization.organization_type,
+                "clinic_id": organization.clinic_id,
+            }
+            for organization in organizations
+        ])

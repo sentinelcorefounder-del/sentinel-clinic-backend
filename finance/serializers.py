@@ -131,3 +131,14 @@ class SettlementBatchSerializer(serializers.ModelSerializer):
             "status", "total_amount", "approved_by", "approved_at", "paid_at",
             "created_at", "updated_at",
         )
+
+
+class PartnerFinanceSummarySerializer(serializers.Serializer):
+    organization_id = serializers.IntegerField()
+    organization_name = serializers.CharField()
+    organization_type = serializers.CharField()
+    wallet = OrganizationWalletSerializer(allow_null=True)
+    active_contract = PartnerContractSerializer(allow_null=True)
+    active_pricing_rules = PricingRuleSerializer(many=True)
+    recent_ledger = WalletLedgerEntrySerializer(many=True)
+    recent_financial_records = EncounterFinancialRecordSerializer(many=True)

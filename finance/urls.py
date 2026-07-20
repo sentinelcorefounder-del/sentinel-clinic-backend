@@ -22,3 +22,12 @@ router.register("wallet-reservations", WalletReservationViewSet, basename="finan
 router.register("settlements", SettlementBatchViewSet, basename="finance-settlement")
 
 urlpatterns = router.urls
+
+from django.urls import path
+from .views import FinanceDashboardSummaryView, PartnerFinanceView, FinanceOrganizationOptionsView
+
+urlpatterns += [
+    path("summary/", FinanceDashboardSummaryView.as_view(), name="finance-summary"),
+    path("me/", PartnerFinanceView.as_view(), name="finance-me"),
+    path("organization-options/", FinanceOrganizationOptionsView.as_view(), name="finance-organization-options"),
+]
