@@ -266,3 +266,183 @@ class FinancialAuditLog(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class OrganizationWallet(TimeStampedModel):
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.PROTECT,
+        related_name="finance_wallets",
+    )
+    currency = models.CharField(max_length=3, default="NGN")
+    is_active = models.BooleanField(default=True)
+    credit_limit = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["organization__name", "currency"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "currency"],
+                name="finance_unique_org_wallet_currency",
+            )
+        ]
+
+    def clean(self):
+        if self.credit_limit < 0:
+            raise ValidationError({"credit_limit": "Credit limit cannot be negative."})
+
+    @property
+    def available_balance(self):
+        return self.ledger_entries.aggregate(total=models.Sum("available_delta"))["total"] or Decimal("0.00")
+
+    @property
+    def reserved_balance(self):
+        return self.ledger_entries.aggregate(total=models.Sum("reserved_delta"))["total"] or Decimal("0.00")
+
+    @property
+    def spendable_balance(self):
+        return self.available_balance + self.credit_limit
+
+    def __str__(self):
+        return f"{self.organization.name} wallet ({self.currency})"
+
+
+class WalletReservation(TimeStampedModel):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        PARTIALLY_CAPTURED = "partially_captured", "Partially captured"
+        CAPTURED = "captured", "Captured"
+        PARTIALLY_RELEASED = "partially_released", "Partially released"
+        RELEASED = "released", "Released"
+        CANCELLED = "cancelled", "Cancelled"
+
+    wallet = models.ForeignKey(
+        OrganizationWallet,
+        on_delete=models.PROTECT,
+        related_name="reservations",
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord,
+        on_delete=models.PROTECT,
+        related_name="wallet_reservations",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    captured_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    released_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.ACTIVE)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    reference = models.CharField(max_length=120, blank=True, default="")
+    reserved_at = models.DateTimeField(auto_now_add=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["wallet", "status"], name="finance_wal_wallet__1c9971_idx"),
+            models.Index(fields=["financial_record", "status"], name="finance_wal_financi_f5d88f_idx"),
+        ]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Reservation amount must be greater than zero."})
+        if self.captured_amount < 0 or self.released_amount < 0:
+            raise ValidationError("Captured and released amounts cannot be negative.")
+        if self.captured_amount + self.released_amount > self.amount:
+            raise ValidationError("Captured and released amounts cannot exceed the reservation amount.")
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Reservation currency must match the wallet currency."})
+        if self.financial_record_id and self.currency != self.financial_record.currency:
+            raise ValidationError({"currency": "Reservation currency must match the financial record currency."})
+
+    @property
+    def remaining_amount(self):
+        return self.amount - self.captured_amount - self.released_amount
+
+    def __str__(self):
+        return f"Reservation {self.id} - {self.amount} {self.currency}"
+
+
+class WalletLedgerEntry(models.Model):
+    class EntryType(models.TextChoices):
+        TOP_UP = "top_up", "Top up"
+        SERVICE_RESERVATION = "service_reservation", "Service reservation"
+        SERVICE_CAPTURE = "service_capture", "Service capture"
+        RESERVATION_RELEASE = "reservation_release", "Reservation release"
+        REFUND = "refund", "Refund"
+        REVERSAL = "reversal", "Reversal"
+        ADJUSTMENT = "adjustment", "Adjustment"
+        SETTLEMENT = "settlement", "Settlement"
+        TRANSFER = "transfer", "Transfer"
+        WRITE_OFF = "write_off", "Write off"
+
+    wallet = models.ForeignKey(
+        OrganizationWallet,
+        on_delete=models.PROTECT,
+        related_name="ledger_entries",
+    )
+    entry_type = models.CharField(max_length=40, choices=EntryType.choices)
+    available_delta = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    reserved_delta = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    currency = models.CharField(max_length=3, default="NGN")
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="wallet_ledger_entries",
+    )
+    reservation = models.ForeignKey(
+        WalletReservation,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+    )
+    related_entry = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="follow_up_entries",
+    )
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    reference = models.CharField(max_length=120, blank=True, default="")
+    description = models.CharField(max_length=255, blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="wallet_ledger_entries",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["wallet", "created_at"], name="finance_wal_wallet__c065f5_idx"),
+            models.Index(fields=["entry_type", "created_at"], name="finance_wal_entry_t_04ed32_idx"),
+            models.Index(fields=["financial_record", "created_at"], name="finance_wal_financi_49d1f9_idx"),
+        ]
+
+    def clean(self):
+        if self.available_delta == 0 and self.reserved_delta == 0:
+            raise ValidationError("A ledger entry must change the available or reserved balance.")
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Ledger currency must match the wallet currency."})
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Wallet ledger entries are immutable and cannot be edited.")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Wallet ledger entries are immutable and cannot be deleted.")
+
+    def __str__(self):
+        return f"{self.get_entry_type_display()} - {self.wallet}"

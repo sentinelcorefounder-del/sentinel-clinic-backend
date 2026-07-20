@@ -9,8 +9,14 @@ from encounters.models import ScreeningEncounter
 from organizations.models import Organization
 from patients.models import Patient
 
-from .models import AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule
-from .services import price_encounter
+from .models import (
+    AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
+    OrganizationWallet, WalletLedgerEntry, WalletReservation,
+)
+from .services import (
+    price_encounter, top_up_wallet, reserve_wallet_funds,
+    capture_wallet_reservation, release_wallet_reservation,
+)
 
 
 class FinanceEngineTests(TestCase):
@@ -81,6 +87,114 @@ class FinanceEngineTests(TestCase):
         self.assertEqual(record.status, EncounterFinancialRecord.Status.AWAITING_PAYMENT)
 
     def test_invalid_allocation_total_is_rejected(self):
-        self.rule.allocation_rules.last().delete()
+        invalid_rule = PricingRule.objects.create(
+            contract=self.contract,
+            name="Invalid Hospital Pricing",
+            service_type="retinal_assessment",
+            source_type="hospital_referral",
+            gross_amount=Decimal("15000.00"),
+            effective_from=date(2026, 1, 1),
+            priority=100,
+        )
+
+        AllocationRule.objects.create(
+            pricing_rule=invalid_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.HOSPITAL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("2500.00"),
+        )
+
+        AllocationRule.objects.create(
+            pricing_rule=invalid_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.CLINIC,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("7500.00"),
+        )
+
+        # Total allocation is only ₦10,000 instead of ₦15,000.
+        # This should be rejected by the pricing engine.
         with self.assertRaises(ValidationError):
             price_encounter(self.encounter)
+
+
+class WalletEngineTests(FinanceEngineTests):
+    def setUp(self):
+        super().setUp()
+        self.record = price_encounter(self.encounter)
+        self.wallet = OrganizationWallet.objects.create(
+            organization=self.organization,
+            currency="NGN",
+            credit_limit=Decimal("0.00"),
+        )
+
+    def test_top_up_is_idempotent(self):
+        first = top_up_wallet(self.wallet, Decimal("20000.00"), "topup-001")
+        second = top_up_wallet(self.wallet, Decimal("20000.00"), "topup-001")
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(self.wallet.available_balance, Decimal("20000.00"))
+        self.assertEqual(WalletLedgerEntry.objects.count(), 1)
+
+    def test_reserve_moves_available_to_reserved(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "topup-002")
+        reservation = reserve_wallet_funds(
+            self.wallet,
+            self.record,
+            Decimal("15000.00"),
+            "reserve-001",
+        )
+        self.assertEqual(reservation.status, WalletReservation.Status.ACTIVE)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        self.assertEqual(self.wallet.reserved_balance, Decimal("15000.00"))
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.WALLET_RESERVED)
+
+    def test_capture_consumes_reserved_funds_and_releases_report(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "topup-003")
+        reservation = reserve_wallet_funds(
+            self.wallet,
+            self.record,
+            Decimal("15000.00"),
+            "reserve-002",
+        )
+        capture_wallet_reservation(reservation, idempotency_key="capture-001")
+        reservation.refresh_from_db()
+        self.record.refresh_from_db()
+        self.assertEqual(reservation.status, WalletReservation.Status.CAPTURED)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        self.assertEqual(self.wallet.reserved_balance, Decimal("0.00"))
+        self.assertEqual(self.record.outstanding_amount, Decimal("0.00"))
+        self.assertTrue(self.record.financially_releasable)
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
+
+    def test_release_returns_reserved_funds(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "topup-004")
+        reservation = reserve_wallet_funds(
+            self.wallet,
+            self.record,
+            Decimal("15000.00"),
+            "reserve-003",
+        )
+        release_wallet_reservation(reservation, idempotency_key="release-001")
+        reservation.refresh_from_db()
+        self.record.refresh_from_db()
+        self.assertEqual(reservation.status, WalletReservation.Status.RELEASED)
+        self.assertEqual(self.wallet.available_balance, Decimal("15000.00"))
+        self.assertEqual(self.wallet.reserved_balance, Decimal("0.00"))
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.AWAITING_PAYMENT)
+
+    def test_insufficient_funds_are_rejected(self):
+        with self.assertRaises(ValidationError):
+            reserve_wallet_funds(
+                self.wallet,
+                self.record,
+                Decimal("15000.00"),
+                "reserve-004",
+            )
+
+    def test_ledger_entries_are_immutable(self):
+        entry = top_up_wallet(self.wallet, Decimal("1000.00"), "topup-005")
+        entry.description = "Changed"
+        with self.assertRaises(ValidationError):
+            entry.save()
+        with self.assertRaises(ValidationError):
+            entry.delete()

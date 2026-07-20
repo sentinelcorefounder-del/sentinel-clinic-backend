@@ -7,6 +7,9 @@ from .models import (
     FinancialAuditLog,
     PartnerContract,
     PricingRule,
+    OrganizationWallet,
+    WalletLedgerEntry,
+    WalletReservation,
 )
 
 
@@ -40,3 +43,43 @@ class EncounterFinancialRecordAdmin(admin.ModelAdmin):
 admin.site.register(AllocationRule)
 admin.site.register(EncounterAllocation)
 admin.site.register(FinancialAuditLog)
+
+
+@admin.register(OrganizationWallet)
+class OrganizationWalletAdmin(admin.ModelAdmin):
+    list_display = ("organization", "currency", "is_active", "credit_limit", "available_balance_display", "reserved_balance_display")
+    list_filter = ("is_active", "currency")
+    search_fields = ("organization__name", "organization__clinic_id")
+
+    @admin.display(description="Available")
+    def available_balance_display(self, obj):
+        return obj.available_balance
+
+    @admin.display(description="Reserved")
+    def reserved_balance_display(self, obj):
+        return obj.reserved_balance
+
+
+@admin.register(WalletReservation)
+class WalletReservationAdmin(admin.ModelAdmin):
+    list_display = ("id", "wallet", "financial_record", "amount", "captured_amount", "released_amount", "status")
+    list_filter = ("status", "currency")
+    search_fields = ("reference", "idempotency_key", "financial_record__encounter__encounter_id")
+    readonly_fields = ("reserved_at", "captured_at", "released_at", "created_at", "updated_at")
+
+
+@admin.register(WalletLedgerEntry)
+class WalletLedgerEntryAdmin(admin.ModelAdmin):
+    list_display = ("id", "wallet", "entry_type", "available_delta", "reserved_delta", "currency", "created_at")
+    list_filter = ("entry_type", "currency", "created_at")
+    search_fields = ("reference", "idempotency_key", "description", "wallet__organization__name")
+    readonly_fields = tuple(field.name for field in WalletLedgerEntry._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

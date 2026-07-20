@@ -6,6 +6,9 @@ from .models import (
     EncounterFinancialRecord,
     PartnerContract,
     PricingRule,
+    OrganizationWallet,
+    WalletLedgerEntry,
+    WalletReservation,
 )
 
 
@@ -67,4 +70,40 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
             "financially_releasable", "pricing_snapshot", "exception_reason",
             "priced_at", "secured_at", "captured_at", "settled_at",
             "created_at", "updated_at",
+        )
+
+
+class OrganizationWalletSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="organization.name", read_only=True)
+    available_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    reserved_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    spendable_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = OrganizationWallet
+        fields = "__all__"
+        read_only_fields = ("created_at", "updated_at")
+
+
+class WalletLedgerEntrySerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+
+    class Meta:
+        model = WalletLedgerEntry
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in WalletLedgerEntry._meta.fields)
+
+
+class WalletReservationSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+    encounter_id = serializers.CharField(source="financial_record.encounter.encounter_id", read_only=True)
+    remaining_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = WalletReservation
+        fields = "__all__"
+        read_only_fields = (
+            "wallet", "financial_record", "amount", "captured_amount", "released_amount",
+            "currency", "status", "idempotency_key", "reference", "reserved_at",
+            "captured_at", "released_at", "created_at", "updated_at",
         )
