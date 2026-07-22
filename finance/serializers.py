@@ -49,8 +49,9 @@ class EncounterAllocationSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             "id", "financial_record", "allocation_rule", "beneficiary_role",
-            "beneficiary_organization", "label", "amount", "currency",
-            "rule_snapshot", "created_at", "updated_at",
+            "beneficiary_organization", "beneficiary_source", "label", "amount", "currency",
+            "rule_snapshot", "status", "earned_at", "reversed_at", "settled_at",
+            "created_at", "updated_at",
         )
 
 
@@ -77,6 +78,8 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             "id", "encounter", "contract", "pricing_rule", "status", "currency",
+            "service_pathway", "payer_type", "payer_organization", "collector_type",
+            "collecting_organization", "payment_method",
             "gross_amount", "allocated_amount", "outstanding_amount",
             "financially_releasable", "pricing_snapshot", "exception_reason",
             "priced_at", "secured_at", "captured_at", "settled_at",

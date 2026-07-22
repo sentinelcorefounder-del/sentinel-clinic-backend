@@ -107,6 +107,11 @@ class AllocationRule(TimeStampedModel):
         FIXED = "fixed", "Fixed amount"
         PERCENTAGE = "percentage", "Percentage"
 
+    class BeneficiarySource(models.TextChoices):
+        FIXED = "fixed", "Fixed organisation"
+        REFERRING_HOSPITAL = "referring_hospital", "Encounter referring hospital"
+        TESTING_CLINIC = "testing_clinic", "Encounter testing clinic"
+
     pricing_rule = models.ForeignKey(
         PricingRule,
         on_delete=models.CASCADE,
@@ -120,6 +125,12 @@ class AllocationRule(TimeStampedModel):
         blank=True,
         related_name="finance_allocation_rules",
     )
+    beneficiary_source = models.CharField(
+        max_length=30,
+        choices=BeneficiarySource.choices,
+        default=BeneficiarySource.FIXED,
+        help_text="How the beneficiary is resolved when an encounter is priced.",
+    )
     label = models.CharField(max_length=120, blank=True, default="")
     calculation_type = models.CharField(max_length=20, choices=CalculationType.choices)
     fixed_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
@@ -131,6 +142,10 @@ class AllocationRule(TimeStampedModel):
         ordering = ["priority", "id"]
 
     def clean(self):
+        if self.beneficiary_source != self.BeneficiarySource.FIXED and self.beneficiary_organization_id:
+            raise ValidationError(
+                {"beneficiary_organization": "A dynamic beneficiary cannot also have a fixed organisation."}
+            )
         if self.calculation_type == self.CalculationType.FIXED:
             if self.fixed_amount is None:
                 raise ValidationError({"fixed_amount": "A fixed allocation requires fixed_amount."})
@@ -158,6 +173,32 @@ class AllocationRule(TimeStampedModel):
 
 
 class EncounterFinancialRecord(TimeStampedModel):
+    class ServicePathway(models.TextChoices):
+        HOSPITAL_REFERRED = "hospital_referred", "Hospital referred"
+        CLINIC_DIRECT = "clinic_direct", "Clinic direct"
+
+    class PayerType(models.TextChoices):
+        PATIENT = "patient", "Patient"
+        ORGANIZATION = "organization", "Hospital or clinic"
+        PROGRAMME = "programme", "Programme sponsor"
+        WAIVED = "waived", "Waived"
+
+    class CollectorType(models.TextChoices):
+        SENTINEL = "sentinel", "Sentinel"
+        HOSPITAL = "hospital", "Hospital"
+        CLINIC = "clinic", "Clinic"
+        PROGRAMME = "programme", "Programme sponsor"
+        NONE = "none", "No collector"
+
+    class PaymentMethod(models.TextChoices):
+        UNSET = "unset", "Not selected"
+        PAYSTACK = "paystack", "Paystack"
+        WALLET = "wallet", "Prefunded wallet"
+        BANK_TRANSFER = "bank_transfer", "Approved bank transfer"
+        POS = "pos", "Sentinel POS"
+        AUTHORIZED_CREDIT = "authorized_credit", "Authorised credit"
+        WAIVED = "waived", "Waived"
+
     class Status(models.TextChoices):
         UNPRICED = "unpriced", "Unpriced"
         PRICED = "priced", "Priced"
@@ -184,6 +225,34 @@ class EncounterFinancialRecord(TimeStampedModel):
         blank=True,
         related_name="payer_financial_records",
         help_text="Organisation financially responsible for this encounter.",
+    )
+    collecting_organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="collected_financial_records",
+        help_text="Partner organisation that collected the patient's money, if any.",
+    )
+    service_pathway = models.CharField(
+        max_length=30,
+        choices=ServicePathway.choices,
+        default=ServicePathway.HOSPITAL_REFERRED,
+    )
+    payer_type = models.CharField(
+        max_length=20,
+        choices=PayerType.choices,
+        default=PayerType.ORGANIZATION,
+    )
+    collector_type = models.CharField(
+        max_length=20,
+        choices=CollectorType.choices,
+        default=CollectorType.NONE,
+    )
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.UNSET,
     )
     contract = models.ForeignKey(
         PartnerContract,
@@ -224,6 +293,13 @@ class EncounterFinancialRecord(TimeStampedModel):
 
 
 class EncounterAllocation(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING_SERVICE = "pending_service", "Pending service"
+        EARNED = "earned", "Earned"
+        SETTLEMENT_PENDING = "settlement_pending", "Settlement pending"
+        SETTLED = "settled", "Settled"
+        REVERSED = "reversed", "Reversed"
+
     financial_record = models.ForeignKey(
         EncounterFinancialRecord,
         on_delete=models.CASCADE,
@@ -244,13 +320,29 @@ class EncounterAllocation(TimeStampedModel):
         blank=True,
         related_name="encounter_allocations",
     )
+    beneficiary_source = models.CharField(
+        max_length=30,
+        choices=AllocationRule.BeneficiarySource.choices,
+        default=AllocationRule.BeneficiarySource.FIXED,
+    )
     label = models.CharField(max_length=120, blank=True, default="")
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3, default="NGN")
     rule_snapshot = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.PENDING_SERVICE)
+    earned_at = models.DateTimeField(null=True, blank=True)
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["id"]
+        indexes = [
+            models.Index(
+                fields=["beneficiary_organization", "status"],
+                name="fin_alloc_benef_status_idx",
+            ),
+            models.Index(fields=["status", "created_at"], name="fin_alloc_status_created_idx"),
+        ]
 
 
 class FinancialAuditLog(models.Model):

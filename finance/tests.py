@@ -8,6 +8,7 @@ from django.test import TestCase
 from encounters.models import ScreeningEncounter
 from organizations.models import Organization
 from patients.models import Patient
+from referrals.models import HospitalReferral
 
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
@@ -16,6 +17,7 @@ from .models import (
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation,
+    infer_financial_identity, earn_financial_record_allocations,
 )
 
 
@@ -85,6 +87,85 @@ class FinanceEngineTests(TestCase):
         self.assertEqual(record.allocated_amount, Decimal("15000.00"))
         self.assertEqual(record.allocations.count(), 3)
         self.assertEqual(record.status, EncounterFinancialRecord.Status.AWAITING_PAYMENT)
+        self.assertEqual(record.service_pathway, EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED)
+        self.assertEqual(record.payer_type, EncounterFinancialRecord.PayerType.ORGANIZATION)
+        self.assertEqual(record.payment_method, EncounterFinancialRecord.PaymentMethod.WALLET)
+        self.assertTrue(
+            all(
+                allocation.status == allocation.Status.PENDING_SERVICE
+                for allocation in record.allocations.all()
+            )
+        )
+
+    def test_patient_payment_identity_is_independent_from_pathway(self):
+        self.encounter.payment_responsibility = "patient"
+        self.encounter.save(update_fields=["payment_responsibility"])
+        pathway, payer, collector, method = infer_financial_identity(self.encounter)
+        self.assertEqual(pathway, EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED)
+        self.assertEqual(payer, EncounterFinancialRecord.PayerType.PATIENT)
+        self.assertEqual(collector, EncounterFinancialRecord.CollectorType.SENTINEL)
+        self.assertEqual(method, EncounterFinancialRecord.PaymentMethod.PAYSTACK)
+
+    def test_dynamic_hospital_and_testing_clinic_beneficiaries_are_frozen(self):
+        clinic = Organization.objects.create(
+            clinic_id="CLINIC-001",
+            name="Testing Clinic",
+            organization_type="clinic",
+        )
+        referral = HospitalReferral.objects.create(
+            source_hospital=self.organization,
+            matched_clinic=clinic,
+            patient=self.patient,
+            first_name=self.patient.first_name,
+            last_name=self.patient.last_name,
+            reason_for_referral="Retinal assessment",
+        )
+        self.encounter.hospital_referral = referral
+        self.encounter.originating_organization = clinic
+        self.encounter.save(update_fields=["hospital_referral", "originating_organization"])
+
+        dynamic_rule = PricingRule.objects.create(
+            contract=self.contract,
+            name="Dynamic multi-party allocation",
+            service_type="retinal_assessment",
+            source_type="hospital_referral",
+            gross_amount=Decimal("15000.00"),
+            effective_from=date(2026, 1, 1),
+            priority=1,
+        )
+        AllocationRule.objects.create(
+            pricing_rule=dynamic_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.HOSPITAL,
+            beneficiary_source=AllocationRule.BeneficiarySource.REFERRING_HOSPITAL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("2500.00"),
+        )
+        AllocationRule.objects.create(
+            pricing_rule=dynamic_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.CLINIC,
+            beneficiary_source=AllocationRule.BeneficiarySource.TESTING_CLINIC,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("7500.00"),
+        )
+        AllocationRule.objects.create(
+            pricing_rule=dynamic_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("5000.00"),
+        )
+
+        record = price_encounter(self.encounter)
+        hospital_allocation = record.allocations.get(
+            beneficiary_role=AllocationRule.BeneficiaryRole.HOSPITAL
+        )
+        clinic_allocation = record.allocations.get(
+            beneficiary_role=AllocationRule.BeneficiaryRole.CLINIC
+        )
+        self.assertEqual(hospital_allocation.beneficiary_organization, self.organization)
+        self.assertEqual(clinic_allocation.beneficiary_organization, clinic)
+        self.assertEqual(
+            hospital_allocation.rule_snapshot["beneficiary_organization_id"], self.organization.id
+        )
 
     def test_invalid_allocation_total_is_rejected(self):
         invalid_rule = PricingRule.objects.create(
@@ -165,6 +246,29 @@ class WalletEngineTests(FinanceEngineTests):
         self.assertEqual(self.record.outstanding_amount, Decimal("0.00"))
         self.assertTrue(self.record.financially_releasable)
         self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
+
+    def test_allocation_earning_is_explicit_and_idempotent(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "topup-earn")
+        reservation = reserve_wallet_funds(
+            self.wallet, self.record, Decimal("15000.00"), "reserve-earn"
+        )
+        capture_wallet_reservation(reservation, idempotency_key="capture-earn")
+        self.assertFalse(
+            self.record.allocations.filter(
+                status=self.record.allocations.model.Status.EARNED
+            ).exists()
+        )
+        earn_financial_record_allocations(self.record)
+        earn_financial_record_allocations(self.record)
+        self.assertEqual(
+            self.record.allocations.filter(
+                status=self.record.allocations.model.Status.EARNED
+            ).count(),
+            3,
+        )
+        self.assertEqual(
+            self.record.audit_entries.filter(action="allocations_earned").count(), 1
+        )
 
     def test_release_returns_reserved_funds(self):
         top_up_wallet(self.wallet, Decimal("15000.00"), "topup-004")

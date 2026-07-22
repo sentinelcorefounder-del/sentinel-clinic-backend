@@ -6,12 +6,57 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .models import (
+    AllocationRule,
     EncounterAllocation,
     EncounterFinancialRecord,
     FinancialAuditLog,
     PartnerContract,
     PricingRule,
 )
+
+
+def infer_financial_identity(encounter):
+    """Return stable finance dimensions without treating pathway as payer."""
+    pathway = (
+        EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT
+        if encounter.source_type == "clinic_direct"
+        else EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED
+    )
+    responsibility = (encounter.payment_responsibility or "").strip()
+    if responsibility == "patient":
+        payer_type = EncounterFinancialRecord.PayerType.PATIENT
+        collector_type = EncounterFinancialRecord.CollectorType.SENTINEL
+        payment_method = EncounterFinancialRecord.PaymentMethod.PAYSTACK
+    elif responsibility in {"hospital", "clinic"}:
+        payer_type = EncounterFinancialRecord.PayerType.ORGANIZATION
+        collector_type = EncounterFinancialRecord.CollectorType.NONE
+        payment_method = EncounterFinancialRecord.PaymentMethod.WALLET
+    elif responsibility == "programme":
+        payer_type = EncounterFinancialRecord.PayerType.PROGRAMME
+        collector_type = EncounterFinancialRecord.CollectorType.PROGRAMME
+        payment_method = EncounterFinancialRecord.PaymentMethod.UNSET
+    else:
+        payer_type = EncounterFinancialRecord.PayerType.WAIVED
+        collector_type = EncounterFinancialRecord.CollectorType.NONE
+        payment_method = EncounterFinancialRecord.PaymentMethod.WAIVED
+    return pathway, payer_type, collector_type, payment_method
+
+
+def resolve_allocation_beneficiary(encounter, allocation_rule):
+    source = allocation_rule.beneficiary_source
+    if source == AllocationRule.BeneficiarySource.REFERRING_HOSPITAL:
+        referral = getattr(encounter, "hospital_referral", None)
+        return getattr(referral, "source_hospital", None)
+    if source == AllocationRule.BeneficiarySource.TESTING_CLINIC:
+        referral = getattr(encounter, "hospital_referral", None)
+        matched_clinic = getattr(referral, "matched_clinic", None)
+        if matched_clinic is not None:
+            return matched_clinic
+        origin = encounter.originating_organization
+        if origin is not None and origin.organization_type == "clinic":
+            return origin
+        return None
+    return allocation_rule.beneficiary_organization
 
 
 def _active_for_date(queryset, value):
@@ -135,8 +180,17 @@ def price_encounter(encounter, actor=None, force=False):
     allocated_total = Decimal("0.00")
     for allocation_rule in rule.allocation_rules.filter(is_active=True).order_by("priority", "id"):
         amount = allocation_rule.calculate(rule.gross_amount)
+        beneficiary = resolve_allocation_beneficiary(encounter, allocation_rule)
+        if (
+            allocation_rule.beneficiary_source != AllocationRule.BeneficiarySource.FIXED
+            and beneficiary is None
+        ):
+            raise ValidationError(
+                f"Could not resolve the {allocation_rule.get_beneficiary_source_display().lower()} "
+                "for this encounter."
+            )
         allocated_total += amount
-        allocations.append((allocation_rule, amount))
+        allocations.append((allocation_rule, beneficiary, amount))
 
     if allocated_total != rule.gross_amount:
         raise ValidationError(
@@ -148,6 +202,12 @@ def price_encounter(encounter, actor=None, force=False):
     record.contract = contract
     record.pricing_rule = rule
     record.payer_organization = resolve_payer_organization(encounter)
+    (
+        record.service_pathway,
+        record.payer_type,
+        record.collector_type,
+        record.payment_method,
+    ) = infer_financial_identity(encounter)
     record.currency = contract.currency
     record.gross_amount = rule.gross_amount
     record.allocated_amount = allocated_total
@@ -168,6 +228,10 @@ def price_encounter(encounter, actor=None, force=False):
         "payment_responsibility": rule.payment_responsibility,
         "gross_amount": str(rule.gross_amount),
         "currency": contract.currency,
+        "service_pathway": record.service_pathway,
+        "payer_type": record.payer_type,
+        "collector_type": record.collector_type,
+        "payment_method": record.payment_method,
     }
     record.save()
 
@@ -177,18 +241,21 @@ def price_encounter(encounter, actor=None, force=False):
                 financial_record=record,
                 allocation_rule=allocation_rule,
                 beneficiary_role=allocation_rule.beneficiary_role,
-                beneficiary_organization=allocation_rule.beneficiary_organization,
+                beneficiary_organization=beneficiary,
+                beneficiary_source=allocation_rule.beneficiary_source,
                 label=allocation_rule.label,
                 amount=amount,
                 currency=contract.currency,
                 rule_snapshot={
                     "allocation_rule_id": allocation_rule.id,
+                    "beneficiary_source": allocation_rule.beneficiary_source,
+                    "beneficiary_organization_id": beneficiary.id if beneficiary else None,
                     "calculation_type": allocation_rule.calculation_type,
                     "fixed_amount": str(allocation_rule.fixed_amount) if allocation_rule.fixed_amount is not None else None,
                     "percentage": str(allocation_rule.percentage) if allocation_rule.percentage is not None else None,
                 },
             )
-            for allocation_rule, amount in allocations
+            for allocation_rule, beneficiary, amount in allocations
         ]
     )
 
@@ -555,6 +622,29 @@ def capture_financial_record_wallet_reservation(financial_record, actor=None, re
 
 
 @transaction.atomic
+def earn_financial_record_allocations(financial_record, actor=None):
+    """Mark frozen shares as earned exactly once; callers decide the clinical trigger."""
+    record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    if not record.financially_releasable:
+        raise ValidationError("This financial record is not covered and cannot earn allocations.")
+    pending = record.allocations.select_for_update().filter(
+        status=EncounterAllocation.Status.PENDING_SERVICE
+    )
+    if not pending.exists():
+        return record
+    earned_at = timezone.now()
+    count = pending.update(status=EncounterAllocation.Status.EARNED, earned_at=earned_at)
+    _audit(
+        record,
+        "allocations_earned",
+        actor=actor,
+        previous_status=record.status,
+        details={"allocation_count": count, "earned_at": earned_at.isoformat()},
+    )
+    return record
+
+
+@transaction.atomic
 def create_settlement_batch(beneficiary_organization, period_start, period_end, currency="NGN", actor=None):
     from .models import EncounterAllocation, SettlementBatch, SettlementItem
 
@@ -565,6 +655,7 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
     allocations = EncounterAllocation.objects.select_for_update().filter(
         beneficiary_organization=beneficiary_organization,
         currency=currency,
+        status=EncounterAllocation.Status.EARNED,
         financial_record__financially_releasable=True,
         financial_record__captured_at__date__gte=period_start,
         financial_record__captured_at__date__lte=period_end,
@@ -590,7 +681,7 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
 
 @transaction.atomic
 def approve_settlement_batch(batch, actor=None):
-    from .models import SettlementBatch
+    from .models import EncounterAllocation, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
     if batch.status != SettlementBatch.Status.DRAFT:
@@ -599,12 +690,16 @@ def approve_settlement_batch(batch, actor=None):
     batch.approved_by = actor
     batch.approved_at = timezone.now()
     batch.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+    EncounterAllocation.objects.filter(
+        settlement_item__batch=batch,
+        status=EncounterAllocation.Status.EARNED,
+    ).update(status=EncounterAllocation.Status.SETTLEMENT_PENDING)
     return batch
 
 
 @transaction.atomic
 def mark_settlement_batch_paid(batch, external_reference, actor=None):
-    from .models import EncounterFinancialRecord, SettlementBatch
+    from .models import EncounterAllocation, EncounterFinancialRecord, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().prefetch_related(
         "items__allocation__financial_record"
@@ -618,6 +713,10 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None):
     batch.external_reference = external_reference
     batch.paid_at = timezone.now()
     batch.save(update_fields=["status", "external_reference", "paid_at", "updated_at"])
+    EncounterAllocation.objects.filter(settlement_item__batch=batch).update(
+        status=EncounterAllocation.Status.SETTLED,
+        settled_at=batch.paid_at,
+    )
 
     record_ids = {item.allocation.financial_record_id for item in batch.items.all()}
     for record in EncounterFinancialRecord.objects.select_for_update().filter(id__in=record_ids):

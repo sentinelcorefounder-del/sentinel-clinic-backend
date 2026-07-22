@@ -36,8 +36,14 @@ class PricingRuleAdmin(admin.ModelAdmin):
 
 @admin.register(EncounterFinancialRecord)
 class EncounterFinancialRecordAdmin(admin.ModelAdmin):
-    list_display = ("encounter", "status", "gross_amount", "currency", "financially_releasable")
-    list_filter = ("status", "currency", "financially_releasable")
+    list_display = (
+        "encounter", "service_pathway", "payer_type", "collector_type",
+        "payment_method", "status", "gross_amount", "currency", "financially_releasable",
+    )
+    list_filter = (
+        "service_pathway", "payer_type", "collector_type", "payment_method",
+        "status", "currency", "financially_releasable",
+    )
     search_fields = ("encounter__encounter_id", "encounter__patient__first_name", "encounter__patient__last_name")
     readonly_fields = ("pricing_snapshot", "created_at", "updated_at")
 
