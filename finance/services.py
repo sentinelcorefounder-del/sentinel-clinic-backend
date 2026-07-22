@@ -160,6 +160,181 @@ def ensure_financial_record(encounter):
     return record
 
 
+def _control_snapshot(action_request):
+    wallet = action_request.wallet
+    return {
+        "request_status": action_request.status,
+        "wallet_available": str(wallet.available_balance),
+        "wallet_reserved": str(wallet.reserved_balance),
+        "financial_status": (
+            action_request.financial_record.status if action_request.financial_record_id else None
+        ),
+    }
+
+
+@transaction.atomic
+def create_finance_action_request(
+    *, action_type, wallet, amount, reason, external_reference, idempotency_key,
+    requested_by, financial_record=None, related_entry=None, evidence=None,
+):
+    from .models import FinanceActionRequest, FinanceControlAudit, OrganizationWallet
+
+    key = _require_idempotency_key(idempotency_key)
+    existing = FinanceActionRequest.objects.filter(idempotency_key=key).first()
+    if existing:
+        return existing
+    wallet = OrganizationWallet.objects.select_for_update().get(pk=wallet.pk)
+    request = FinanceActionRequest(
+        action_type=action_type, wallet=wallet, financial_record=financial_record,
+        related_entry=related_entry, amount=Decimal(str(amount)).quantize(Decimal("0.01")),
+        currency=wallet.currency, reason=str(reason or "").strip(),
+        external_reference=str(external_reference or "").strip(), evidence=evidence,
+        idempotency_key=key, requested_by=requested_by,
+    )
+    request.full_clean()
+    if action_type == FinanceActionRequest.ActionType.REVERSAL and related_entry is None:
+        raise ValidationError("A reversal must identify the ledger entry being reversed.")
+    if financial_record and financial_record.allocations.filter(
+        status=EncounterAllocation.Status.SETTLED
+    ).exists():
+        raise ValidationError(
+            "This encounter has paid allocations. Cancel or recover the affected settlement before correction."
+        )
+    request.save()
+    FinanceControlAudit.objects.create(
+        action="finance_action_requested", actor=requested_by, wallet=wallet,
+        financial_record=financial_record, action_request=request,
+        after_state=_control_snapshot(request),
+        metadata={"type": action_type, "amount": str(request.amount), "reason": request.reason},
+    )
+    return request
+
+
+@transaction.atomic
+def approve_finance_action_request(action_request, *, decided_by):
+    from .models import FinanceActionRequest, FinanceControlAudit, OrganizationWallet, WalletLedgerEntry
+
+    request = FinanceActionRequest.objects.select_for_update().select_related(
+        "wallet", "financial_record", "related_entry"
+    ).get(pk=action_request.pk)
+    if request.status == FinanceActionRequest.Status.APPROVED:
+        return request
+    if request.status != FinanceActionRequest.Status.PENDING:
+        raise ValidationError("Only a pending request can be approved.")
+    if request.requested_by_id == getattr(decided_by, "id", None):
+        raise ValidationError("Maker-checker control: the requester cannot approve this action.")
+    wallet = OrganizationWallet.objects.select_for_update().get(pk=request.wallet_id)
+    before = _control_snapshot(request)
+    if request.action_type == FinanceActionRequest.ActionType.REFUND:
+        delta = request.amount
+        entry_type = WalletLedgerEntry.EntryType.REFUND
+    elif request.action_type == FinanceActionRequest.ActionType.REVERSAL:
+        delta = -request.amount
+        entry_type = WalletLedgerEntry.EntryType.REVERSAL
+    else:
+        delta = request.amount
+        entry_type = WalletLedgerEntry.EntryType.ADJUSTMENT
+    if wallet.available_balance + wallet.credit_limit + delta < 0:
+        raise ValidationError("This correction would exceed the wallet credit limit.")
+    entry = WalletLedgerEntry.objects.create(
+        wallet=wallet, entry_type=entry_type, available_delta=delta,
+        reserved_delta=Decimal("0.00"), currency=wallet.currency,
+        financial_record=request.financial_record, related_entry=request.related_entry,
+        idempotency_key=f"finance-action:{request.pk}:posted",
+        reference=request.external_reference,
+        description=f"Approved {request.get_action_type_display().lower()}: {request.reason[:160]}",
+        metadata={"finance_action_request_id": request.pk}, actor=decided_by,
+    )
+    request.status = FinanceActionRequest.Status.APPROVED
+    request.decided_by = decided_by
+    request.decided_at = timezone.now()
+    request.posted_entry = entry
+    request.save(update_fields=["status", "decided_by", "decided_at", "posted_entry", "updated_at"])
+    record = request.financial_record
+    if record and request.action_type in {
+        FinanceActionRequest.ActionType.REFUND, FinanceActionRequest.ActionType.REVERSAL,
+    }:
+        record.status = (
+            EncounterFinancialRecord.Status.REFUNDED
+            if request.action_type == FinanceActionRequest.ActionType.REFUND
+            else EncounterFinancialRecord.Status.EXCEPTION
+        )
+        record.financially_releasable = False
+        record.exception_reason = request.reason if request.action_type == FinanceActionRequest.ActionType.REVERSAL else ""
+        record.allocations.filter(status=EncounterAllocation.Status.EARNED).update(
+            status=EncounterAllocation.Status.REVERSED, reversed_at=timezone.now()
+        )
+        record.save(update_fields=["status", "financially_releasable", "exception_reason", "updated_at"])
+    FinanceControlAudit.objects.create(
+        action="finance_action_approved", actor=decided_by, wallet=wallet,
+        financial_record=record, action_request=request, before_state=before,
+        after_state=_control_snapshot(request), metadata={"ledger_entry_id": entry.pk},
+    )
+    return request
+
+
+@transaction.atomic
+def reject_finance_action_request(action_request, *, decided_by, reason):
+    from .models import FinanceActionRequest, FinanceControlAudit
+
+    request = FinanceActionRequest.objects.select_for_update().select_related("wallet").get(pk=action_request.pk)
+    if request.status != FinanceActionRequest.Status.PENDING:
+        raise ValidationError("Only a pending request can be rejected.")
+    if request.requested_by_id == getattr(decided_by, "id", None):
+        raise ValidationError("Maker-checker control: the requester cannot decide this action.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A rejection reason is required.")
+    before = _control_snapshot(request)
+    request.status = FinanceActionRequest.Status.REJECTED
+    request.decided_by = decided_by
+    request.decided_at = timezone.now()
+    request.decision_reason = reason
+    request.save(update_fields=["status", "decided_by", "decided_at", "decision_reason", "updated_at"])
+    FinanceControlAudit.objects.create(
+        action="finance_action_rejected", actor=decided_by, wallet=request.wallet,
+        financial_record=request.financial_record, action_request=request,
+        before_state=before, after_state=_control_snapshot(request), metadata={"reason": reason},
+    )
+    return request
+
+
+def reconcile_finance_controls():
+    """Return discrepancies without mutating financial data."""
+    from .models import OrganizationWallet, WalletReservation, SettlementBatch
+
+    issues = []
+    for wallet in OrganizationWallet.objects.all():
+        ledger_reserved = wallet.reserved_balance
+        reservation_reserved = sum(
+            (item.remaining_amount for item in wallet.reservations.filter(
+                status__in=[WalletReservation.Status.ACTIVE, WalletReservation.Status.PARTIALLY_CAPTURED,
+                            WalletReservation.Status.PARTIALLY_RELEASED]
+            )), Decimal("0.00")
+        )
+        if ledger_reserved != reservation_reserved:
+            issues.append({
+                "code": "WALLET_RESERVED_MISMATCH", "wallet_id": wallet.pk,
+                "ledger_reserved": str(ledger_reserved),
+                "reservation_reserved": str(reservation_reserved),
+            })
+    for record in EncounterFinancialRecord.objects.prefetch_related("allocations"):
+        allocation_total = sum((a.amount for a in record.allocations.all()), Decimal("0.00"))
+        if record.allocated_amount != allocation_total:
+            issues.append({
+                "code": "ALLOCATION_TOTAL_MISMATCH", "financial_record_id": record.pk,
+                "record_total": str(record.allocated_amount), "allocation_total": str(allocation_total),
+            })
+    for batch in SettlementBatch.objects.prefetch_related("items"):
+        item_total = sum((item.amount for item in batch.items.all()), Decimal("0.00"))
+        if batch.total_amount != item_total:
+            issues.append({
+                "code": "SETTLEMENT_TOTAL_MISMATCH", "settlement_batch_id": batch.pk,
+                "batch_total": str(batch.total_amount), "item_total": str(item_total),
+            })
+    return {"ok": not issues, "issue_count": len(issues), "issues": issues}
+
+
 @transaction.atomic
 def price_encounter(encounter, actor=None, force=False):
     record = EncounterFinancialRecord.objects.select_for_update().filter(encounter=encounter).first()
@@ -413,6 +588,8 @@ def approve_bank_transfer(funding_request, actor=None):
         raise ValidationError("Only a verified transfer can be approved.")
     if funding_request.received_amount is None:
         raise ValidationError("The received amount has not been verified.")
+    if actor is not None and funding_request.verified_by_id == getattr(actor, "id", None):
+        raise ValidationError("Maker-checker control: the verifier cannot approve this transfer.")
 
     entry = top_up_wallet(
         wallet=funding_request.wallet,
@@ -973,6 +1150,7 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
         currency=currency,
         period_start=period_start,
         period_end=period_end,
+        prepared_by=actor,
     )
     items = [
         SettlementItem(batch=batch, allocation=a, amount=a.amount, currency=a.currency)
@@ -991,6 +1169,8 @@ def approve_settlement_batch(batch, actor=None):
     batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
     if batch.status != SettlementBatch.Status.DRAFT:
         raise ValidationError("Only draft settlement batches can be approved.")
+    if actor is not None and batch.prepared_by_id == getattr(actor, "id", None):
+        raise ValidationError("Maker-checker control: the preparer cannot approve this settlement.")
     batch.status = SettlementBatch.Status.APPROVED
     batch.approved_by = actor
     batch.approved_at = timezone.now()

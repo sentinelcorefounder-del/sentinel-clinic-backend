@@ -14,6 +14,8 @@ from .models import (
     BankTransferFundingRequest,
     ServiceAllowance,
     ServiceAllowanceReservation,
+    FinanceActionRequest,
+    FinanceControlAudit,
 )
 
 
@@ -165,7 +167,7 @@ class SettlementBatchSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             "status", "total_amount", "external_reference", "payment_evidence",
-            "approved_by", "approved_at", "paid_by", "paid_at", "cancelled_by",
+            "prepared_by", "approved_by", "approved_at", "paid_by", "paid_at", "cancelled_by",
             "cancelled_at", "cancellation_reason",
             "created_at", "updated_at",
         )
@@ -234,3 +236,26 @@ class PartnerFinanceSummarySerializer(serializers.Serializer):
     active_pricing_rules = PricingRuleSerializer(many=True)
     recent_ledger = WalletLedgerEntrySerializer(many=True)
     recent_financial_records = EncounterFinancialRecordSerializer(many=True)
+
+
+class FinanceActionRequestSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+    requested_by_username = serializers.CharField(source="requested_by.username", read_only=True)
+    decided_by_username = serializers.CharField(source="decided_by.username", read_only=True)
+
+    class Meta:
+        model = FinanceActionRequest
+        fields = "__all__"
+        read_only_fields = (
+            "currency", "status", "requested_by", "decided_by", "decided_at",
+            "decision_reason", "posted_entry", "created_at", "updated_at",
+        )
+
+
+class FinanceControlAuditSerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = FinanceControlAudit
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in FinanceControlAudit._meta.fields)

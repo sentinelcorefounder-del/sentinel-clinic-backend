@@ -15,6 +15,8 @@ from .models import (
     BankTransferFundingRequest,
     ServiceAllowance,
     ServiceAllowanceReservation,
+    FinanceActionRequest,
+    FinanceControlAudit,
 )
 
 
@@ -48,7 +50,13 @@ class EncounterFinancialRecordAdmin(admin.ModelAdmin):
         "status", "currency", "financially_releasable",
     )
     search_fields = ("encounter__encounter_id", "encounter__patient__first_name", "encounter__patient__last_name")
-    readonly_fields = ("pricing_snapshot", "created_at", "updated_at")
+    readonly_fields = tuple(field.name for field in EncounterFinancialRecord._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 admin.site.register(AllocationRule)
@@ -123,11 +131,14 @@ class SettlementBatchAdmin(admin.ModelAdmin):
     list_display = ("id", "beneficiary_organization", "period_start", "period_end", "total_amount", "currency", "status")
     list_filter = ("status", "currency", "period_end")
     search_fields = ("beneficiary_organization__name", "external_reference")
-    readonly_fields = (
-        "total_amount", "approved_by", "approved_at", "paid_by", "paid_at",
-        "cancelled_by", "cancelled_at", "created_at", "updated_at",
-    )
+    readonly_fields = tuple(field.name for field in SettlementBatch._meta.fields)
     inlines = [SettlementItemInline]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(BankTransferFundingRequest)
@@ -139,3 +150,36 @@ class BankTransferFundingRequestAdmin(admin.ModelAdmin):
         "request_reference", "requester", "proof_submitted_at", "verified_by", "verified_at",
         "approved_by", "approved_at", "ledger_entry", "created_at", "updated_at",
     )
+
+
+@admin.register(FinanceActionRequest)
+class FinanceActionRequestAdmin(admin.ModelAdmin):
+    list_display = ("id", "action_type", "wallet", "amount", "status", "requested_by", "decided_by", "created_at")
+    list_filter = ("action_type", "status", "currency")
+    search_fields = ("external_reference", "idempotency_key", "reason", "wallet__organization__name")
+    readonly_fields = tuple(field.name for field in FinanceActionRequest._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(FinanceControlAudit)
+class FinanceControlAuditAdmin(admin.ModelAdmin):
+    list_display = ("id", "action", "actor", "wallet", "created_at")
+    list_filter = ("action", "created_at")
+    readonly_fields = tuple(field.name for field in FinanceControlAudit._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

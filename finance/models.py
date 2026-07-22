@@ -383,6 +383,14 @@ class FinancialAuditLog(models.Model):
     class Meta:
         ordering = ["-created_at"]
 
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Financial audit records are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Financial audit records are immutable.")
+
 
 class OrganizationWallet(TimeStampedModel):
     organization = models.ForeignKey(
@@ -783,6 +791,10 @@ class SettlementBatch(TimeStampedModel):
     external_reference = models.CharField(max_length=120, blank=True, default="")
     payment_evidence = models.FileField(upload_to="finance/settlements/%Y/%m/", null=True, blank=True)
     notes = models.TextField(blank=True, default="")
+    prepared_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="prepared_finance_settlements",
+    )
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -849,3 +861,119 @@ class SettlementItem(TimeStampedModel):
 
     def __str__(self):
         return f"Settlement item {self.id or 'new'} - {self.amount} {self.currency}"
+
+
+def finance_action_evidence_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/action-evidence/{instance.idempotency_key}/{uuid.uuid4().hex}.{suffix}"
+
+
+class FinanceActionRequest(TimeStampedModel):
+    """Maker-checker request for any compensating wallet correction."""
+
+    class ActionType(models.TextChoices):
+        REFUND = "refund", "Refund"
+        REVERSAL = "reversal", "Reversal"
+        ADJUSTMENT = "adjustment", "Adjustment"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending approval"
+        APPROVED = "approved", "Approved and posted"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled"
+
+    action_type = models.CharField(max_length=20, choices=ActionType.choices)
+    wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, related_name="finance_action_requests"
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="finance_action_requests",
+    )
+    related_entry = models.ForeignKey(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="finance_action_requests",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    reason = models.TextField()
+    external_reference = models.CharField(max_length=120)
+    evidence = models.FileField(upload_to=finance_action_evidence_path, null=True, blank=True)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="requested_finance_actions",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="decided_finance_actions",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+    posted_entry = models.OneToOneField(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="approved_finance_action",
+    )
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status", "action_type"], name="fin_action_status_type_idx"),
+            models.Index(fields=["wallet", "status"], name="fin_action_wallet_status_idx"),
+        ]
+
+    def clean(self):
+        if self.amount == 0:
+            raise ValidationError({"amount": "Amount cannot be zero."})
+        if self.action_type in {self.ActionType.REFUND, self.ActionType.REVERSAL} and self.amount < 0:
+            raise ValidationError({"amount": "Refund and reversal amounts must be positive."})
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Currency must match the wallet."})
+        if not self.reason.strip():
+            raise ValidationError({"reason": "A reason is required."})
+        if not self.external_reference.strip():
+            raise ValidationError({"external_reference": "An external reference is required."})
+        if self.related_entry_id and self.related_entry.wallet_id != self.wallet_id:
+            raise ValidationError({"related_entry": "Related entry must belong to the same wallet."})
+
+
+class FinanceControlAudit(models.Model):
+    """Append-only audit record for sensitive finance control activity."""
+
+    action = models.CharField(max_length=80)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="finance_control_audits",
+    )
+    wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    action_request = models.ForeignKey(
+        FinanceActionRequest, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="audit_entries",
+    )
+    settlement_batch = models.ForeignKey(
+        SettlementBatch, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    before_state = models.JSONField(default=dict, blank=True)
+    after_state = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Finance control audit records are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Finance control audit records are immutable.")

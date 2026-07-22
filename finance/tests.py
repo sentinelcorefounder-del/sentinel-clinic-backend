@@ -18,6 +18,7 @@ from .models import (
     BankTransferFundingRequest,
     ServiceAllowance, ServiceAllowanceReservation,
     SettlementBatch, SettlementItem, EncounterAllocation,
+    FinanceActionRequest, FinanceControlAudit,
 )
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
@@ -28,6 +29,8 @@ from .services import (
     approve_service_allowance, reserve_service_allowance, fund_allowance_reservation,
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
     cancel_settlement_batch,
+    create_finance_action_request, approve_finance_action_request,
+    reject_finance_action_request, reconcile_finance_controls,
 )
 
 
@@ -430,6 +433,7 @@ class BankTransferFundingTests(WalletEngineTests):
     def setUp(self):
         super().setUp()
         self.user = get_user_model().objects.create_user(username="finance-verifier")
+        self.approver = get_user_model().objects.create_user(username="finance-approver")
         self.request = BankTransferFundingRequest.objects.create(
             wallet=self.wallet,
             requested_amount=Decimal("50000.00"),
@@ -460,8 +464,8 @@ class BankTransferFundingTests(WalletEngineTests):
         request = self._submit_and_verify()
         self.assertEqual(request.status, BankTransferFundingRequest.Status.VERIFIED)
         self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
-        first = approve_bank_transfer(request, actor=self.user)
-        second = approve_bank_transfer(request, actor=self.user)
+        first = approve_bank_transfer(request, actor=self.approver)
+        second = approve_bank_transfer(request, actor=self.approver)
         self.assertEqual(first.ledger_entry_id, second.ledger_entry_id)
         self.assertEqual(self.wallet.available_balance, Decimal("50000.00"))
         self.assertEqual(WalletLedgerEntry.objects.count(), 1)
@@ -469,8 +473,14 @@ class BankTransferFundingTests(WalletEngineTests):
     def test_underpayment_is_flagged_and_credits_only_received_amount(self):
         request = self._submit_and_verify(amount="45000.00")
         self.assertEqual(request.status, BankTransferFundingRequest.Status.UNDERPAID)
-        approve_bank_transfer(request, actor=self.user)
+        approve_bank_transfer(request, actor=self.approver)
         self.assertEqual(self.wallet.available_balance, Decimal("45000.00"))
+
+    def test_verifier_cannot_approve_same_transfer(self):
+        request = self._submit_and_verify()
+        with self.assertRaisesMessage(ValidationError, "Maker-checker"):
+            approve_bank_transfer(request, actor=self.user)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
 
     def test_duplicate_bank_transaction_reference_is_rejected(self):
         self._submit_and_verify(reference="DUPLICATE-REF")
@@ -692,3 +702,62 @@ class ServiceAllowanceTests(TestCase):
         reserve_service_allowance(self.record, actor=self.user)
         with self.assertRaisesMessage(ValidationError, "PAYMENT_REQUIRED"):
             capture_finance_for_hospital_publication(self.encounter, actor=self.user)
+
+
+class FinanceControlTests(TestCase):
+    def setUp(self):
+        FinanceEngineTests.setUp(self)
+        self.record = price_encounter(self.encounter)
+        self.wallet = OrganizationWallet.objects.create(
+            organization=self.organization, currency="NGN", credit_limit=Decimal("0.00")
+        )
+        User = get_user_model()
+        self.maker = User.objects.create_user(username="finance-maker")
+        self.checker = User.objects.create_user(username="finance-checker")
+        top_up_wallet(self.wallet, Decimal("20000.00"), "control-opening")
+
+    def _request(self, **overrides):
+        values = {
+            "action_type": FinanceActionRequest.ActionType.ADJUSTMENT,
+            "wallet": self.wallet, "amount": Decimal("1000.00"),
+            "reason": "Correct verified posting error", "external_reference": "FIN-CORR-001",
+            "idempotency_key": "finance-control-001", "requested_by": self.maker,
+        }
+        values.update(overrides)
+        return create_finance_action_request(**values)
+
+    def test_request_does_not_change_wallet_until_approved(self):
+        before = self.wallet.available_balance
+        request = self._request()
+        self.assertEqual(request.status, FinanceActionRequest.Status.PENDING)
+        self.assertEqual(self.wallet.available_balance, before)
+        self.assertEqual(FinanceControlAudit.objects.filter(action_request=request).count(), 1)
+
+    def test_maker_cannot_approve_own_request(self):
+        with self.assertRaises(ValidationError):
+            approve_finance_action_request(self._request(), decided_by=self.maker)
+
+    def test_checker_approval_posts_one_compensating_entry(self):
+        approved = approve_finance_action_request(self._request(), decided_by=self.checker)
+        self.assertEqual(approved.posted_entry.available_delta, Decimal("1000.00"))
+        again = approve_finance_action_request(approved, decided_by=self.checker)
+        self.assertEqual(again.posted_entry_id, approved.posted_entry_id)
+
+    def test_rejection_posts_no_ledger_entry(self):
+        rejected = reject_finance_action_request(
+            self._request(), decided_by=self.checker, reason="Evidence does not match"
+        )
+        self.assertEqual(rejected.status, FinanceActionRequest.Status.REJECTED)
+        self.assertIsNone(rejected.posted_entry_id)
+
+    def test_paid_allocation_blocks_financial_correction(self):
+        allocation = self.record.allocations.first()
+        allocation.status = EncounterAllocation.Status.SETTLED
+        allocation.save(update_fields=["status", "updated_at"])
+        with self.assertRaises(ValidationError):
+            self._request(financial_record=self.record)
+
+    def test_reconciliation_is_read_only_and_clean(self):
+        result = reconcile_finance_controls()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["issue_count"], 0)
