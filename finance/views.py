@@ -25,6 +25,7 @@ from .services import (
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
     reserve_financial_record_from_originating_wallet, capture_financial_record_wallet_reservation,
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
+    cancel_settlement_batch,
     sync_encounter_finance_lifecycle,
     submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer, reject_bank_transfer,
     approve_service_allowance,
@@ -417,6 +418,17 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
                 self.get_object(),
                 external_reference=request.data.get("external_reference", ""),
                 actor=request.user,
+                payment_evidence=request.FILES.get("payment_evidence"),
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(batch).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        try:
+            batch = cancel_settlement_batch(
+                self.get_object(), reason=request.data.get("reason", ""), actor=request.user
             )
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)

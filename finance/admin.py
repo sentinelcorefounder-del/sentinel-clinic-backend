@@ -32,7 +32,7 @@ class PartnerContractAdmin(admin.ModelAdmin):
 
 @admin.register(PricingRule)
 class PricingRuleAdmin(admin.ModelAdmin):
-    list_display = ("name", "contract", "service_type", "gross_amount", "priority", "is_active")
+    list_display = ("name", "version", "contract", "service_type", "gross_amount", "priority", "is_active")
     list_filter = ("is_active", "service_type", "source_type", "workflow_route")
     inlines = [AllocationRuleInline]
 
@@ -123,7 +123,10 @@ class SettlementBatchAdmin(admin.ModelAdmin):
     list_display = ("id", "beneficiary_organization", "period_start", "period_end", "total_amount", "currency", "status")
     list_filter = ("status", "currency", "period_end")
     search_fields = ("beneficiary_organization__name", "external_reference")
-    readonly_fields = ("total_amount", "approved_by", "approved_at", "paid_at", "created_at", "updated_at")
+    readonly_fields = (
+        "total_amount", "approved_by", "approved_at", "paid_by", "paid_at",
+        "cancelled_by", "cancelled_at", "created_at", "updated_at",
+    )
     inlines = [SettlementItemInline]
 
 

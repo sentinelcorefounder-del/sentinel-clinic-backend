@@ -23,6 +23,13 @@ class AllocationRuleSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
 
+    def update(self, instance, validated_data):
+        if instance.generated_allocations.exists():
+            raise serializers.ValidationError(
+                "This allocation rule has historical transactions. Create a new pricing-rule version instead."
+            )
+        return super().update(instance, validated_data)
+
 
 class PricingRuleSerializer(serializers.ModelSerializer):
     allocation_rules = AllocationRuleSerializer(many=True, read_only=True)
@@ -31,6 +38,20 @@ class PricingRuleSerializer(serializers.ModelSerializer):
         model = PricingRule
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
+
+    def validate(self, attrs):
+        contract = attrs.get("contract", getattr(self.instance, "contract", None))
+        supersedes = attrs.get("supersedes", getattr(self.instance, "supersedes", None))
+        if supersedes and contract and supersedes.contract_id != contract.id:
+            raise serializers.ValidationError({"supersedes": "Must belong to the same contract."})
+        return attrs
+
+    def update(self, instance, validated_data):
+        if instance.financial_records.exists():
+            raise serializers.ValidationError(
+                "This pricing rule has historical transactions. Create a new version instead."
+            )
+        return super().update(instance, validated_data)
 
 
 class PartnerContractSerializer(serializers.ModelSerializer):
@@ -143,7 +164,9 @@ class SettlementBatchSerializer(serializers.ModelSerializer):
         model = SettlementBatch
         fields = "__all__"
         read_only_fields = (
-            "status", "total_amount", "approved_by", "approved_at", "paid_at",
+            "status", "total_amount", "external_reference", "payment_evidence",
+            "approved_by", "approved_at", "paid_by", "paid_at", "cancelled_by",
+            "cancelled_at", "cancellation_reason",
             "created_at", "updated_at",
         )
 

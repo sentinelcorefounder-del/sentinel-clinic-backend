@@ -71,12 +71,23 @@ class PricingRule(TimeStampedModel):
     effective_from = models.DateField()
     effective_to = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True, default="")
+    version = models.PositiveIntegerField(default=1)
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="superseded_by",
+    )
 
     class Meta:
         ordering = ["priority", "-effective_from", "name"]
         indexes = [
             models.Index(fields=["contract", "is_active", "service_type"]),
             models.Index(fields=["source_type", "workflow_route"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["contract", "name", "version"],
+                name="fin_unique_pricing_rule_version",
+            )
         ]
 
     def clean(self):
@@ -90,6 +101,10 @@ class PricingRule(TimeStampedModel):
             and self.max_monthly_volume < self.min_monthly_volume
         ):
             raise ValidationError({"max_monthly_volume": "Maximum volume cannot be below minimum volume."})
+        if self.supersedes_id and self.supersedes_id == self.id:
+            raise ValidationError({"supersedes": "A pricing rule cannot supersede itself."})
+        if self.supersedes_id and self.supersedes.contract_id != self.contract_id:
+            raise ValidationError({"supersedes": "A pricing rule can only supersede a rule in the same contract."})
 
     def __str__(self):
         return self.name
@@ -766,6 +781,7 @@ class SettlementBatch(TimeStampedModel):
     period_end = models.DateField()
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     external_reference = models.CharField(max_length=120, blank=True, default="")
+    payment_evidence = models.FileField(upload_to="finance/settlements/%Y/%m/", null=True, blank=True)
     notes = models.TextField(blank=True, default="")
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -776,11 +792,28 @@ class SettlementBatch(TimeStampedModel):
     )
     approved_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="paid_finance_settlements",
+    )
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="cancelled_finance_settlements",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["-period_end", "-created_at"]
         indexes = [
             models.Index(fields=["beneficiary_organization", "status"], name="fin_set_org_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_reference"],
+                condition=~models.Q(external_reference=""),
+                name="fin_unique_settlement_external_ref",
+            )
         ]
 
     def clean(self):
@@ -797,10 +830,10 @@ class SettlementItem(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="items",
     )
-    allocation = models.OneToOneField(
+    allocation = models.ForeignKey(
         EncounterAllocation,
         on_delete=models.PROTECT,
-        related_name="settlement_item",
+        related_name="settlement_items",
     )
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3, default="NGN")

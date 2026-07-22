@@ -117,7 +117,13 @@ def resolve_pricing_rule(encounter, contract):
         encounter.encounter_date,
     )
 
-    # Empty rule dimensions are wildcards. Exact matches are scored higher.
+    month_volume = EncounterFinancialRecord.objects.filter(
+        payer_organization=contract.organization,
+        encounter__encounter_date__year=encounter.encounter_date.year,
+        encounter__encounter_date__month=encounter.encounter_date.month,
+    ).exclude(status=EncounterFinancialRecord.Status.CANCELLED).exclude(encounter=encounter).count() + 1
+
+    # Empty rule dimensions are wildcards. Exact matches and narrower volume tiers win.
     valid = []
     dimensions = {
         "source_type": encounter.source_type,
@@ -125,6 +131,10 @@ def resolve_pricing_rule(encounter, contract):
         "payment_responsibility": encounter.payment_responsibility,
     }
     for rule in candidates.prefetch_related("allocation_rules"):
+        if rule.min_monthly_volume is not None and month_volume < rule.min_monthly_volume:
+            continue
+        if rule.max_monthly_volume is not None and month_volume > rule.max_monthly_volume:
+            continue
         score = 0
         matches = True
         for field, encounter_value in dimensions.items():
@@ -135,7 +145,8 @@ def resolve_pricing_rule(encounter, contract):
                     break
                 score += 1
         if matches:
-            valid.append((score, -rule.priority, rule.effective_from, rule.id, rule))
+            tier_specificity = int(rule.min_monthly_volume is not None) + int(rule.max_monthly_volume is not None)
+            valid.append((score, tier_specificity, -rule.priority, rule.effective_from, rule.version, rule.id, rule))
 
     if not valid:
         return None
@@ -224,11 +235,15 @@ def price_encounter(encounter, actor=None, force=False):
         "programme": contract.programme,
         "pricing_rule_id": rule.id,
         "pricing_rule_name": rule.name,
+        "pricing_rule_version": rule.version,
+        "pricing_rule_supersedes_id": rule.supersedes_id,
         "service_type": rule.service_type,
         "source_type": rule.source_type,
         "workflow_route": rule.workflow_route,
         "payment_responsibility": rule.payment_responsibility,
         "gross_amount": str(rule.gross_amount),
+        "min_monthly_volume": rule.min_monthly_volume,
+        "max_monthly_volume": rule.max_monthly_volume,
         "currency": contract.currency,
         "service_pathway": record.service_pathway,
         "payer_type": record.payer_type,
@@ -944,8 +959,13 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
         financial_record__financially_releasable=True,
         financial_record__captured_at__date__gte=period_start,
         financial_record__captured_at__date__lte=period_end,
-        settlement_item__isnull=True,
-    )
+    ).exclude(
+        settlement_items__batch__status__in=[
+            SettlementBatch.Status.DRAFT,
+            SettlementBatch.Status.APPROVED,
+            SettlementBatch.Status.PAID,
+        ]
+    ).distinct()
     if not allocations.exists():
         raise ValidationError("No unsettled allocations were found for this beneficiary and period.")
     batch = SettlementBatch.objects.create(
@@ -976,14 +996,14 @@ def approve_settlement_batch(batch, actor=None):
     batch.approved_at = timezone.now()
     batch.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
     EncounterAllocation.objects.filter(
-        settlement_item__batch=batch,
+        settlement_items__batch=batch,
         status=EncounterAllocation.Status.EARNED,
     ).update(status=EncounterAllocation.Status.SETTLEMENT_PENDING)
     return batch
 
 
 @transaction.atomic
-def mark_settlement_batch_paid(batch, external_reference, actor=None):
+def mark_settlement_batch_paid(batch, external_reference, actor=None, payment_evidence=None):
     from .models import EncounterAllocation, EncounterFinancialRecord, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().prefetch_related(
@@ -994,18 +1014,24 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None):
     external_reference = str(external_reference or "").strip()
     if not external_reference:
         raise ValidationError("An external settlement reference is required.")
+    if SettlementBatch.objects.exclude(pk=batch.pk).filter(external_reference=external_reference).exists():
+        raise ValidationError("This external settlement reference has already been used.")
+    if payment_evidence is None:
+        raise ValidationError("Payment evidence is required before a settlement can be marked paid.")
     batch.status = SettlementBatch.Status.PAID
     batch.external_reference = external_reference
+    batch.payment_evidence = payment_evidence
+    batch.paid_by = actor
     batch.paid_at = timezone.now()
-    batch.save(update_fields=["status", "external_reference", "paid_at", "updated_at"])
-    EncounterAllocation.objects.filter(settlement_item__batch=batch).update(
+    batch.save(update_fields=["status", "external_reference", "payment_evidence", "paid_by", "paid_at", "updated_at"])
+    EncounterAllocation.objects.filter(settlement_items__batch=batch).update(
         status=EncounterAllocation.Status.SETTLED,
         settled_at=batch.paid_at,
     )
 
     record_ids = {item.allocation.financial_record_id for item in batch.items.all()}
     for record in EncounterFinancialRecord.objects.select_for_update().filter(id__in=record_ids):
-        if not record.allocations.exclude(settlement_item__batch__status=SettlementBatch.Status.PAID).exists():
+        if not record.allocations.exclude(settlement_items__batch__status=SettlementBatch.Status.PAID).exists():
             previous_status = record.status
             record.status = EncounterFinancialRecord.Status.SETTLED
             record.settled_at = timezone.now()
@@ -1017,6 +1043,28 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None):
                 previous_status=previous_status,
                 details={"settlement_batch_id": batch.id, "external_reference": external_reference},
             )
+    return batch
+
+
+@transaction.atomic
+def cancel_settlement_batch(batch, reason, actor=None):
+    from .models import EncounterAllocation, SettlementBatch
+
+    batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
+    if batch.status not in {SettlementBatch.Status.DRAFT, SettlementBatch.Status.APPROVED}:
+        raise ValidationError("Only draft or approved settlement batches can be cancelled.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A settlement cancellation reason is required.")
+    EncounterAllocation.objects.filter(
+        settlement_items__batch=batch,
+        status=EncounterAllocation.Status.SETTLEMENT_PENDING,
+    ).update(status=EncounterAllocation.Status.EARNED)
+    batch.status = SettlementBatch.Status.CANCELLED
+    batch.cancelled_by = actor
+    batch.cancelled_at = timezone.now()
+    batch.cancellation_reason = reason
+    batch.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"])
     return batch
 
 

@@ -17,6 +17,7 @@ from .models import (
     OrganizationWallet, WalletLedgerEntry, WalletReservation,
     BankTransferFundingRequest,
     ServiceAllowance, ServiceAllowanceReservation,
+    SettlementBatch, SettlementItem, EncounterAllocation,
 )
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
@@ -25,6 +26,8 @@ from .services import (
     capture_finance_for_hospital_publication,
     submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer,
     approve_service_allowance, reserve_service_allowance, fund_allowance_reservation,
+    create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
+    cancel_settlement_batch,
 )
 
 
@@ -495,6 +498,87 @@ class BankTransferFundingTests(WalletEngineTests):
             submit_bank_transfer_proof(self.request, proof, actor=self.user)
         self.request.refresh_from_db()
         self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+
+
+class VersionedPricingAndSettlementTests(WalletEngineTests):
+    def test_volume_tier_is_applied_and_frozen_in_snapshot(self):
+        self.rule.max_monthly_volume = 1
+        self.rule.save(update_fields=["max_monthly_volume", "updated_at"])
+        tier = PricingRule.objects.create(
+            contract=self.contract, name="Hospital volume tier", version=2,
+            supersedes=self.rule, service_type="retinal_assessment",
+            source_type="hospital_referral", min_monthly_volume=2,
+            gross_amount=Decimal("12000.00"), effective_from=date(2026, 1, 1), priority=1,
+        )
+        AllocationRule.objects.create(
+            pricing_rule=tier, beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("12000.00"),
+        )
+        price_encounter(self.encounter, force=True)
+        second_patient = Patient.objects.create(
+            patient_id="PAT-VOLUME-2", first_name="Volume", last_name="Two",
+            date_of_birth=date(1980, 1, 1), sex="female",
+        )
+        second_encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-VOLUME-2", patient=second_patient, encounter_date=date.today(),
+            originating_organization=self.organization, source_type="hospital_referral",
+            workflow_route="sentinel_managed", payment_responsibility="hospital",
+        )
+        second_record = price_encounter(second_encounter, force=True)
+        self.assertEqual(second_record.gross_amount, Decimal("12000.00"))
+        self.assertEqual(second_record.pricing_snapshot["pricing_rule_version"], 2)
+        self.assertEqual(second_record.pricing_snapshot["min_monthly_volume"], 2)
+
+    def _earned_allocations(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "settlement-topup")
+        reservation = reserve_wallet_funds(
+            self.wallet, self.record, Decimal("15000.00"), "settlement-reserve"
+        )
+        capture_wallet_reservation(reservation, idempotency_key="settlement-capture")
+        earn_financial_record_allocations(self.record)
+        allocation = self.record.allocations.filter(
+            beneficiary_role=AllocationRule.BeneficiaryRole.HOSPITAL
+        ).first()
+        allocation.beneficiary_organization = self.organization
+        allocation.save(update_fields=["beneficiary_organization", "updated_at"])
+
+    def test_settlement_requires_evidence_and_prevents_duplicate_reference(self):
+        self._earned_allocations()
+        batch = create_settlement_batch(
+            self.organization, date.today(), date.today(), actor=None
+        )
+        approve_settlement_batch(batch)
+        with self.assertRaisesMessage(ValidationError, "Payment evidence"):
+            mark_settlement_batch_paid(batch, "PAY-001")
+        evidence = SimpleUploadedFile("payment.pdf", b"paid", content_type="application/pdf")
+        paid = mark_settlement_batch_paid(batch, "PAY-001", payment_evidence=evidence)
+        self.assertEqual(paid.status, SettlementBatch.Status.PAID)
+        self.assertTrue(paid.payment_evidence.name)
+
+    def test_cancel_approved_settlement_restores_earned_allocations(self):
+        self._earned_allocations()
+        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        approve_settlement_batch(batch)
+        self.assertEqual(
+            EncounterAllocation.objects.filter(
+                settlement_items__batch=batch,
+                status=EncounterAllocation.Status.SETTLEMENT_PENDING,
+            ).count(), 1,
+        )
+        cancel_settlement_batch(batch, "Payment details need correction")
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, SettlementBatch.Status.CANCELLED)
+        self.assertEqual(
+            EncounterAllocation.objects.filter(
+                settlement_items__batch=batch, status=EncounterAllocation.Status.EARNED,
+            ).count(), 1,
+        )
+        replacement = create_settlement_batch(
+            self.organization, date.today(), date.today()
+        )
+        self.assertNotEqual(replacement.pk, batch.pk)
+        self.assertEqual(replacement.items.count(), 1)
 
 
 class ServiceAllowanceTests(TestCase):
