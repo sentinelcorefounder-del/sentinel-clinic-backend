@@ -1,9 +1,11 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
 
 from encounters.models import ScreeningEncounter
 from organizations.models import Organization
@@ -13,12 +15,14 @@ from referrals.models import HospitalReferral
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
     OrganizationWallet, WalletLedgerEntry, WalletReservation,
+    BankTransferFundingRequest,
 )
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation,
     infer_financial_identity, earn_financial_record_allocations,
     capture_finance_for_hospital_publication,
+    submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer,
 )
 
 
@@ -415,3 +419,77 @@ class NegotiatedPricingAndAutomationTests(WalletEngineTests):
         self.record.refresh_from_db()
         self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
         self.assertEqual(self.record.outstanding_amount, Decimal("0.00"))
+
+
+class BankTransferFundingTests(WalletEngineTests):
+    def setUp(self):
+        super().setUp()
+        self.user = get_user_model().objects.create_user(username="finance-verifier")
+        self.request = BankTransferFundingRequest.objects.create(
+            wallet=self.wallet,
+            requested_amount=Decimal("50000.00"),
+            currency="NGN",
+            requester=self.user,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
+
+    def _submit_and_verify(self, amount="50000.00", reference="BANK-TXN-001"):
+        proof = SimpleUploadedFile("receipt.pdf", b"test receipt", content_type="application/pdf")
+        submit_bank_transfer_proof(self.request, proof, actor=self.user)
+        return verify_bank_transfer(
+            self.request,
+            received_amount=Decimal(amount),
+            bank_transaction_reference=reference,
+            value_date=date.today(),
+            actor=self.user,
+        )
+
+    def test_proof_does_not_credit_wallet(self):
+        proof = SimpleUploadedFile("receipt.pdf", b"test receipt", content_type="application/pdf")
+        request = submit_bank_transfer_proof(self.request, proof, actor=self.user)
+        self.assertEqual(request.status, BankTransferFundingRequest.Status.PROOF_SUBMITTED)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        self.assertEqual(WalletLedgerEntry.objects.count(), 0)
+
+    def test_verified_transfer_credits_actual_amount_once_on_approval(self):
+        request = self._submit_and_verify()
+        self.assertEqual(request.status, BankTransferFundingRequest.Status.VERIFIED)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        first = approve_bank_transfer(request, actor=self.user)
+        second = approve_bank_transfer(request, actor=self.user)
+        self.assertEqual(first.ledger_entry_id, second.ledger_entry_id)
+        self.assertEqual(self.wallet.available_balance, Decimal("50000.00"))
+        self.assertEqual(WalletLedgerEntry.objects.count(), 1)
+
+    def test_underpayment_is_flagged_and_credits_only_received_amount(self):
+        request = self._submit_and_verify(amount="45000.00")
+        self.assertEqual(request.status, BankTransferFundingRequest.Status.UNDERPAID)
+        approve_bank_transfer(request, actor=self.user)
+        self.assertEqual(self.wallet.available_balance, Decimal("45000.00"))
+
+    def test_duplicate_bank_transaction_reference_is_rejected(self):
+        self._submit_and_verify(reference="DUPLICATE-REF")
+        other = BankTransferFundingRequest.objects.create(
+            wallet=self.wallet,
+            requested_amount=Decimal("10000.00"),
+            currency="NGN",
+        )
+        proof = SimpleUploadedFile("other.pdf", b"other receipt", content_type="application/pdf")
+        submit_bank_transfer_proof(other, proof, actor=self.user)
+        with self.assertRaisesMessage(ValidationError, "already been used"):
+            verify_bank_transfer(
+                other,
+                received_amount=Decimal("10000.00"),
+                bank_transaction_reference="DUPLICATE-REF",
+                value_date=date.today(),
+                actor=self.user,
+            )
+
+    def test_expired_request_rejects_proof_and_does_not_credit(self):
+        self.request.expires_at = timezone.now() - timedelta(minutes=1)
+        self.request.save(update_fields=["expires_at", "updated_at"])
+        proof = SimpleUploadedFile("late.pdf", b"late receipt", content_type="application/pdf")
+        with self.assertRaisesMessage(ValidationError, "expired"):
+            submit_bank_transfer_proof(self.request, proof, actor=self.user)
+        self.request.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))

@@ -12,6 +12,7 @@ from .models import (
     WalletReservation,
     SettlementBatch,
     SettlementItem,
+    BankTransferFundingRequest,
 )
 
 
@@ -107,3 +108,14 @@ class SettlementBatchAdmin(admin.ModelAdmin):
     search_fields = ("beneficiary_organization__name", "external_reference")
     readonly_fields = ("total_amount", "approved_by", "approved_at", "paid_at", "created_at", "updated_at")
     inlines = [SettlementItemInline]
+
+
+@admin.register(BankTransferFundingRequest)
+class BankTransferFundingRequestAdmin(admin.ModelAdmin):
+    list_display = ("request_reference", "wallet", "requested_amount", "received_amount", "currency", "status", "created_at")
+    list_filter = ("status", "currency", "created_at")
+    search_fields = ("request_reference", "bank_transaction_reference", "wallet__organization__name")
+    readonly_fields = (
+        "request_reference", "requester", "proof_submitted_at", "verified_by", "verified_at",
+        "approved_by", "approved_at", "ledger_entry", "created_at", "updated_at",
+    )

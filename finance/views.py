@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
     OrganizationWallet, WalletLedgerEntry, WalletReservation, SettlementBatch,
+    BankTransferFundingRequest,
 )
 from .serializers import (
     AllocationRuleSerializer,
@@ -15,6 +16,7 @@ from .serializers import (
     PartnerContractSerializer,
     PricingRuleSerializer,
     OrganizationWalletSerializer, WalletLedgerEntrySerializer, WalletReservationSerializer, SettlementBatchSerializer,
+    BankTransferFundingRequestSerializer,
 )
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
@@ -22,6 +24,7 @@ from .services import (
     reserve_financial_record_from_originating_wallet, capture_financial_record_wallet_reservation,
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
     sync_encounter_finance_lifecycle,
+    submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer, reject_bank_transfer,
 )
 
 
@@ -262,6 +265,91 @@ class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
             return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(reservation).data)
 
+
+class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
+    serializer_class = BankTransferFundingRequestSerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+    queryset = BankTransferFundingRequest.objects.select_related(
+        "wallet", "wallet__organization", "requester", "verified_by", "approved_by", "ledger_entry"
+    ).all()
+
+    def _is_finance_ops(self):
+        return IsSentinelFinanceOps().has_permission(self.request, self)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self._is_finance_ops():
+            status_value = (self.request.query_params.get("status") or "").strip()
+            return queryset.filter(status=status_value) if status_value else queryset
+        organization = get_user_organization(self.request.user)
+        return queryset.filter(wallet__organization=organization) if organization else queryset.none()
+
+    def perform_create(self, serializer):
+        wallet = serializer.validated_data["wallet"]
+        if not self._is_finance_ops():
+            organization = get_user_organization(self.request.user)
+            if organization is None or wallet.organization_id != organization.id:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("You can only request funding for your own organisation.")
+        instance = serializer.save(requester=self.request.user, currency=wallet.currency)
+        instance.full_clean()
+        instance.save()
+
+    @action(detail=True, methods=["post"], url_path="submit-proof")
+    def submit_proof(self, request, pk=None):
+        try:
+            funding_request = submit_bank_transfer_proof(
+                self.get_object(), request.FILES.get("proof"), actor=request.user
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    def _require_finance_ops(self):
+        if not self._is_finance_ops():
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Sentinel Finance permission is required.")
+
+    @action(detail=True, methods=["post"])
+    def verify(self, request, pk=None):
+        self._require_finance_ops()
+        try:
+            funding_request = verify_bank_transfer(
+                self.get_object(),
+                received_amount=request.data.get("received_amount"),
+                bank_transaction_reference=request.data.get("bank_transaction_reference"),
+                value_date=parse_date(request.data.get("value_date", "")),
+                actor=request.user,
+                notes=request.data.get("notes", ""),
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        self._require_finance_ops()
+        try:
+            funding_request = approve_bank_transfer(self.get_object(), actor=request.user)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        self._require_finance_ops()
+        try:
+            funding_request = reject_bank_transfer(
+                self.get_object(), reason=request.data.get("reason"), actor=request.user
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
 
 class SettlementBatchViewSet(FinanceAdminViewSet):
     serializer_class = SettlementBatchSerializer

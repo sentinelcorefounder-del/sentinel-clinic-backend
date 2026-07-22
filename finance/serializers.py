@@ -11,6 +11,7 @@ from .models import (
     WalletReservation,
     SettlementBatch,
     SettlementItem,
+    BankTransferFundingRequest,
 )
 
 
@@ -143,6 +144,25 @@ class SettlementBatchSerializer(serializers.ModelSerializer):
             "status", "total_amount", "approved_by", "approved_at", "paid_at",
             "created_at", "updated_at",
         )
+
+
+class BankTransferFundingRequestSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+
+    class Meta:
+        model = BankTransferFundingRequest
+        fields = "__all__"
+        read_only_fields = (
+            "request_reference", "status", "received_amount", "currency", "proof", "proof_submitted_at",
+            "bank_transaction_reference", "value_date", "requester", "verified_by",
+            "verified_at", "approved_by", "approved_at", "ledger_entry",
+            "rejection_reason", "created_at", "updated_at",
+        )
+
+    def validate_requested_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Requested amount must be greater than zero.")
+        return value
 
 
 class PartnerFinanceSummarySerializer(serializers.Serializer):

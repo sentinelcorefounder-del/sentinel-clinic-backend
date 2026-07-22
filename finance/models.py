@@ -1,4 +1,5 @@
 from decimal import Decimal
+import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -546,6 +547,107 @@ class WalletLedgerEntry(models.Model):
 
     def __str__(self):
         return f"{self.get_entry_type_display()} - {self.wallet}"
+
+
+def bank_transfer_proof_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/bank-transfer-proofs/{instance.request_reference}/{uuid.uuid4().hex}.{suffix}"
+
+
+def bank_transfer_request_reference():
+    return f"SEN-BT-{uuid.uuid4().hex[:12].upper()}"
+
+
+class BankTransferFundingRequest(TimeStampedModel):
+    class Status(models.TextChoices):
+        AWAITING_TRANSFER = "awaiting_transfer", "Awaiting transfer"
+        PROOF_SUBMITTED = "proof_submitted", "Proof submitted"
+        UNDER_VERIFICATION = "under_verification", "Under verification"
+        VERIFIED = "verified", "Verified"
+        CREDITED = "credited", "Credited"
+        UNDERPAID = "underpaid", "Underpaid"
+        OVERPAID = "overpaid", "Overpaid"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+        REVERSED = "reversed", "Reversed"
+
+    wallet = models.ForeignKey(
+        OrganizationWallet,
+        on_delete=models.PROTECT,
+        related_name="bank_transfer_funding_requests",
+    )
+    request_reference = models.CharField(
+        max_length=32,
+        unique=True,
+        default=bank_transfer_request_reference,
+        editable=False,
+    )
+    requested_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    received_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.AWAITING_TRANSFER)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    proof = models.FileField(upload_to=bank_transfer_proof_path, null=True, blank=True)
+    proof_submitted_at = models.DateTimeField(null=True, blank=True)
+    bank_transaction_reference = models.CharField(max_length=120, blank=True, default="")
+    value_date = models.DateField(null=True, blank=True)
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requested_bank_transfer_funding",
+    )
+    verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="verified_bank_transfer_funding",
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_bank_transfer_funding",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    ledger_entry = models.OneToOneField(
+        WalletLedgerEntry,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="bank_transfer_funding_request",
+    )
+    notes = models.TextField(blank=True, default="")
+    rejection_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["wallet", "status"], name="fin_bank_wallet_status_idx"),
+            models.Index(fields=["status", "created_at"], name="fin_bank_status_created_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bank_transaction_reference"],
+                condition=~models.Q(bank_transaction_reference=""),
+                name="fin_unique_bank_transaction_ref",
+            )
+        ]
+
+    def clean(self):
+        if self.requested_amount <= 0:
+            raise ValidationError({"requested_amount": "Requested amount must be greater than zero."})
+        if self.received_amount is not None and self.received_amount <= 0:
+            raise ValidationError({"received_amount": "Received amount must be greater than zero."})
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Funding currency must match the wallet currency."})
+
+    def __str__(self):
+        return f"{self.request_reference} - {self.wallet}"
 
 
 class SettlementBatch(TimeStampedModel):

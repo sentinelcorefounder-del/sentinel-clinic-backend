@@ -320,6 +320,122 @@ def top_up_wallet(wallet, amount, idempotency_key, actor=None, reference="", des
 
 
 @transaction.atomic
+def submit_bank_transfer_proof(funding_request, proof, actor=None):
+    from .models import BankTransferFundingRequest
+
+    funding_request = BankTransferFundingRequest.objects.select_for_update().get(pk=funding_request.pk)
+    if funding_request.status not in {
+        BankTransferFundingRequest.Status.AWAITING_TRANSFER,
+        BankTransferFundingRequest.Status.PROOF_SUBMITTED,
+    }:
+        raise ValidationError("Proof cannot be submitted in the current status.")
+    if funding_request.expires_at and funding_request.expires_at <= timezone.now():
+        funding_request.status = BankTransferFundingRequest.Status.EXPIRED
+        funding_request.save(update_fields=["status", "updated_at"])
+        raise ValidationError("This funding request has expired.")
+    if not proof:
+        raise ValidationError("Transfer proof is required.")
+    funding_request.proof = proof
+    funding_request.proof_submitted_at = timezone.now()
+    funding_request.status = BankTransferFundingRequest.Status.PROOF_SUBMITTED
+    funding_request.save(update_fields=["proof", "proof_submitted_at", "status", "updated_at"])
+    return funding_request
+
+
+@transaction.atomic
+def verify_bank_transfer(funding_request, received_amount, bank_transaction_reference, value_date, actor=None, notes=""):
+    from .models import BankTransferFundingRequest
+
+    funding_request = BankTransferFundingRequest.objects.select_for_update().get(pk=funding_request.pk)
+    if funding_request.status not in {
+        BankTransferFundingRequest.Status.PROOF_SUBMITTED,
+        BankTransferFundingRequest.Status.UNDER_VERIFICATION,
+    }:
+        raise ValidationError("This funding request is not awaiting verification.")
+    received_amount = _money(received_amount)
+    bank_transaction_reference = str(bank_transaction_reference or "").strip()
+    if not bank_transaction_reference:
+        raise ValidationError("The bank transaction reference is required.")
+    if BankTransferFundingRequest.objects.exclude(pk=funding_request.pk).filter(
+        bank_transaction_reference=bank_transaction_reference
+    ).exists():
+        raise ValidationError("This bank transaction reference has already been used.")
+    if not value_date:
+        raise ValidationError("The bank value date is required.")
+
+    funding_request.received_amount = received_amount
+    funding_request.bank_transaction_reference = bank_transaction_reference
+    funding_request.value_date = value_date
+    funding_request.verified_by = actor
+    funding_request.verified_at = timezone.now()
+    funding_request.notes = notes or funding_request.notes
+    if received_amount < funding_request.requested_amount:
+        funding_request.status = BankTransferFundingRequest.Status.UNDERPAID
+    elif received_amount > funding_request.requested_amount:
+        funding_request.status = BankTransferFundingRequest.Status.OVERPAID
+    else:
+        funding_request.status = BankTransferFundingRequest.Status.VERIFIED
+    funding_request.save()
+    return funding_request
+
+
+@transaction.atomic
+def approve_bank_transfer(funding_request, actor=None):
+    from .models import BankTransferFundingRequest, WalletLedgerEntry
+
+    funding_request = BankTransferFundingRequest.objects.select_for_update().select_related("wallet").get(
+        pk=funding_request.pk
+    )
+    if funding_request.status == BankTransferFundingRequest.Status.CREDITED:
+        return funding_request
+    if funding_request.status not in {
+        BankTransferFundingRequest.Status.VERIFIED,
+        BankTransferFundingRequest.Status.UNDERPAID,
+        BankTransferFundingRequest.Status.OVERPAID,
+    }:
+        raise ValidationError("Only a verified transfer can be approved.")
+    if funding_request.received_amount is None:
+        raise ValidationError("The received amount has not been verified.")
+
+    entry = top_up_wallet(
+        wallet=funding_request.wallet,
+        amount=funding_request.received_amount,
+        idempotency_key=f"bank-transfer:{funding_request.pk}:credit",
+        actor=actor,
+        reference=funding_request.bank_transaction_reference,
+        description=f"Approved bank transfer {funding_request.request_reference}",
+        metadata={"bank_transfer_funding_request_id": funding_request.pk},
+    )
+    funding_request.status = BankTransferFundingRequest.Status.CREDITED
+    funding_request.approved_by = actor
+    funding_request.approved_at = timezone.now()
+    funding_request.ledger_entry = entry
+    funding_request.save(update_fields=["status", "approved_by", "approved_at", "ledger_entry", "updated_at"])
+    return funding_request
+
+
+@transaction.atomic
+def reject_bank_transfer(funding_request, reason, actor=None):
+    from .models import BankTransferFundingRequest
+
+    funding_request = BankTransferFundingRequest.objects.select_for_update().get(pk=funding_request.pk)
+    if funding_request.status in {
+        BankTransferFundingRequest.Status.CREDITED,
+        BankTransferFundingRequest.Status.REVERSED,
+    }:
+        raise ValidationError("A credited or reversed funding request cannot be rejected.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A rejection reason is required.")
+    funding_request.status = BankTransferFundingRequest.Status.REJECTED
+    funding_request.rejection_reason = reason
+    funding_request.verified_by = actor
+    funding_request.verified_at = timezone.now()
+    funding_request.save(update_fields=["status", "rejection_reason", "verified_by", "verified_at", "updated_at"])
+    return funding_request
+
+
+@transaction.atomic
 def adjust_wallet(wallet, available_delta, idempotency_key, actor=None, reference="", description="", metadata=None):
     from .models import OrganizationWallet, WalletLedgerEntry
 
