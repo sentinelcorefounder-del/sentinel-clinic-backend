@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -8,6 +9,13 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
+from finance.models import AllocationRule, PartnerContract, PricingRule, OrganizationWallet
+from finance.services import (
+    price_encounter,
+    release_wallet_reservation,
+    reserve_financial_record_from_originating_wallet,
+    top_up_wallet,
+)
 from ops.models import OpsAuditLog
 from organizations.models import Organization, OrganizationProfile
 from patients.models import Patient
@@ -64,6 +72,34 @@ class ReleaseControlTestCase(TestCase):
             hospital_referral=self.referral,
             workflow_route="sentinel_managed",
         )
+        self.contract = PartnerContract.objects.create(
+            organization=self.hospital,
+            name="Release-control hospital contract",
+            programme="diabetic_screening",
+            status=PartnerContract.Status.ACTIVE,
+            effective_from=date(2026, 1, 1),
+        )
+        self.pricing_rule = PricingRule.objects.create(
+            contract=self.contract,
+            name="Release-control assessment",
+            service_type="retinal_assessment",
+            source_type="hospital_referral",
+            gross_amount=Decimal("15000.00"),
+            effective_from=date(2026, 1, 1),
+        )
+        AllocationRule.objects.create(
+            pricing_rule=self.pricing_rule,
+            beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("15000.00"),
+        )
+        self.wallet = OrganizationWallet.objects.create(
+            organization=self.hospital,
+            currency="NGN",
+        )
+        top_up_wallet(self.wallet, Decimal("15000.00"), "release-control-topup")
+        self.financial_record = price_encounter(self.encounter, force=True)
+        reserve_financial_record_from_originating_wallet(self.financial_record)
 
     def make_user(self, username, role, organization):
         user = get_user_model().objects.create_user(username=username, password="test-pass")
@@ -179,6 +215,8 @@ class ReleaseControlTestCase(TestCase):
         self.assertEqual(report.distribution_status, "awaiting_distribution")
         self.assertIsNone(report.hospital_released_at)
         self.assertFalse(self.referral.report_ready)
+        self.financial_record.refresh_from_db()
+        self.assertEqual(self.financial_record.status, self.financial_record.Status.WALLET_RESERVED)
 
         self.client.force_authenticate(self.hospital_user)
         reports = self.client.get("/api/referrals/hospital/reports/")
@@ -206,6 +244,15 @@ class ReleaseControlTestCase(TestCase):
         self.assertIsNotNone(report.hospital_released_at)
         self.assertEqual(report.hospital_released_by, self.ops_user)
         self.assertTrue(self.referral.report_ready)
+        self.financial_record.refresh_from_db()
+        self.assertEqual(self.financial_record.status, self.financial_record.Status.CAPTURED)
+        self.assertTrue(self.financial_record.financially_releasable)
+        self.assertEqual(
+            self.financial_record.allocations.filter(
+                status=self.financial_record.allocations.model.Status.EARNED
+            ).count(),
+            1,
+        )
         event_count = ReportStatusEvent.objects.filter(
             report=report, event_type="released_to_hospital"
         ).count()
@@ -224,12 +271,35 @@ class ReleaseControlTestCase(TestCase):
             ).count(),
             audit_count,
         )
+        self.assertEqual(
+            self.financial_record.wallet_ledger_entries.filter(entry_type="service_capture").count(),
+            1,
+        )
 
         self.client.force_authenticate(self.hospital_user)
         self.assertEqual(self.client.get("/api/referrals/hospital/reports/").data[0]["id"], report.id)
         self.assertEqual(self.client.get(f"/api/reports/{report.id}/pdf/").status_code, 200)
         self.client.force_authenticate(self.other_hospital_user)
         self.assertEqual(self.client.get(f"/api/reports/{report.id}/pdf/").status_code, 403)
+
+    def test_release_is_blocked_on_financial_hold(self):
+        report = self.create_report()
+        self.submit(report)
+        self.issue(report)
+        reservation = self.financial_record.wallet_reservations.get()
+        release_wallet_reservation(
+            reservation,
+            idempotency_key="release-control-financial-hold",
+        )
+
+        response = self.release(report)
+
+        self.assertEqual(response.status_code, 402, response.data)
+        self.assertEqual(response.data["code"], "PAYMENT_REQUIRED")
+        report.refresh_from_db()
+        self.referral.refresh_from_db()
+        self.assertEqual(report.distribution_status, "awaiting_distribution")
+        self.assertFalse(self.referral.report_ready)
 
     def test_compatibility_sync_cannot_force_release(self):
         report = self.create_report()

@@ -645,6 +645,43 @@ def earn_financial_record_allocations(financial_record, actor=None):
 
 
 @transaction.atomic
+def capture_finance_for_hospital_publication(encounter, actor=None):
+    """Cover and earn a hospital-referred service at the publication boundary.
+
+    Report submission/clinical completion must never capture a hospital-funded
+    service. The controlled Ops release endpoint is the only automatic capture
+    boundary for this pathway.
+    """
+    record = EncounterFinancialRecord.objects.select_for_update().filter(
+        encounter=encounter
+    ).first()
+    if record is None:
+        record = price_encounter(encounter, actor=actor)
+    else:
+        record.refresh_from_db()
+
+    if record.service_pathway != EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED:
+        raise ValidationError("This financial trigger only applies to hospital-referred services.")
+
+    if record.status == EncounterFinancialRecord.Status.WALLET_RESERVED:
+        capture_financial_record_wallet_reservation(
+            record,
+            actor=actor,
+            reference=f"EFR-{record.id}-HOSPITAL-PUBLICATION",
+        )
+        record.refresh_from_db()
+
+    if not record.financially_releasable:
+        raise ValidationError(
+            "PAYMENT_REQUIRED: This report is on financial hold until its service is fully funded."
+        )
+
+    earn_financial_record_allocations(record, actor=actor)
+    record.refresh_from_db()
+    return record
+
+
+@transaction.atomic
 def create_settlement_batch(beneficiary_organization, period_start, period_end, currency="NGN", actor=None):
     from .models import EncounterAllocation, SettlementBatch, SettlementItem
 
@@ -786,7 +823,8 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
     """Idempotently align finance with the encounter clinical lifecycle.
 
     scheduled/in-progress: price and secure by wallet or approved credit
-    completed: capture an active wallet reservation
+    clinic-direct completed: capture and earn the service
+    hospital-referred completed: retain the reservation until Ops publication
     cancelled: release unused reservation and cancel finance record
 
     Clinical work is not deleted when finance cannot progress. Instead the
@@ -829,18 +867,17 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
                 raise
         record.refresh_from_db()
 
-    if encounter.screening_status == "completed":
+    if (
+        encounter.screening_status == "completed"
+        and record.service_pathway == EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT
+    ):
         if record.status == EncounterFinancialRecord.Status.WALLET_RESERVED:
             capture_financial_record_wallet_reservation(
                 record, actor=actor, reference=f"EFR-{record.id}-COMPLETE"
             )
             record.refresh_from_db()
-        elif record.status == EncounterFinancialRecord.Status.APPROVED_CREDIT:
-            previous_status = record.status
-            record.status = EncounterFinancialRecord.Status.READY_FOR_RELEASE
-            record.financially_releasable = True
-            record.captured_at = record.captured_at or timezone.now()
-            record.save(update_fields=["status", "financially_releasable", "captured_at", "updated_at"] )
-            _audit(record, "credit_service_completed", actor=actor, previous_status=previous_status)
+        record.refresh_from_db()
+        if record.financially_releasable:
+            earn_financial_record_allocations(record, actor=actor)
 
     return record

@@ -18,6 +18,7 @@ from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation,
     infer_financial_identity, earn_financial_record_allocations,
+    capture_finance_for_hospital_publication,
 )
 
 
@@ -305,6 +306,81 @@ class WalletEngineTests(FinanceEngineTests):
 
 
 class NegotiatedPricingAndAutomationTests(WalletEngineTests):
+    def test_clinic_direct_completion_captures_and_earns_once(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "clinic-trigger-topup")
+        from .services import reserve_financial_record_from_originating_wallet
+        reserve_financial_record_from_originating_wallet(self.record)
+        self.record.service_pathway = EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT
+        self.record.save(update_fields=["service_pathway", "updated_at"])
+        self.encounter.source_type = "clinic_direct"
+        self.encounter.screening_status = "completed"
+        self.encounter.save(update_fields=["source_type", "screening_status", "updated_at"])
+
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
+        self.assertTrue(self.record.financially_releasable)
+        self.assertEqual(
+            self.record.allocations.filter(status=self.record.allocations.model.Status.EARNED).count(),
+            3,
+        )
+
+    def test_hospital_completion_does_not_capture_reserved_funds(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "hospital-trigger-topup")
+        from .services import reserve_financial_record_from_originating_wallet
+        reserve_financial_record_from_originating_wallet(self.record)
+
+        self.encounter.screening_status = "completed"
+        self.encounter.save(update_fields=["screening_status", "updated_at"])
+
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.WALLET_RESERVED)
+        self.assertFalse(self.record.financially_releasable)
+        self.assertFalse(
+            self.record.allocations.filter(status=self.record.allocations.model.Status.EARNED).exists()
+        )
+
+    def test_hospital_publication_capture_is_idempotent_and_earns_once(self):
+        top_up_wallet(self.wallet, Decimal("15000.00"), "hospital-publication-topup")
+        from .services import reserve_financial_record_from_originating_wallet
+        reserve_financial_record_from_originating_wallet(self.record)
+
+        capture_finance_for_hospital_publication(self.encounter)
+        capture_finance_for_hospital_publication(self.encounter)
+
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.CAPTURED)
+        self.assertTrue(self.record.financially_releasable)
+        self.assertEqual(
+            self.record.allocations.filter(status=self.record.allocations.model.Status.EARNED).count(),
+            3,
+        )
+        self.assertEqual(
+            self.record.wallet_ledger_entries.filter(
+                entry_type=WalletLedgerEntry.EntryType.SERVICE_CAPTURE
+            ).count(),
+            1,
+        )
+
+    def test_hospital_publication_requires_covered_finance(self):
+        with self.assertRaisesMessage(ValidationError, "PAYMENT_REQUIRED"):
+            capture_finance_for_hospital_publication(self.encounter)
+
+    def test_approved_credit_does_not_publish_or_earn_before_funding(self):
+        self.contract.credit_allowed = True
+        self.contract.save(update_fields=["credit_allowed", "updated_at"])
+        self.record.service_pathway = EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT
+        self.record.save(update_fields=["service_pathway", "updated_at"])
+        self.encounter.source_type = "clinic_direct"
+        self.encounter.screening_status = "completed"
+        self.encounter.save(update_fields=["source_type", "screening_status", "updated_at"])
+
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.APPROVED_CREDIT)
+        self.assertFalse(self.record.financially_releasable)
+        self.assertFalse(
+            self.record.allocations.filter(status=self.record.allocations.model.Status.EARNED).exists()
+        )
+
     def test_negotiated_price_is_reserved_not_global_default(self):
         negotiated_rule = PricingRule.objects.create(
             contract=self.contract,

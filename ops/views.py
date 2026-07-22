@@ -8,6 +8,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.auth.tokens import default_token_generator
+from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.utils import timezone
 from django.utils.encoding import force_bytes
@@ -24,6 +25,7 @@ from organizations.services.provisioning import (
 )
 from patients.models import Patient
 from payments.services.paystack import initialize_transaction, verify_transaction
+from finance.services import capture_finance_for_hospital_publication
 from referrals.models import HospitalReferral
 from reports.models import StructuredReport, ReportStatusEvent
 from reports.release_control import is_report_released_to_hospital
@@ -1206,6 +1208,22 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
                 "hospital_name": referral.source_hospital.name,
             })
 
+        try:
+            financial_record = capture_finance_for_hospital_publication(
+                report.encounter,
+                actor=request.user,
+            )
+        except ValidationError as exc:
+            messages = getattr(exc, "messages", None) or [str(exc)]
+            return Response(
+                {
+                    "detail": messages[0],
+                    "code": "PAYMENT_REQUIRED",
+                    "distribution_status": report.distribution_status,
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+
         now = timezone.now()
         report.distribution_status = "released_to_hospital"
         report.hospital_released_at = now
@@ -1247,6 +1265,7 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
                 "referral_id": referral.referral_id,
                 "hospital_id": referral.source_hospital_id,
                 "hospital_name": referral.source_hospital.name,
+                "financial_record_id": financial_record.id,
             },
         )
 
