@@ -3,7 +3,7 @@ import hmac
 import json
 from decimal import Decimal
 
-from django.db import models
+from django.db import models, transaction
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
@@ -26,6 +26,7 @@ from patients.models import Patient
 from payments.services.paystack import initialize_transaction, verify_transaction
 from referrals.models import HospitalReferral
 from reports.models import StructuredReport, ReportStatusEvent
+from reports.release_control import is_report_released_to_hospital
 from users.models import UserSecurityProfile
 
 from .models import OpsAuditLog, OpsNotification, OpsPayment
@@ -1148,13 +1149,14 @@ class OpsDistributionQueueView(OpsOnlyMixin, APIView):
 
 
 class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
+    @transaction.atomic
     def post(self, request, pk):
         denied = self.check_ops_permission(request)
         if denied:
             return denied
 
         report = (
-            StructuredReport.objects.select_related(
+            StructuredReport.objects.select_for_update().select_related(
                 "patient",
                 "patient__assigned_clinic",
                 "encounter",
@@ -1192,12 +1194,17 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        referral.report = report
-        referral.report_ready = True
-        referral.referral_status = "report_issued"
-        referral.save(update_fields=[
-            "report", "report_ready", "referral_status", "updated_at",
-        ])
+        referral = HospitalReferral.objects.select_for_update().get(pk=referral.pk)
+
+        if is_report_released_to_hospital(report, referral):
+            return Response({
+                "message": "Report was already released to this hospital.",
+                "report_id": report.report_id,
+                "distribution_status": report.distribution_status,
+                "hospital_released_at": report.hospital_released_at,
+                "referral_id": referral.referral_id,
+                "hospital_name": referral.source_hospital.name,
+            })
 
         now = timezone.now()
         report.distribution_status = "released_to_hospital"
@@ -1208,6 +1215,13 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
             "hospital_released_at",
             "hospital_released_by",
             "updated_at",
+        ])
+
+        referral.report = report
+        referral.report_ready = True
+        referral.referral_status = "report_issued"
+        referral.save(update_fields=[
+            "report", "report_ready", "referral_status", "updated_at",
         ])
 
         ReportStatusEvent.objects.create(

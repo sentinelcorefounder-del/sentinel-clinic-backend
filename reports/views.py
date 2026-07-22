@@ -1,8 +1,6 @@
 from io import BytesIO
 import os
 
-from django.conf import settings
-from django.core.mail import send_mail
 from django.http import Http404, HttpResponse
 from django.utils import timezone
 from reportlab.lib.pagesizes import A4
@@ -27,11 +25,11 @@ from .permissions import (
     CanSubmitReportToOps,
 )
 from .serializers import StructuredReportSerializer
-from .services_basecrow import (
+from .referral_linking import (
     build_report_pdf_url,
-    sync_report_to_basecrow_referral,
     sync_report_to_local_hospital_referral,
 )
+from .release_control import is_report_released_to_hospital
 
 
 class StructuredReportRulesMixin:
@@ -64,17 +62,6 @@ class StructuredReportRulesMixin:
         ).strip().lower()
 
         report_marked_retake = urgency_outcome == "image_retake"
-
-        print(
-            "REPORT RULE DEBUG:",
-            {
-                "has_uploaded_image": has_uploaded_image,
-                "report_marked_ungradable": report_marked_ungradable,
-                "urgency_outcome": urgency_outcome,
-                "report_marked_retake": report_marked_retake,
-                "validated_data_keys": list(serializer.validated_data.keys()),
-            },
-        )
 
         allowed_without_image = report_marked_ungradable or report_marked_retake
 
@@ -523,16 +510,6 @@ def submit_report_to_ops(request, pk):
 
     local_referral = sync_report_to_local_hospital_referral(report)
 
-    basecrow_sync = None
-    basecrow_sync_error = ""
-    try:
-        basecrow_sync = sync_report_to_basecrow_referral(report, request=request)
-    except Exception as exc:
-        # Do not block clinical submission if Basecrow is temporarily unavailable.
-        # Return the error so it is visible during testing/logging.
-        basecrow_sync_error = str(exc)
-        print("Basecrow referral report sync failed:", exc)
-
     return Response(
         {
             "message": "Report submitted to Sentinel Ops successfully.",
@@ -540,10 +517,7 @@ def submit_report_to_ops(request, pk):
             "report_pk": report.pk,
             "report_status": report.report_status,
             "submitted_to_ops_at": report.submitted_to_ops_at,
-            "report_pdf_url": build_report_pdf_url(request, report),
             "local_hospital_referral_id": local_referral.referral_id if local_referral else "",
-            "basecrow_sync": basecrow_sync,
-            "basecrow_sync_error": basecrow_sync_error,
         },
         status=status.HTTP_200_OK,
     )
@@ -650,139 +624,20 @@ def clinic_issue_report(request, pk):
     ReportStatusEvent.objects.create(report=report,event_type="clinic_issued",from_status=previous_status,to_status="issued",note="Clinic Managed report issued directly by the clinic. Sentinel retained a read-only audit copy.",actor=user)
     return Response({"message":"Report signed and issued successfully.","report":StructuredReportSerializer(report,context={"request":request}).data,"report_status":report.report_status,"issued_at":report.issued_at,"report_pdf_url":build_report_pdf_url(request,report)},status=status.HTTP_200_OK)
 
-def _build_manual_payout_email(report):
-    patient = report.patient
-    clinic = patient.assigned_clinic if patient else None
-
-    patient_name = f"{patient.first_name} {patient.last_name}".strip() if patient else "Unknown Patient"
-    clinic_name = clinic.name if clinic and clinic.name else "Unknown Clinic"
-    encounter_id = report.encounter.encounter_id if report.encounter else "-"
-    payout_outcome = (report.urgency_outcome or "-").replace("_", " ").title()
-
-    subject = f"[Sentinel Manual Payout] Ops approved report {report.report_id}"
-
-    body = f"""
-A Sentinel report has been approved by Ops and is ready for manual payout review.
-
-Report ID: {report.report_id}
-Internal Report PK: {report.pk}
-Patient: {patient_name}
-Patient ID: {patient.patient_id if patient else "-"}
-Clinic: {clinic_name}
-Encounter ID: {encounter_id}
-Review Date: {report.review_date}
-Outcome: {payout_outcome}
-Approved At: {timezone.now().isoformat()}
-
-Please review and process manual payout.
-
-Sentinel
-""".strip()
-
-    return subject, body
-
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, CanReviewOpsReports])
 def approve_report_by_ops(request, pk):
-    try:
-        report = StructuredReport.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-            "encounter",
-        ).get(pk=pk)
-    except StructuredReport.DoesNotExist:
-        raise Http404("Report not found.")
-
-    if report.report_status != "submitted_to_ops":
-        return Response(
-            {
-                "detail": f"Only reports submitted to Ops can be approved. Current status: {report.report_status}"
-            },
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    report.report_status = "ops_approved"
-    report.ops_reviewed_at = timezone.now()
-    report.ops_reviewed_by = request.user
-    report.ops_review_note = (request.data.get("note") or "").strip()
-    report.save(
-        update_fields=[
-            "report_status",
-            "ops_reviewed_at",
-            "ops_reviewed_by",
-            "ops_review_note",
-            "updated_at",
-        ]
-    )
-
-    subject, body = _build_manual_payout_email(report)
-
-    send_mail(
-        subject=subject,
-        message=body,
-        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
-        recipient_list=["sentinel.core.founder@gmail.com"],
-        fail_silently=False,
-    )
-
-    report.payout_email_sent_at = timezone.now()
-    report.save(update_fields=["payout_email_sent_at", "updated_at"])
-
-    return Response(
-        {
-            "message": "Report approved by Ops. Manual payout email sent.",
-            "report_id": report.report_id,
-            "report_status": report.report_status,
-            "payout_email_sent_at": report.payout_email_sent_at,
-        },
-        status=status.HTTP_200_OK,
-    )
+    # Compatibility wrapper. The canonical transition lives under /api/ops/.
+    from ops.views import OpsReportApproveView
+    return OpsReportApproveView().post(request, pk)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, CanReviewOpsReports])
 def reject_report_by_ops(request, pk):
-    try:
-        report = StructuredReport.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-            "encounter",
-        ).get(pk=pk)
-    except StructuredReport.DoesNotExist:
-        raise Http404("Report not found.")
-
-    if report.report_status != "submitted_to_ops":
-        return Response(
-            {
-                "detail": f"Only reports submitted to Ops can be rejected. Current status: {report.report_status}"
-            },
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    report.report_status = "ops_rejected"
-    report.ops_reviewed_at = timezone.now()
-    report.ops_reviewed_by = request.user
-    report.ops_review_note = (request.data.get("note") or "").strip()
-    report.save(
-        update_fields=[
-            "report_status",
-            "ops_reviewed_at",
-            "ops_reviewed_by",
-            "ops_review_note",
-            "updated_at",
-        ]
-    )
-
-    return Response(
-        {
-            "message": "Report rejected by Ops.",
-            "report_id": report.report_id,
-            "report_status": report.report_status,
-            "ops_review_note": report.ops_review_note,
-        },
-        status=status.HTTP_200_OK,
-    )
+    # Compatibility wrapper. The canonical transition lives under /api/ops/.
+    from ops.views import OpsReportRejectView
+    return OpsReportRejectView().post(request, pk)
 
 
 class StructuredReportPDFView(APIView):
@@ -815,21 +670,23 @@ class StructuredReportPDFView(APIView):
                 if not org:
                     raise PermissionDenied("You cannot access this report.")
 
-                is_clinic_match = report.patient.assigned_clinic_id == org.id
-                is_hospital_match = report.hospital_referrals.filter(
+                hospital_referral = report.hospital_referrals.filter(
                     source_hospital=org,
-                    report_ready=True,
-                ).exists()
+                ).first()
+                is_hospital_user = getattr(org, "organization_type", "") == "hospital"
+                is_hospital_match = (
+                    is_hospital_user
+                    and is_report_released_to_hospital(report, hospital_referral)
+                )
+                is_clinic_match = (
+                    not is_hospital_user
+                    and report.patient.assigned_clinic_id == org.id
+                )
 
                 if not is_clinic_match and not is_hospital_match:
                     raise PermissionDenied("You cannot access this report.")
 
                 if is_hospital_match:
-                    if report.report_status != "issued":
-                        raise PermissionDenied(
-                            "This report has not been issued to the hospital yet."
-                        )
-
                     now = timezone.now()
                     if not report.hospital_viewed_at:
                         report.hospital_viewed_at = now
@@ -848,13 +705,6 @@ class StructuredReportPDFView(APIView):
                         to_status=report.report_status,
                         note="Hospital opened/downloaded the issued report PDF.",
                         actor=request.user,
-                    )
-                    report.hospital_referrals.filter(
-                        source_hospital=org
-                    ).update(
-                        referral_status="completed",
-                        report_ready=True,
-                        updated_at=now,
                     )
 
         report_format = normalise_report_format(
@@ -883,4 +733,3 @@ class StructuredReportPDFView(APIView):
             f'inline; filename="{report.report_id}-{report_format}.pdf"'
         )
         return response
-

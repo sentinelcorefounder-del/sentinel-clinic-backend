@@ -1,5 +1,9 @@
 from rest_framework import serializers
 from .models import HospitalReferral
+from reports.release_control import (
+    hospital_visible_report_status,
+    is_report_released_to_hospital,
+)
 
 
 class HospitalReferralSerializer(serializers.ModelSerializer):
@@ -55,7 +59,6 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "payment_currency",
             "payment_reference",
             "payment_paid_at",
-            "baserow_row_id",
             "source_system",
             "notes",
             "submitted_by_username",
@@ -64,7 +67,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
         ]
 
     def get_report_status(self, obj):
-        return obj.report.report_status if obj.report_id else "not_created"
+        return hospital_visible_report_status(obj.report, obj)
 
     def get_report_issued_at(self, obj):
         if not obj.report_id or not obj.report.issued_at:
@@ -86,10 +89,12 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "returned_to_clinic": "returned_to_clinic",
             "ops_rejected": "returned_to_clinic",
             "ops_approved": "submitted_to_ops",
-            "issued": "report_issued",
+            "issued": "submitted_to_ops",
         }
 
-        if report.report_status != "issued":
+        released = is_report_released_to_hospital(report, instance)
+
+        if not released:
             data["report_ready"] = False
             data["report_pdf_url"] = ""
             data["referral_status"] = status_map.get(
@@ -97,14 +102,14 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
                 data.get("referral_status", "in_clinic"),
             )
         else:
-            data["report_ready"] = True
+            data["report_ready"] = instance.report_ready
             if instance.referral_status != "completed":
                 data["referral_status"] = "report_issued"
 
         return data
 
     def get_report_pdf_url(self, obj):
-        if not obj.report_id or obj.report.report_status != "issued":
+        if not is_report_released_to_hospital(obj.report, obj):
             return ""
 
         request = self.context.get("request")
