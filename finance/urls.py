@@ -9,6 +9,11 @@ from .views import (
     WalletLedgerEntryViewSet,
     WalletReservationViewSet,
     SettlementBatchViewSet,
+    BankTransferFundingRequestViewSet,
+    ServiceAllowanceViewSet,
+    ServiceAllowanceReservationViewSet,
+    FinanceActionRequestViewSet,
+    FinanceControlAuditViewSet,
 )
 
 router = DefaultRouter()
@@ -20,14 +25,27 @@ router.register("wallets", OrganizationWalletViewSet, basename="finance-wallet")
 router.register("wallet-ledger", WalletLedgerEntryViewSet, basename="finance-wallet-ledger")
 router.register("wallet-reservations", WalletReservationViewSet, basename="finance-wallet-reservation")
 router.register("settlements", SettlementBatchViewSet, basename="finance-settlement")
+router.register("bank-transfer-funding", BankTransferFundingRequestViewSet, basename="finance-bank-transfer-funding")
+router.register("service-allowances", ServiceAllowanceViewSet, basename="finance-service-allowance")
+router.register("allowance-reservations", ServiceAllowanceReservationViewSet, basename="finance-allowance-reservation")
+router.register("action-requests", FinanceActionRequestViewSet, basename="finance-action-request")
+router.register("control-audit", FinanceControlAuditViewSet, basename="finance-control-audit")
 
 urlpatterns = router.urls
 
 from django.urls import path
-from .views import FinanceDashboardSummaryView, PartnerFinanceView, FinanceOrganizationOptionsView
+from .views import (
+    FinanceCapabilitiesView,
+    FinanceDashboardSummaryView,
+    FinanceOrganizationOptionsView,
+    FinanceReconciliationView,
+    PartnerFinanceView,
+)
 
 urlpatterns += [
     path("summary/", FinanceDashboardSummaryView.as_view(), name="finance-summary"),
     path("me/", PartnerFinanceView.as_view(), name="finance-me"),
     path("organization-options/", FinanceOrganizationOptionsView.as_view(), name="finance-organization-options"),
+    path("reconciliation/", FinanceReconciliationView.as_view(), name="finance-reconciliation"),
+    path("capabilities/", FinanceCapabilitiesView.as_view(), name="finance-capabilities"),
 ]

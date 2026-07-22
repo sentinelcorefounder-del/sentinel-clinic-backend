@@ -1,4 +1,5 @@
 from decimal import Decimal
+import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -70,12 +71,23 @@ class PricingRule(TimeStampedModel):
     effective_from = models.DateField()
     effective_to = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True, default="")
+    version = models.PositiveIntegerField(default=1)
+    supersedes = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="superseded_by",
+    )
 
     class Meta:
         ordering = ["priority", "-effective_from", "name"]
         indexes = [
             models.Index(fields=["contract", "is_active", "service_type"]),
             models.Index(fields=["source_type", "workflow_route"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["contract", "name", "version"],
+                name="fin_unique_pricing_rule_version",
+            )
         ]
 
     def clean(self):
@@ -89,6 +101,10 @@ class PricingRule(TimeStampedModel):
             and self.max_monthly_volume < self.min_monthly_volume
         ):
             raise ValidationError({"max_monthly_volume": "Maximum volume cannot be below minimum volume."})
+        if self.supersedes_id and self.supersedes_id == self.id:
+            raise ValidationError({"supersedes": "A pricing rule cannot supersede itself."})
+        if self.supersedes_id and self.supersedes.contract_id != self.contract_id:
+            raise ValidationError({"supersedes": "A pricing rule can only supersede a rule in the same contract."})
 
     def __str__(self):
         return self.name
@@ -107,6 +123,11 @@ class AllocationRule(TimeStampedModel):
         FIXED = "fixed", "Fixed amount"
         PERCENTAGE = "percentage", "Percentage"
 
+    class BeneficiarySource(models.TextChoices):
+        FIXED = "fixed", "Fixed organisation"
+        REFERRING_HOSPITAL = "referring_hospital", "Encounter referring hospital"
+        TESTING_CLINIC = "testing_clinic", "Encounter testing clinic"
+
     pricing_rule = models.ForeignKey(
         PricingRule,
         on_delete=models.CASCADE,
@@ -120,6 +141,12 @@ class AllocationRule(TimeStampedModel):
         blank=True,
         related_name="finance_allocation_rules",
     )
+    beneficiary_source = models.CharField(
+        max_length=30,
+        choices=BeneficiarySource.choices,
+        default=BeneficiarySource.FIXED,
+        help_text="How the beneficiary is resolved when an encounter is priced.",
+    )
     label = models.CharField(max_length=120, blank=True, default="")
     calculation_type = models.CharField(max_length=20, choices=CalculationType.choices)
     fixed_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
@@ -131,6 +158,10 @@ class AllocationRule(TimeStampedModel):
         ordering = ["priority", "id"]
 
     def clean(self):
+        if self.beneficiary_source != self.BeneficiarySource.FIXED and self.beneficiary_organization_id:
+            raise ValidationError(
+                {"beneficiary_organization": "A dynamic beneficiary cannot also have a fixed organisation."}
+            )
         if self.calculation_type == self.CalculationType.FIXED:
             if self.fixed_amount is None:
                 raise ValidationError({"fixed_amount": "A fixed allocation requires fixed_amount."})
@@ -158,6 +189,32 @@ class AllocationRule(TimeStampedModel):
 
 
 class EncounterFinancialRecord(TimeStampedModel):
+    class ServicePathway(models.TextChoices):
+        HOSPITAL_REFERRED = "hospital_referred", "Hospital referred"
+        CLINIC_DIRECT = "clinic_direct", "Clinic direct"
+
+    class PayerType(models.TextChoices):
+        PATIENT = "patient", "Patient"
+        ORGANIZATION = "organization", "Hospital or clinic"
+        PROGRAMME = "programme", "Programme sponsor"
+        WAIVED = "waived", "Waived"
+
+    class CollectorType(models.TextChoices):
+        SENTINEL = "sentinel", "Sentinel"
+        HOSPITAL = "hospital", "Hospital"
+        CLINIC = "clinic", "Clinic"
+        PROGRAMME = "programme", "Programme sponsor"
+        NONE = "none", "No collector"
+
+    class PaymentMethod(models.TextChoices):
+        UNSET = "unset", "Not selected"
+        PAYSTACK = "paystack", "Paystack"
+        WALLET = "wallet", "Prefunded wallet"
+        BANK_TRANSFER = "bank_transfer", "Approved bank transfer"
+        POS = "pos", "Sentinel POS"
+        AUTHORIZED_CREDIT = "authorized_credit", "Authorised credit"
+        WAIVED = "waived", "Waived"
+
     class Status(models.TextChoices):
         UNPRICED = "unpriced", "Unpriced"
         PRICED = "priced", "Priced"
@@ -184,6 +241,34 @@ class EncounterFinancialRecord(TimeStampedModel):
         blank=True,
         related_name="payer_financial_records",
         help_text="Organisation financially responsible for this encounter.",
+    )
+    collecting_organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="collected_financial_records",
+        help_text="Partner organisation that collected the patient's money, if any.",
+    )
+    service_pathway = models.CharField(
+        max_length=30,
+        choices=ServicePathway.choices,
+        default=ServicePathway.HOSPITAL_REFERRED,
+    )
+    payer_type = models.CharField(
+        max_length=20,
+        choices=PayerType.choices,
+        default=PayerType.ORGANIZATION,
+    )
+    collector_type = models.CharField(
+        max_length=20,
+        choices=CollectorType.choices,
+        default=CollectorType.NONE,
+    )
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.UNSET,
     )
     contract = models.ForeignKey(
         PartnerContract,
@@ -224,6 +309,13 @@ class EncounterFinancialRecord(TimeStampedModel):
 
 
 class EncounterAllocation(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING_SERVICE = "pending_service", "Pending service"
+        EARNED = "earned", "Earned"
+        SETTLEMENT_PENDING = "settlement_pending", "Settlement pending"
+        SETTLED = "settled", "Settled"
+        REVERSED = "reversed", "Reversed"
+
     financial_record = models.ForeignKey(
         EncounterFinancialRecord,
         on_delete=models.CASCADE,
@@ -244,13 +336,29 @@ class EncounterAllocation(TimeStampedModel):
         blank=True,
         related_name="encounter_allocations",
     )
+    beneficiary_source = models.CharField(
+        max_length=30,
+        choices=AllocationRule.BeneficiarySource.choices,
+        default=AllocationRule.BeneficiarySource.FIXED,
+    )
     label = models.CharField(max_length=120, blank=True, default="")
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3, default="NGN")
     rule_snapshot = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.PENDING_SERVICE)
+    earned_at = models.DateTimeField(null=True, blank=True)
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["id"]
+        indexes = [
+            models.Index(
+                fields=["beneficiary_organization", "status"],
+                name="fin_alloc_benef_status_idx",
+            ),
+            models.Index(fields=["status", "created_at"], name="fin_alloc_status_created_idx"),
+        ]
 
 
 class FinancialAuditLog(models.Model):
@@ -274,6 +382,14 @@ class FinancialAuditLog(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Financial audit records are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Financial audit records are immutable.")
 
 
 class OrganizationWallet(TimeStampedModel):
@@ -314,6 +430,104 @@ class OrganizationWallet(TimeStampedModel):
 
     def __str__(self):
         return f"{self.organization.name} wallet ({self.currency})"
+
+
+class ServiceAllowance(TimeStampedModel):
+    """A controlled authority to deliver services before cash funding arrives."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        ACTIVE = "active", "Active"
+        SUSPENDED = "suspended", "Suspended"
+        EXHAUSTED = "exhausted", "Exhausted"
+        EXPIRED = "expired", "Expired"
+        REVOKED = "revoked", "Revoked"
+
+    organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="service_allowances",
+    )
+    contract = models.ForeignKey(
+        PartnerContract, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="service_allowances",
+    )
+    name = models.CharField(max_length=255)
+    currency = models.CharField(max_length=3, default="NGN")
+    monetary_limit = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    patient_limit = models.PositiveIntegerField(null=True, blank=True)
+    valid_from = models.DateField()
+    expires_at = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="approved_service_allowances",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["organization", "status"], name="fin_allow_org_status_idx"),
+            models.Index(fields=["status", "expires_at"], name="fin_allow_status_exp_idx"),
+        ]
+
+    def clean(self):
+        if self.monetary_limit is None and self.patient_limit is None:
+            raise ValidationError("An allowance requires a monetary limit, a patient limit, or both.")
+        if self.monetary_limit is not None and self.monetary_limit <= 0:
+            raise ValidationError({"monetary_limit": "Monetary limit must be greater than zero."})
+        if self.patient_limit is not None and self.patient_limit <= 0:
+            raise ValidationError({"patient_limit": "Patient limit must be greater than zero."})
+        if self.contract_id and self.contract.organization_id != self.organization_id:
+            raise ValidationError({"contract": "Contract and allowance organisation must match."})
+
+    @property
+    def reserved_amount(self):
+        return self.reservations.filter(status=ServiceAllowanceReservation.Status.ACTIVE).aggregate(
+            total=models.Sum("amount")
+        )["total"] or Decimal("0.00")
+
+    @property
+    def reserved_patients(self):
+        return self.reservations.filter(status=ServiceAllowanceReservation.Status.ACTIVE).count()
+
+    def __str__(self):
+        return f"{self.organization.name} - {self.name}"
+
+
+class ServiceAllowanceReservation(TimeStampedModel):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        FUNDED = "funded", "Replaced by genuine funding"
+        RELEASED = "released", "Released"
+
+    allowance = models.ForeignKey(ServiceAllowance, on_delete=models.PROTECT, related_name="reservations")
+    financial_record = models.OneToOneField(
+        EncounterFinancialRecord, on_delete=models.PROTECT, related_name="allowance_reservation"
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
+    reserved_at = models.DateTimeField(auto_now_add=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="service_allowance_reservations",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["allowance", "status"], name="fin_allow_res_status_idx")]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Reserved amount must be greater than zero."})
+        if self.allowance_id and self.currency != self.allowance.currency:
+            raise ValidationError({"currency": "Reservation currency must match the allowance."})
+
+    def __str__(self):
+        return f"Allowance reservation {self.pk}"
 
 
 class WalletReservation(TimeStampedModel):
@@ -456,6 +670,107 @@ class WalletLedgerEntry(models.Model):
         return f"{self.get_entry_type_display()} - {self.wallet}"
 
 
+def bank_transfer_proof_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/bank-transfer-proofs/{instance.request_reference}/{uuid.uuid4().hex}.{suffix}"
+
+
+def bank_transfer_request_reference():
+    return f"SEN-BT-{uuid.uuid4().hex[:12].upper()}"
+
+
+class BankTransferFundingRequest(TimeStampedModel):
+    class Status(models.TextChoices):
+        AWAITING_TRANSFER = "awaiting_transfer", "Awaiting transfer"
+        PROOF_SUBMITTED = "proof_submitted", "Proof submitted"
+        UNDER_VERIFICATION = "under_verification", "Under verification"
+        VERIFIED = "verified", "Verified"
+        CREDITED = "credited", "Credited"
+        UNDERPAID = "underpaid", "Underpaid"
+        OVERPAID = "overpaid", "Overpaid"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+        REVERSED = "reversed", "Reversed"
+
+    wallet = models.ForeignKey(
+        OrganizationWallet,
+        on_delete=models.PROTECT,
+        related_name="bank_transfer_funding_requests",
+    )
+    request_reference = models.CharField(
+        max_length=32,
+        unique=True,
+        default=bank_transfer_request_reference,
+        editable=False,
+    )
+    requested_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    received_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=30, choices=Status.choices, default=Status.AWAITING_TRANSFER)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    proof = models.FileField(upload_to=bank_transfer_proof_path, null=True, blank=True)
+    proof_submitted_at = models.DateTimeField(null=True, blank=True)
+    bank_transaction_reference = models.CharField(max_length=120, blank=True, default="")
+    value_date = models.DateField(null=True, blank=True)
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="requested_bank_transfer_funding",
+    )
+    verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="verified_bank_transfer_funding",
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_bank_transfer_funding",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    ledger_entry = models.OneToOneField(
+        WalletLedgerEntry,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="bank_transfer_funding_request",
+    )
+    notes = models.TextField(blank=True, default="")
+    rejection_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["wallet", "status"], name="fin_bank_wallet_status_idx"),
+            models.Index(fields=["status", "created_at"], name="fin_bank_status_created_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bank_transaction_reference"],
+                condition=~models.Q(bank_transaction_reference=""),
+                name="fin_unique_bank_transaction_ref",
+            )
+        ]
+
+    def clean(self):
+        if self.requested_amount <= 0:
+            raise ValidationError({"requested_amount": "Requested amount must be greater than zero."})
+        if self.received_amount is not None and self.received_amount <= 0:
+            raise ValidationError({"received_amount": "Received amount must be greater than zero."})
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Funding currency must match the wallet currency."})
+
+    def __str__(self):
+        return f"{self.request_reference} - {self.wallet}"
+
+
 class SettlementBatch(TimeStampedModel):
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
@@ -474,7 +789,12 @@ class SettlementBatch(TimeStampedModel):
     period_end = models.DateField()
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     external_reference = models.CharField(max_length=120, blank=True, default="")
+    payment_evidence = models.FileField(upload_to="finance/settlements/%Y/%m/", null=True, blank=True)
     notes = models.TextField(blank=True, default="")
+    prepared_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="prepared_finance_settlements",
+    )
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -484,11 +804,28 @@ class SettlementBatch(TimeStampedModel):
     )
     approved_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="paid_finance_settlements",
+    )
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="cancelled_finance_settlements",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ["-period_end", "-created_at"]
         indexes = [
             models.Index(fields=["beneficiary_organization", "status"], name="fin_set_org_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_reference"],
+                condition=~models.Q(external_reference=""),
+                name="fin_unique_settlement_external_ref",
+            )
         ]
 
     def clean(self):
@@ -505,10 +842,10 @@ class SettlementItem(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="items",
     )
-    allocation = models.OneToOneField(
+    allocation = models.ForeignKey(
         EncounterAllocation,
         on_delete=models.PROTECT,
-        related_name="settlement_item",
+        related_name="settlement_items",
     )
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3, default="NGN")
@@ -524,3 +861,119 @@ class SettlementItem(TimeStampedModel):
 
     def __str__(self):
         return f"Settlement item {self.id or 'new'} - {self.amount} {self.currency}"
+
+
+def finance_action_evidence_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/action-evidence/{instance.idempotency_key}/{uuid.uuid4().hex}.{suffix}"
+
+
+class FinanceActionRequest(TimeStampedModel):
+    """Maker-checker request for any compensating wallet correction."""
+
+    class ActionType(models.TextChoices):
+        REFUND = "refund", "Refund"
+        REVERSAL = "reversal", "Reversal"
+        ADJUSTMENT = "adjustment", "Adjustment"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending approval"
+        APPROVED = "approved", "Approved and posted"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled"
+
+    action_type = models.CharField(max_length=20, choices=ActionType.choices)
+    wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, related_name="finance_action_requests"
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="finance_action_requests",
+    )
+    related_entry = models.ForeignKey(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="finance_action_requests",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    reason = models.TextField()
+    external_reference = models.CharField(max_length=120)
+    evidence = models.FileField(upload_to=finance_action_evidence_path, null=True, blank=True)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="requested_finance_actions",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="decided_finance_actions",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+    posted_entry = models.OneToOneField(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="approved_finance_action",
+    )
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status", "action_type"], name="fin_action_status_type_idx"),
+            models.Index(fields=["wallet", "status"], name="fin_action_wallet_status_idx"),
+        ]
+
+    def clean(self):
+        if self.amount == 0:
+            raise ValidationError({"amount": "Amount cannot be zero."})
+        if self.action_type in {self.ActionType.REFUND, self.ActionType.REVERSAL} and self.amount < 0:
+            raise ValidationError({"amount": "Refund and reversal amounts must be positive."})
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Currency must match the wallet."})
+        if not self.reason.strip():
+            raise ValidationError({"reason": "A reason is required."})
+        if not self.external_reference.strip():
+            raise ValidationError({"external_reference": "An external reference is required."})
+        if self.related_entry_id and self.related_entry.wallet_id != self.wallet_id:
+            raise ValidationError({"related_entry": "Related entry must belong to the same wallet."})
+
+
+class FinanceControlAudit(models.Model):
+    """Append-only audit record for sensitive finance control activity."""
+
+    action = models.CharField(max_length=80)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="finance_control_audits",
+    )
+    wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    action_request = models.ForeignKey(
+        FinanceActionRequest, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="audit_entries",
+    )
+    settlement_batch = models.ForeignKey(
+        SettlementBatch, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="control_audits",
+    )
+    before_state = models.JSONField(default=dict, blank=True)
+    after_state = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Finance control audit records are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Finance control audit records are immutable.")

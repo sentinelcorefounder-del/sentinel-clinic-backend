@@ -8,6 +8,9 @@ from rest_framework.response import Response
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
     OrganizationWallet, WalletLedgerEntry, WalletReservation, SettlementBatch,
+    BankTransferFundingRequest,
+    ServiceAllowance, ServiceAllowanceReservation,
+    FinanceActionRequest, FinanceControlAudit,
 )
 from .serializers import (
     AllocationRuleSerializer,
@@ -15,13 +18,21 @@ from .serializers import (
     PartnerContractSerializer,
     PricingRuleSerializer,
     OrganizationWalletSerializer, WalletLedgerEntrySerializer, WalletReservationSerializer, SettlementBatchSerializer,
+    BankTransferFundingRequestSerializer,
+    ServiceAllowanceSerializer, ServiceAllowanceReservationSerializer,
+    FinanceActionRequestSerializer, FinanceControlAuditSerializer,
 )
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
     reserve_financial_record_from_originating_wallet, capture_financial_record_wallet_reservation,
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
+    cancel_settlement_batch,
     sync_encounter_finance_lifecycle,
+    submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer, reject_bank_transfer,
+    approve_service_allowance,
+    create_finance_action_request, approve_finance_action_request,
+    reject_finance_action_request, reconcile_finance_controls,
 )
 
 
@@ -40,8 +51,47 @@ class IsSentinelFinanceOps(BasePermission):
         return user.groups.filter(name__in=self.allowed_groups).exists()
 
 
+class FinanceRolePermission(BasePermission):
+    role_groups = {
+        "viewer": {"finance_viewer", "finance_operator", "finance_approver", "finance_admin",
+                   "ops_admin", "sentinel_ops", "super_admin", "finance_tester"},
+        "operator": {"finance_operator", "finance_admin", "super_admin", "finance_tester"},
+        "approver": {"finance_approver", "finance_admin", "super_admin", "finance_tester"},
+        "admin": {"finance_admin", "super_admin", "finance_tester"},
+    }
+    required_role = "viewer"
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser:
+            return True
+        return user.groups.filter(name__in=self.role_groups[self.required_role]).exists()
+
+
+class IsFinanceViewer(FinanceRolePermission):
+    required_role = "viewer"
+
+
+class IsFinanceOperator(FinanceRolePermission):
+    required_role = "operator"
+
+
+class IsFinanceApprover(FinanceRolePermission):
+    required_role = "approver"
+
+
+class IsFinanceAdministrator(FinanceRolePermission):
+    required_role = "admin"
+
+
 class FinanceAdminViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceAdministrator]
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
 
 
 class PartnerContractViewSet(FinanceAdminViewSet):
@@ -61,8 +111,41 @@ class AllocationRuleViewSet(FinanceAdminViewSet):
     serializer_class = AllocationRuleSerializer
 
 
-class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
+class ServiceAllowanceViewSet(FinanceAdminViewSet):
+    serializer_class = ServiceAllowanceSerializer
+    queryset = ServiceAllowance.objects.select_related(
+        "organization", "contract", "approved_by"
+    ).all()
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action == "approve":
+            role = IsFinanceApprover
+        else:
+            role = IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            allowance = approve_service_allowance(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(allowance).data)
+
+
+class ServiceAllowanceReservationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    serializer_class = ServiceAllowanceReservationSerializer
+    queryset = ServiceAllowanceReservation.objects.select_related(
+        "allowance", "allowance__organization", "financial_record",
+        "financial_record__encounter", "actor",
+    ).all()
+
+
+class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = EncounterFinancialRecordSerializer
     queryset = EncounterFinancialRecord.objects.select_related(
         "encounter",
@@ -70,6 +153,10 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
         "contract",
         "pricing_rule",
     ).prefetch_related("allocations", "allocations__beneficiary_organization")
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        return [IsAuthenticated(), role()]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -134,6 +221,15 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
     queryset = OrganizationWallet.objects.select_related("organization").all()
     serializer_class = OrganizationWalletSerializer
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action in {"top_up", "reserve"}:
+            role = IsFinanceOperator
+        else:
+            role = IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
     @action(detail=True, methods=["post"], url_path="top-up")
     def top_up(self, request, pk=None):
         wallet = self.get_object()
@@ -154,45 +250,17 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
 
     @action(detail=True, methods=["post"])
     def adjust(self, request, pk=None):
-        wallet = self.get_object()
-        try:
-            entry = adjust_wallet(
-                wallet=wallet,
-                available_delta=request.data.get("available_delta"),
-                idempotency_key=request.data.get("idempotency_key", ""),
-                actor=request.user,
-                reference=request.data.get("reference", ""),
-                description=request.data.get("description", ""),
-                metadata=request.data.get("metadata") or {},
-            )
-        except (DjangoValidationError, ValueError, TypeError) as exc:
-            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
-            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(WalletLedgerEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
+        return Response(
+            {"detail": "Direct wallet adjustment is disabled. Create a finance action request."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     @action(detail=True, methods=["post"])
     def refund(self, request, pk=None):
-        wallet = self.get_object()
-        record = None
-        record_id = request.data.get("financial_record_id")
-        if record_id:
-            try:
-                record = EncounterFinancialRecord.objects.get(pk=record_id)
-            except EncounterFinancialRecord.DoesNotExist:
-                return Response({"detail": "Financial record not found."}, status=status.HTTP_404_NOT_FOUND)
-        try:
-            entry = refund_to_wallet(
-                wallet=wallet,
-                amount=request.data.get("amount"),
-                idempotency_key=request.data.get("idempotency_key", ""),
-                financial_record=record,
-                actor=request.user,
-                reference=request.data.get("reference", ""),
-            )
-        except (DjangoValidationError, ValueError, TypeError) as exc:
-            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
-            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(WalletLedgerEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
+        return Response(
+            {"detail": "Direct refund is disabled. Create a finance action request."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     @action(detail=True, methods=["post"])
     def reserve(self, request, pk=None):
@@ -216,7 +284,7 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
 
 
 class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = WalletLedgerEntrySerializer
     queryset = WalletLedgerEntry.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "reservation", "actor"
@@ -224,11 +292,15 @@ class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = WalletReservationSerializer
     queryset = WalletReservation.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "financial_record__encounter"
     ).all()
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        return [IsAuthenticated(), role()]
 
     @action(detail=True, methods=["post"])
     def capture(self, request, pk=None):
@@ -263,11 +335,110 @@ class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(self.get_serializer(reservation).data)
 
 
+class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
+    serializer_class = BankTransferFundingRequestSerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+    queryset = BankTransferFundingRequest.objects.select_related(
+        "wallet", "wallet__organization", "requester", "verified_by", "approved_by", "ledger_entry"
+    ).all()
+
+    def _is_finance_ops(self):
+        return IsSentinelFinanceOps().has_permission(self.request, self)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self._is_finance_ops():
+            status_value = (self.request.query_params.get("status") or "").strip()
+            return queryset.filter(status=status_value) if status_value else queryset
+        organization = get_user_organization(self.request.user)
+        return queryset.filter(wallet__organization=organization) if organization else queryset.none()
+
+    def perform_create(self, serializer):
+        wallet = serializer.validated_data["wallet"]
+        if not self._is_finance_ops():
+            organization = get_user_organization(self.request.user)
+            if organization is None or wallet.organization_id != organization.id:
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("You can only request funding for your own organisation.")
+        instance = serializer.save(requester=self.request.user, currency=wallet.currency)
+        instance.full_clean()
+        instance.save()
+
+    @action(detail=True, methods=["post"], url_path="submit-proof")
+    def submit_proof(self, request, pk=None):
+        try:
+            funding_request = submit_bank_transfer_proof(
+                self.get_object(), request.FILES.get("proof"), actor=request.user
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    def _require_finance_ops(self):
+        if not self._is_finance_ops():
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Sentinel Finance permission is required.")
+
+    def _require_finance_role(self, permission_class):
+        if not permission_class().has_permission(self.request, self):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("The required Sentinel Finance role is not assigned.")
+
+    @action(detail=True, methods=["post"])
+    def verify(self, request, pk=None):
+        self._require_finance_role(IsFinanceOperator)
+        try:
+            funding_request = verify_bank_transfer(
+                self.get_object(),
+                received_amount=request.data.get("received_amount"),
+                bank_transaction_reference=request.data.get("bank_transaction_reference"),
+                value_date=parse_date(request.data.get("value_date", "")),
+                actor=request.user,
+                notes=request.data.get("notes", ""),
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        self._require_finance_role(IsFinanceApprover)
+        try:
+            funding_request = approve_bank_transfer(self.get_object(), actor=request.user)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        self._require_finance_role(IsFinanceApprover)
+        try:
+            funding_request = reject_bank_transfer(
+                self.get_object(), reason=request.data.get("reason"), actor=request.user
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(funding_request).data)
+
 class SettlementBatchViewSet(FinanceAdminViewSet):
     serializer_class = SettlementBatchSerializer
     queryset = SettlementBatch.objects.select_related(
         "beneficiary_organization", "approved_by"
     ).prefetch_related("items", "items__allocation", "items__allocation__financial_record")
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action in {"approve", "mark_paid"}:
+            role = IsFinanceApprover
+        else:
+            role = IsFinanceOperator
+        return [IsAuthenticated(), role()]
 
     def create(self, request, *args, **kwargs):
         try:
@@ -302,6 +473,17 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
                 self.get_object(),
                 external_reference=request.data.get("external_reference", ""),
                 actor=request.user,
+                payment_evidence=request.FILES.get("payment_evidence"),
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(batch).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        try:
+            batch = cancel_settlement_batch(
+                self.get_object(), reason=request.data.get("reason", ""), actor=request.user
             )
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
@@ -333,7 +515,7 @@ def _active_contract_for(organization):
 
 
 class FinanceDashboardSummaryView(APIView):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
 
     def get(self, request):
         wallet_totals = WalletLedgerEntry.objects.aggregate(
@@ -386,7 +568,7 @@ class PartnerFinanceView(APIView):
 
 
 class FinanceOrganizationOptionsView(APIView):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
 
     def get(self, request):
         organizations = Organization.objects.filter(is_active=True).order_by("name")
@@ -399,3 +581,95 @@ class FinanceOrganizationOptionsView(APIView):
             }
             for organization in organizations
         ])
+
+
+class FinanceActionRequestViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = FinanceActionRequestSerializer
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+    queryset = FinanceActionRequest.objects.select_related(
+        "wallet", "wallet__organization", "financial_record", "related_entry",
+        "requested_by", "decided_by", "posted_entry",
+    ).all()
+
+    def get_permissions(self):
+        role = IsFinanceViewer
+        if self.action == "create":
+            role = IsFinanceOperator
+        elif self.action in {"approve", "reject"}:
+            role = IsFinanceApprover
+        return [IsAuthenticated(), role()]
+
+    def create(self, request, *args, **kwargs):
+        try:
+            wallet = OrganizationWallet.objects.get(pk=request.data.get("wallet"))
+            record = EncounterFinancialRecord.objects.filter(
+                pk=request.data.get("financial_record")
+            ).first()
+            related_entry = WalletLedgerEntry.objects.filter(pk=request.data.get("related_entry")).first()
+            action_request = create_finance_action_request(
+                action_type=request.data.get("action_type"), wallet=wallet,
+                amount=request.data.get("amount"), reason=request.data.get("reason"),
+                external_reference=request.data.get("external_reference"),
+                idempotency_key=request.data.get("idempotency_key"), requested_by=request.user,
+                financial_record=record, related_entry=related_entry,
+                evidence=request.FILES.get("evidence"),
+            )
+        except OrganizationWallet.DoesNotExist:
+            return Response({"detail": "Wallet not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(action_request).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            action_request = approve_finance_action_request(self.get_object(), decided_by=request.user)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(action_request).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        try:
+            action_request = reject_finance_action_request(
+                self.get_object(), decided_by=request.user, reason=request.data.get("reason")
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(action_request).data)
+
+
+class FinanceControlAuditViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = FinanceControlAuditSerializer
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+    queryset = FinanceControlAudit.objects.select_related(
+        "actor", "wallet", "financial_record", "action_request", "settlement_batch"
+    ).all()
+
+
+class FinanceReconciliationView(APIView):
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+
+    def get(self, request):
+        return Response(reconcile_finance_controls())
+
+
+class FinanceCapabilitiesView(APIView):
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+
+    def get(self, request):
+        def allowed(permission):
+            return permission().has_permission(request, self)
+
+        return Response({
+            "can_view": True,
+            "can_operate": allowed(IsFinanceOperator),
+            "can_approve": allowed(IsFinanceApprover),
+            "can_administer": allowed(IsFinanceAdministrator),
+            "can_request_corrections": allowed(IsFinanceOperator),
+            "can_decide_corrections": allowed(IsFinanceApprover),
+            "can_prepare_settlements": allowed(IsFinanceOperator),
+            "can_approve_settlements": allowed(IsFinanceApprover),
+            "can_configure_pricing": allowed(IsFinanceAdministrator),
+        })

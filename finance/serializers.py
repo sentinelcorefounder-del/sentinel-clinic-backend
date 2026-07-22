@@ -11,6 +11,11 @@ from .models import (
     WalletReservation,
     SettlementBatch,
     SettlementItem,
+    BankTransferFundingRequest,
+    ServiceAllowance,
+    ServiceAllowanceReservation,
+    FinanceActionRequest,
+    FinanceControlAudit,
 )
 
 
@@ -20,6 +25,13 @@ class AllocationRuleSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
 
+    def update(self, instance, validated_data):
+        if instance.generated_allocations.exists():
+            raise serializers.ValidationError(
+                "This allocation rule has historical transactions. Create a new pricing-rule version instead."
+            )
+        return super().update(instance, validated_data)
+
 
 class PricingRuleSerializer(serializers.ModelSerializer):
     allocation_rules = AllocationRuleSerializer(many=True, read_only=True)
@@ -28,6 +40,20 @@ class PricingRuleSerializer(serializers.ModelSerializer):
         model = PricingRule
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
+
+    def validate(self, attrs):
+        contract = attrs.get("contract", getattr(self.instance, "contract", None))
+        supersedes = attrs.get("supersedes", getattr(self.instance, "supersedes", None))
+        if supersedes and contract and supersedes.contract_id != contract.id:
+            raise serializers.ValidationError({"supersedes": "Must belong to the same contract."})
+        return attrs
+
+    def update(self, instance, validated_data):
+        if instance.financial_records.exists():
+            raise serializers.ValidationError(
+                "This pricing rule has historical transactions. Create a new version instead."
+            )
+        return super().update(instance, validated_data)
 
 
 class PartnerContractSerializer(serializers.ModelSerializer):
@@ -49,8 +75,9 @@ class EncounterAllocationSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             "id", "financial_record", "allocation_rule", "beneficiary_role",
-            "beneficiary_organization", "label", "amount", "currency",
-            "rule_snapshot", "created_at", "updated_at",
+            "beneficiary_organization", "beneficiary_source", "label", "amount", "currency",
+            "rule_snapshot", "status", "earned_at", "reversed_at", "settled_at",
+            "created_at", "updated_at",
         )
 
 
@@ -77,6 +104,8 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             "id", "encounter", "contract", "pricing_rule", "status", "currency",
+            "service_pathway", "payer_type", "payer_organization", "collector_type",
+            "collecting_organization", "payment_method",
             "gross_amount", "allocated_amount", "outstanding_amount",
             "financially_releasable", "pricing_snapshot", "exception_reason",
             "priced_at", "secured_at", "captured_at", "settled_at",
@@ -137,9 +166,65 @@ class SettlementBatchSerializer(serializers.ModelSerializer):
         model = SettlementBatch
         fields = "__all__"
         read_only_fields = (
-            "status", "total_amount", "approved_by", "approved_at", "paid_at",
+            "status", "total_amount", "external_reference", "payment_evidence",
+            "prepared_by", "approved_by", "approved_at", "paid_by", "paid_at", "cancelled_by",
+            "cancelled_at", "cancellation_reason",
             "created_at", "updated_at",
         )
+
+
+class BankTransferFundingRequestSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+
+    class Meta:
+        model = BankTransferFundingRequest
+        fields = "__all__"
+        read_only_fields = (
+            "request_reference", "status", "received_amount", "currency", "proof", "proof_submitted_at",
+            "bank_transaction_reference", "value_date", "requester", "verified_by",
+            "verified_at", "approved_by", "approved_at", "ledger_entry",
+            "rejection_reason", "created_at", "updated_at",
+        )
+
+    def validate_requested_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Requested amount must be greater than zero.")
+        return value
+
+
+class ServiceAllowanceSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="organization.name", read_only=True)
+    reserved_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    reserved_patients = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ServiceAllowance
+        fields = "__all__"
+        read_only_fields = ("status", "approved_by", "approved_at", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        monetary_limit = attrs.get("monetary_limit", getattr(self.instance, "monetary_limit", None))
+        patient_limit = attrs.get("patient_limit", getattr(self.instance, "patient_limit", None))
+        if monetary_limit is None and patient_limit is None:
+            raise serializers.ValidationError("Provide a monetary limit, a patient limit, or both.")
+        if monetary_limit is not None and monetary_limit <= 0:
+            raise serializers.ValidationError({"monetary_limit": "Must be greater than zero."})
+        if patient_limit is not None and patient_limit <= 0:
+            raise serializers.ValidationError({"patient_limit": "Must be greater than zero."})
+        organization = attrs.get("organization", getattr(self.instance, "organization", None))
+        contract = attrs.get("contract", getattr(self.instance, "contract", None))
+        if contract and organization and contract.organization_id != organization.id:
+            raise serializers.ValidationError({"contract": "Contract and allowance organisation must match."})
+        return attrs
+
+
+class ServiceAllowanceReservationSerializer(serializers.ModelSerializer):
+    encounter_id = serializers.CharField(source="financial_record.encounter.encounter_id", read_only=True)
+
+    class Meta:
+        model = ServiceAllowanceReservation
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in ServiceAllowanceReservation._meta.fields)
 
 
 class PartnerFinanceSummarySerializer(serializers.Serializer):
@@ -151,3 +236,26 @@ class PartnerFinanceSummarySerializer(serializers.Serializer):
     active_pricing_rules = PricingRuleSerializer(many=True)
     recent_ledger = WalletLedgerEntrySerializer(many=True)
     recent_financial_records = EncounterFinancialRecordSerializer(many=True)
+
+
+class FinanceActionRequestSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+    requested_by_username = serializers.CharField(source="requested_by.username", read_only=True)
+    decided_by_username = serializers.CharField(source="decided_by.username", read_only=True)
+
+    class Meta:
+        model = FinanceActionRequest
+        fields = "__all__"
+        read_only_fields = (
+            "currency", "status", "requested_by", "decided_by", "decided_at",
+            "decision_reason", "posted_entry", "created_at", "updated_at",
+        )
+
+
+class FinanceControlAuditSerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = FinanceControlAudit
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in FinanceControlAudit._meta.fields)
