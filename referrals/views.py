@@ -1,3 +1,4 @@
+import logging
 
 from django.utils import timezone
 from django.db.models import Q, Max
@@ -11,11 +12,20 @@ from common.tenant import get_user_organization
 from organizations.models import Organization
 from patients.models import Patient
 from reports.models import StructuredReport, ReportStatusEvent
+from reports.release_control import (
+    hospital_released_referral_q,
+    hospital_visible_referral_status,
+    hospital_visible_report_status,
+    is_report_released_to_hospital,
+)
 from .models import HospitalReferral, generate_referral_id
 from .permissions import IsHospitalUser
 from .serializers import HospitalReferralSerializer
 from .submit_serializers import HospitalReferralSubmitSerializer
 from .sync_serializers import HospitalReferralStatusSyncSerializer
+
+
+logger = logging.getLogger(__name__)
 
 
 class HospitalScopedMixin:
@@ -59,7 +69,10 @@ class HospitalReferralDetailView(HospitalReferralQuerysetMixin, generics.Retriev
         referral = self.get_object()
         report = referral.report
 
-        if report and report.report_status == "issued" and not report.hospital_viewed_at:
+        if (
+            is_report_released_to_hospital(report, referral)
+            and not report.hospital_viewed_at
+        ):
             report.hospital_viewed_at = timezone.now()
             report.save(update_fields=["hospital_viewed_at", "updated_at"])
             ReportStatusEvent.objects.create(
@@ -91,10 +104,7 @@ class HospitalIssuedReportListView(APIView):
             "matched_clinic",
             "report",
             "source_hospital",
-        ).filter(
-            report__report_status="issued",
-            report_ready=True,
-        )
+        ).filter(hospital_released_referral_q())
 
         if not request.user.is_superuser:
             referrals = referrals.filter(source_hospital=org)
@@ -145,11 +155,7 @@ class HospitalIssuedReportDetailView(APIView):
             "matched_clinic",
             "report",
             "source_hospital",
-        ).filter(
-            report_id=pk,
-            report__report_status="issued",
-            report_ready=True,
-        )
+        ).filter(hospital_released_referral_q(), report_id=pk)
 
         if not request.user.is_superuser:
             if not org:
@@ -267,10 +273,7 @@ class HospitalPatientListView(APIView):
 
         if referral_status and referral_status != "all":
             if referral_status == "report_ready":
-                referrals = referrals.filter(
-                    report__report_status="issued",
-                    report_ready=True,
-                )
+                referrals = referrals.filter(hospital_released_referral_q())
             else:
                 referrals = referrals.filter(referral_status=referral_status)
 
@@ -300,7 +303,7 @@ class HospitalPatientListView(APIView):
                     "hospital_mrn": referral.hospital_mrn,
                     "referral_pk": referral.id,
                     "referral_id": referral.referral_id,
-                    "referral_status": referral.referral_status,
+                    "referral_status": hospital_visible_referral_status(referral),
                     "clinic_name": (
                         referral.matched_clinic.name
                         if referral.matched_clinic
@@ -309,11 +312,9 @@ class HospitalPatientListView(APIView):
                     "payment_status": payment.status if payment else "not_created",
                     "report_pk": report.id if report else None,
                     "report_id": report.report_id if report else "",
-                    "report_status": report.report_status if report else "not_created",
-                    "report_ready": bool(
-                        report
-                        and report.report_status == "issued"
-                        and referral.report_ready
+                    "report_status": hospital_visible_report_status(report, referral),
+                    "report_ready": is_report_released_to_hospital(
+                        report, referral
                     ),
                     "latest_activity": referral.updated_at,
                 }
@@ -391,19 +392,15 @@ class HospitalPatientDetailView(APIView):
                         if referral.matched_clinic
                         else ""
                     ),
-                    "referral_status": referral.referral_status,
+                    "referral_status": hospital_visible_referral_status(referral),
                     "payment_status": payment.status if payment else "not_created",
-                    "report_status": report.report_status if report else "not_created",
+                    "report_status": hospital_visible_report_status(report, referral),
                     "created_at": referral.created_at,
                     "updated_at": referral.updated_at,
                 }
             )
 
-            if (
-                not report
-                or report.report_status != "issued"
-                or not referral.report_ready
-            ):
+            if not is_report_released_to_hospital(report, referral):
                 continue
 
             if report.id not in seen_report_ids:
@@ -729,12 +726,30 @@ class HospitalReferralStatusSyncView(APIView):
             report = StructuredReport.objects.filter(report_id=report_id).first()
             if report and hospital_referral.report_id != report.id:
                 hospital_referral.report = report
-                hospital_referral.report_ready = report.report_status == "issued"
+                hospital_referral.report_ready = False
                 updated_fields.extend(["report", "report_ready"])
 
-        if "report_ready" in data:
-            if hospital_referral.report_ready != data["report_ready"]:
-                hospital_referral.report_ready = data["report_ready"]
+        requested_ready = data.get("report_ready") is True
+        requested_status = data.get("referral_status")
+        requested_completed = requested_status == "completed"
+        authoritative_release = is_report_released_to_hospital(
+            hospital_referral.report, hospital_referral
+        )
+        if (requested_ready or requested_completed) and not authoritative_release:
+            logger.warning(
+                "Rejected premature hospital release sync for referral %s",
+                hospital_referral.referral_id,
+            )
+            raise ValidationError(
+                "report_ready/completed cannot be set before Sentinel Ops "
+                "has released the report to this hospital."
+            )
+
+        # Compatibility callers may report false, but they cannot revoke or
+        # grant the authoritative release state.
+        if "report_ready" in data and not data["report_ready"] and not authoritative_release:
+            if hospital_referral.report_ready:
+                hospital_referral.report_ready = False
                 updated_fields.append("report_ready")
 
         if "payout_status" in data:
@@ -746,12 +761,17 @@ class HospitalReferralStatusSyncView(APIView):
             hospital_referral.notes = data["notes"]
             updated_fields.append("notes")
 
-        requested_status = data.get("referral_status")
-
         if requested_status:
-            hospital_referral.referral_status = requested_status
+            if requested_status == "completed" and authoritative_release:
+                hospital_referral.referral_status = "completed"
+            elif requested_status != "completed":
+                hospital_referral.referral_status = requested_status
         else:
             if (
+                authoritative_release
+            ):
+                hospital_referral.referral_status = "report_issued"
+            elif (
                 hospital_referral.report_id
                 and hospital_referral.report.report_status == "issued"
             ):

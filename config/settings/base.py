@@ -147,17 +147,6 @@ PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_BASE_URL = os.environ.get("PAYSTACK_BASE_URL", "https://api.paystack.co")
 
 # -------------------------------
-# BASEROW
-# -------------------------------
-BASEROW_API_TOKEN = os.environ.get("BASEROW_API_TOKEN", "")
-BASEROW_BASE_URL = os.environ.get("BASEROW_BASE_URL", "https://api.baserow.io")
-
-BASEROW_PAYMENTS_TABLE_ID = os.environ.get("BASEROW_PAYMENTS_TABLE_ID", "")
-BASEROW_REFERRALS_TABLE_ID = os.environ.get("BASEROW_REFERRALS_TABLE_ID", "")
-BASEROW_HOSPITAL_INTAKE_TABLE_ID = os.environ.get("BASEROW_HOSPITAL_INTAKE_TABLE_ID", "")
-BASEROW_HOSPITALS_TABLE_ID = os.environ.get("BASEROW_HOSPITALS_TABLE_ID", "")
-
-# -------------------------------
 # FRONTEND
 # -------------------------------
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
