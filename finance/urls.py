@@ -34,11 +34,18 @@ router.register("control-audit", FinanceControlAuditViewSet, basename="finance-c
 urlpatterns = router.urls
 
 from django.urls import path
-from .views import FinanceDashboardSummaryView, PartnerFinanceView, FinanceOrganizationOptionsView, FinanceReconciliationView
+from .views import (
+    FinanceCapabilitiesView,
+    FinanceDashboardSummaryView,
+    FinanceOrganizationOptionsView,
+    FinanceReconciliationView,
+    PartnerFinanceView,
+)
 
 urlpatterns += [
     path("summary/", FinanceDashboardSummaryView.as_view(), name="finance-summary"),
     path("me/", PartnerFinanceView.as_view(), name="finance-me"),
     path("organization-options/", FinanceOrganizationOptionsView.as_view(), name="finance-organization-options"),
     path("reconciliation/", FinanceReconciliationView.as_view(), name="finance-reconciliation"),
+    path("capabilities/", FinanceCapabilitiesView.as_view(), name="finance-capabilities"),
 ]

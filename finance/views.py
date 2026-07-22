@@ -89,6 +89,10 @@ class IsFinanceAdministrator(FinanceRolePermission):
 class FinanceAdminViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsFinanceAdministrator]
 
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
 
 class PartnerContractViewSet(FinanceAdminViewSet):
     queryset = PartnerContract.objects.select_related("organization").all()
@@ -113,6 +117,15 @@ class ServiceAllowanceViewSet(FinanceAdminViewSet):
         "organization", "contract", "approved_by"
     ).all()
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action == "approve":
+            role = IsFinanceApprover
+        else:
+            role = IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
         try:
@@ -132,7 +145,7 @@ class ServiceAllowanceReservationViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = EncounterFinancialRecordSerializer
     queryset = EncounterFinancialRecord.objects.select_related(
         "encounter",
@@ -140,6 +153,10 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
         "contract",
         "pricing_rule",
     ).prefetch_related("allocations", "allocations__beneficiary_organization")
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        return [IsAuthenticated(), role()]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -204,6 +221,15 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
     queryset = OrganizationWallet.objects.select_related("organization").all()
     serializer_class = OrganizationWalletSerializer
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action in {"top_up", "reserve"}:
+            role = IsFinanceOperator
+        else:
+            role = IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
     @action(detail=True, methods=["post"], url_path="top-up")
     def top_up(self, request, pk=None):
         wallet = self.get_object()
@@ -258,7 +284,7 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
 
 
 class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = WalletLedgerEntrySerializer
     queryset = WalletLedgerEntry.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "reservation", "actor"
@@ -266,11 +292,15 @@ class WalletLedgerEntryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
     serializer_class = WalletReservationSerializer
     queryset = WalletReservation.objects.select_related(
         "wallet", "wallet__organization", "financial_record", "financial_record__encounter"
     ).all()
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        return [IsAuthenticated(), role()]
 
     @action(detail=True, methods=["post"])
     def capture(self, request, pk=None):
@@ -401,6 +431,15 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
         "beneficiary_organization", "approved_by"
     ).prefetch_related("items", "items__allocation", "items__allocation__financial_record")
 
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action in {"approve", "mark_paid"}:
+            role = IsFinanceApprover
+        else:
+            role = IsFinanceOperator
+        return [IsAuthenticated(), role()]
+
     def create(self, request, *args, **kwargs):
         try:
             from organizations.models import Organization
@@ -476,7 +515,7 @@ def _active_contract_for(organization):
 
 
 class FinanceDashboardSummaryView(APIView):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
 
     def get(self, request):
         wallet_totals = WalletLedgerEntry.objects.aggregate(
@@ -529,7 +568,7 @@ class PartnerFinanceView(APIView):
 
 
 class FinanceOrganizationOptionsView(APIView):
-    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
 
     def get(self, request):
         organizations = Organization.objects.filter(is_active=True).order_by("name")
@@ -614,3 +653,23 @@ class FinanceReconciliationView(APIView):
 
     def get(self, request):
         return Response(reconcile_finance_controls())
+
+
+class FinanceCapabilitiesView(APIView):
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+
+    def get(self, request):
+        def allowed(permission):
+            return permission().has_permission(request, self)
+
+        return Response({
+            "can_view": True,
+            "can_operate": allowed(IsFinanceOperator),
+            "can_approve": allowed(IsFinanceApprover),
+            "can_administer": allowed(IsFinanceAdministrator),
+            "can_request_corrections": allowed(IsFinanceOperator),
+            "can_decide_corrections": allowed(IsFinanceApprover),
+            "can_prepare_settlements": allowed(IsFinanceOperator),
+            "can_approve_settlements": allowed(IsFinanceApprover),
+            "can_configure_pricing": allowed(IsFinanceAdministrator),
+        })

@@ -2,10 +2,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
 from organizations.models import Organization
@@ -761,3 +763,46 @@ class FinanceControlTests(TestCase):
         result = reconcile_finance_controls()
         self.assertTrue(result["ok"])
         self.assertEqual(result["issue_count"], 0)
+
+
+class FinanceApiCapabilityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = get_user_model().objects.create_user(username="finance-api-user")
+
+    def assign(self, *groups):
+        self.user.groups.clear()
+        for name in groups:
+            self.user.groups.add(Group.objects.get_or_create(name=name)[0])
+        self.client.force_authenticate(self.user)
+
+    def test_viewer_receives_read_only_capabilities(self):
+        self.assign("finance_viewer")
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["can_view"])
+        self.assertFalse(response.data["can_operate"])
+        self.assertFalse(response.data["can_approve"])
+        self.assertFalse(response.data["can_administer"])
+
+    def test_operator_can_prepare_but_not_approve(self):
+        self.assign("finance_operator")
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertTrue(response.data["can_prepare_settlements"])
+        self.assertFalse(response.data["can_approve_settlements"])
+
+    def test_approver_can_decide_but_not_configure(self):
+        self.assign("finance_approver")
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertTrue(response.data["can_decide_corrections"])
+        self.assertFalse(response.data["can_configure_pricing"])
+
+    def test_finance_admin_has_all_capabilities(self):
+        self.assign("finance_admin")
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertTrue(all(response.data.values()))
+
+    def test_viewer_can_list_but_cannot_create_wallets(self):
+        self.assign("finance_viewer")
+        self.assertEqual(self.client.get("/api/finance/wallets/").status_code, 200)
+        self.assertEqual(self.client.post("/api/finance/wallets/", {}).status_code, 403)
