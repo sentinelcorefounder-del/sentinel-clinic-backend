@@ -10,6 +10,8 @@ from .views import (
     WalletReservationViewSet,
     SettlementBatchViewSet,
     BankTransferFundingRequestViewSet,
+    ServiceAllowanceViewSet,
+    ServiceAllowanceReservationViewSet,
 )
 
 router = DefaultRouter()
@@ -22,6 +24,8 @@ router.register("wallet-ledger", WalletLedgerEntryViewSet, basename="finance-wal
 router.register("wallet-reservations", WalletReservationViewSet, basename="finance-wallet-reservation")
 router.register("settlements", SettlementBatchViewSet, basename="finance-settlement")
 router.register("bank-transfer-funding", BankTransferFundingRequestViewSet, basename="finance-bank-transfer-funding")
+router.register("service-allowances", ServiceAllowanceViewSet, basename="finance-service-allowance")
+router.register("allowance-reservations", ServiceAllowanceReservationViewSet, basename="finance-allowance-reservation")
 
 urlpatterns = router.urls
 

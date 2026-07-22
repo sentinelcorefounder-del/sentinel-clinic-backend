@@ -9,6 +9,7 @@ from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
     OrganizationWallet, WalletLedgerEntry, WalletReservation, SettlementBatch,
     BankTransferFundingRequest,
+    ServiceAllowance, ServiceAllowanceReservation,
 )
 from .serializers import (
     AllocationRuleSerializer,
@@ -17,6 +18,7 @@ from .serializers import (
     PricingRuleSerializer,
     OrganizationWalletSerializer, WalletLedgerEntrySerializer, WalletReservationSerializer, SettlementBatchSerializer,
     BankTransferFundingRequestSerializer,
+    ServiceAllowanceSerializer, ServiceAllowanceReservationSerializer,
 )
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
@@ -25,6 +27,7 @@ from .services import (
     create_settlement_batch, approve_settlement_batch, mark_settlement_batch_paid,
     sync_encounter_finance_lifecycle,
     submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer, reject_bank_transfer,
+    approve_service_allowance,
 )
 
 
@@ -62,6 +65,30 @@ class AllocationRuleViewSet(FinanceAdminViewSet):
         "pricing_rule", "beneficiary_organization"
     ).all()
     serializer_class = AllocationRuleSerializer
+
+
+class ServiceAllowanceViewSet(FinanceAdminViewSet):
+    serializer_class = ServiceAllowanceSerializer
+    queryset = ServiceAllowance.objects.select_related(
+        "organization", "contract", "approved_by"
+    ).all()
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            allowance = approve_service_allowance(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(allowance).data)
+
+
+class ServiceAllowanceReservationViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated, IsSentinelFinanceOps]
+    serializer_class = ServiceAllowanceReservationSerializer
+    queryset = ServiceAllowanceReservation.objects.select_related(
+        "allowance", "allowance__organization", "financial_record",
+        "financial_record__encounter", "actor",
+    ).all()
 
 
 class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):

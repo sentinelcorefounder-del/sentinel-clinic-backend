@@ -409,6 +409,104 @@ class OrganizationWallet(TimeStampedModel):
         return f"{self.organization.name} wallet ({self.currency})"
 
 
+class ServiceAllowance(TimeStampedModel):
+    """A controlled authority to deliver services before cash funding arrives."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        ACTIVE = "active", "Active"
+        SUSPENDED = "suspended", "Suspended"
+        EXHAUSTED = "exhausted", "Exhausted"
+        EXPIRED = "expired", "Expired"
+        REVOKED = "revoked", "Revoked"
+
+    organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="service_allowances",
+    )
+    contract = models.ForeignKey(
+        PartnerContract, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="service_allowances",
+    )
+    name = models.CharField(max_length=255)
+    currency = models.CharField(max_length=3, default="NGN")
+    monetary_limit = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    patient_limit = models.PositiveIntegerField(null=True, blank=True)
+    valid_from = models.DateField()
+    expires_at = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="approved_service_allowances",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["organization", "status"], name="fin_allow_org_status_idx"),
+            models.Index(fields=["status", "expires_at"], name="fin_allow_status_exp_idx"),
+        ]
+
+    def clean(self):
+        if self.monetary_limit is None and self.patient_limit is None:
+            raise ValidationError("An allowance requires a monetary limit, a patient limit, or both.")
+        if self.monetary_limit is not None and self.monetary_limit <= 0:
+            raise ValidationError({"monetary_limit": "Monetary limit must be greater than zero."})
+        if self.patient_limit is not None and self.patient_limit <= 0:
+            raise ValidationError({"patient_limit": "Patient limit must be greater than zero."})
+        if self.contract_id and self.contract.organization_id != self.organization_id:
+            raise ValidationError({"contract": "Contract and allowance organisation must match."})
+
+    @property
+    def reserved_amount(self):
+        return self.reservations.filter(status=ServiceAllowanceReservation.Status.ACTIVE).aggregate(
+            total=models.Sum("amount")
+        )["total"] or Decimal("0.00")
+
+    @property
+    def reserved_patients(self):
+        return self.reservations.filter(status=ServiceAllowanceReservation.Status.ACTIVE).count()
+
+    def __str__(self):
+        return f"{self.organization.name} - {self.name}"
+
+
+class ServiceAllowanceReservation(TimeStampedModel):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        FUNDED = "funded", "Replaced by genuine funding"
+        RELEASED = "released", "Released"
+
+    allowance = models.ForeignKey(ServiceAllowance, on_delete=models.PROTECT, related_name="reservations")
+    financial_record = models.OneToOneField(
+        EncounterFinancialRecord, on_delete=models.PROTECT, related_name="allowance_reservation"
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
+    reserved_at = models.DateTimeField(auto_now_add=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="service_allowance_reservations",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["allowance", "status"], name="fin_allow_res_status_idx")]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Reserved amount must be greater than zero."})
+        if self.allowance_id and self.currency != self.allowance.currency:
+            raise ValidationError({"currency": "Reservation currency must match the allowance."})
+
+    def __str__(self):
+        return f"Allowance reservation {self.pk}"
+
+
 class WalletReservation(TimeStampedModel):
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"

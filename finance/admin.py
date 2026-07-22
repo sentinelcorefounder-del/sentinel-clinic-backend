@@ -13,6 +13,8 @@ from .models import (
     SettlementBatch,
     SettlementItem,
     BankTransferFundingRequest,
+    ServiceAllowance,
+    ServiceAllowanceReservation,
 )
 
 
@@ -52,6 +54,21 @@ class EncounterFinancialRecordAdmin(admin.ModelAdmin):
 admin.site.register(AllocationRule)
 admin.site.register(EncounterAllocation)
 admin.site.register(FinancialAuditLog)
+
+
+@admin.register(ServiceAllowance)
+class ServiceAllowanceAdmin(admin.ModelAdmin):
+    list_display = ("name", "organization", "status", "monetary_limit", "patient_limit", "expires_at")
+    list_filter = ("status", "currency")
+    search_fields = ("name", "organization__name")
+    readonly_fields = ("approved_by", "approved_at", "created_at", "updated_at")
+
+
+@admin.register(ServiceAllowanceReservation)
+class ServiceAllowanceReservationAdmin(admin.ModelAdmin):
+    list_display = ("id", "allowance", "financial_record", "amount", "status", "reserved_at")
+    list_filter = ("status", "currency")
+    readonly_fields = tuple(field.name for field in ServiceAllowanceReservation._meta.fields)
 
 
 @admin.register(OrganizationWallet)

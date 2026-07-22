@@ -16,6 +16,7 @@ from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
     OrganizationWallet, WalletLedgerEntry, WalletReservation,
     BankTransferFundingRequest,
+    ServiceAllowance, ServiceAllowanceReservation,
 )
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
@@ -23,6 +24,7 @@ from .services import (
     infer_financial_identity, earn_financial_record_allocations,
     capture_finance_for_hospital_publication,
     submit_bank_transfer_proof, verify_bank_transfer, approve_bank_transfer,
+    approve_service_allowance, reserve_service_allowance, fund_allowance_reservation,
 )
 
 
@@ -493,3 +495,116 @@ class BankTransferFundingTests(WalletEngineTests):
             submit_bank_transfer_proof(self.request, proof, actor=self.user)
         self.request.refresh_from_db()
         self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+
+
+class ServiceAllowanceTests(TestCase):
+    def setUp(self):
+        self.organization = Organization.objects.create(
+            clinic_id="HOSP-ALLOW", name="Allowance Hospital", organization_type="hospital"
+        )
+        self.patient = Patient.objects.create(
+            patient_id="PAT-FIN-ALLOW-1", first_name="First", last_name="Patient",
+            date_of_birth=date(1980, 1, 1), sex="female",
+        )
+        self.encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-FIN-ALLOW-1", patient=self.patient,
+            encounter_date=date.today(), originating_organization=self.organization,
+            source_type="hospital_referral", workflow_route="sentinel_managed",
+            payment_responsibility="hospital",
+        )
+        self.contract = PartnerContract.objects.create(
+            organization=self.organization, name="Allowance Contract",
+            programme="diabetic_screening", status=PartnerContract.Status.ACTIVE,
+            effective_from=date(2026, 1, 1),
+        )
+        rule = PricingRule.objects.create(
+            contract=self.contract, name="Allowance Price", service_type="retinal_assessment",
+            source_type="hospital_referral", gross_amount=Decimal("15000.00"),
+            effective_from=date(2026, 1, 1),
+        )
+        AllocationRule.objects.create(
+            pricing_rule=rule, beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("15000.00"),
+        )
+        self.record = price_encounter(self.encounter)
+        self.wallet = OrganizationWallet.objects.create(
+            organization=self.organization, currency="NGN", credit_limit=Decimal("0.00")
+        )
+        self.user = get_user_model().objects.create_user(username="allowance-approver")
+        self.allowance = ServiceAllowance.objects.create(
+            organization=self.organization,
+            contract=self.contract,
+            name="Temporary service authority",
+            currency="NGN",
+            monetary_limit=Decimal("30000.00"),
+            patient_limit=2,
+            valid_from=date.today(),
+            expires_at=timezone.now() + timedelta(days=30),
+        )
+        approve_service_allowance(self.allowance, actor=self.user)
+
+    def test_allowance_reservation_never_credits_or_releases(self):
+        reservation = reserve_service_allowance(self.record, actor=self.user)
+        self.record.refresh_from_db()
+        self.assertEqual(reservation.status, ServiceAllowanceReservation.Status.ACTIVE)
+        self.assertEqual(self.record.status, EncounterFinancialRecord.Status.APPROVED_CREDIT)
+        self.assertFalse(self.record.financially_releasable)
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        self.assertEqual(WalletLedgerEntry.objects.count(), 0)
+
+    def test_patient_and_monetary_limits_cannot_be_exceeded(self):
+        reserve_service_allowance(self.record, actor=self.user)
+        second_patient = Patient.objects.create(
+            patient_id="PAT-FIN-ALLOW-2", first_name="Second", last_name="Patient",
+            date_of_birth=date(1981, 1, 1), sex="male",
+        )
+        second_encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-FIN-ALLOW-2", patient=second_patient,
+            encounter_date=date.today(), originating_organization=self.organization,
+            source_type="hospital_referral", workflow_route="sentinel_managed",
+            payment_responsibility="hospital",
+        )
+        second_record = EncounterFinancialRecord.objects.get(encounter=second_encounter)
+        if second_record.status in {EncounterFinancialRecord.Status.UNPRICED, EncounterFinancialRecord.Status.EXCEPTION}:
+            second_record = price_encounter(second_encounter, force=True)
+        reserve_service_allowance(second_record, actor=self.user)
+        third_patient = Patient.objects.create(
+            patient_id="PAT-FIN-ALLOW-3", first_name="Third", last_name="Patient",
+            date_of_birth=date(1982, 1, 1), sex="female",
+        )
+        third_encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-FIN-ALLOW-3", patient=third_patient,
+            encounter_date=date.today(), originating_organization=self.organization,
+            source_type="hospital_referral", workflow_route="sentinel_managed",
+            payment_responsibility="hospital",
+        )
+        third_record = EncounterFinancialRecord.objects.get(encounter=third_encounter)
+        if third_record.status in {EncounterFinancialRecord.Status.UNPRICED, EncounterFinancialRecord.Status.EXCEPTION}:
+            third_record = price_encounter(third_encounter, force=True)
+        with self.assertRaisesMessage(ValidationError, "sufficient monetary and patient capacity"):
+            reserve_service_allowance(third_record, actor=self.user)
+
+    def test_expired_allowance_cannot_be_reserved(self):
+        self.allowance.expires_at = timezone.now() - timedelta(minutes=1)
+        self.allowance.save(update_fields=["expires_at", "updated_at"])
+        with self.assertRaisesMessage(ValidationError, "No active service allowance"):
+            reserve_service_allowance(self.record, actor=self.user)
+
+    def test_real_funding_replaces_allowance_then_capture_can_proceed(self):
+        allowance_reservation = reserve_service_allowance(self.record, actor=self.user)
+        top_up_wallet(self.wallet, Decimal("15000.00"), "allowance-real-funding")
+        wallet_reservation = fund_allowance_reservation(self.record, actor=self.user)
+        allowance_reservation.refresh_from_db()
+        self.record.refresh_from_db()
+        self.assertEqual(allowance_reservation.status, ServiceAllowanceReservation.Status.FUNDED)
+        self.assertEqual(wallet_reservation.status, WalletReservation.Status.ACTIVE)
+        self.assertFalse(self.record.financially_releasable)
+        capture_finance_for_hospital_publication(self.encounter, actor=self.user)
+        self.record.refresh_from_db()
+        self.assertTrue(self.record.financially_releasable)
+
+    def test_publication_remains_held_while_allowance_is_unfunded(self):
+        reserve_service_allowance(self.record, actor=self.user)
+        with self.assertRaisesMessage(ValidationError, "PAYMENT_REQUIRED"):
+            capture_finance_for_hospital_publication(self.encounter, actor=self.user)

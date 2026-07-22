@@ -12,6 +12,8 @@ from .models import (
     SettlementBatch,
     SettlementItem,
     BankTransferFundingRequest,
+    ServiceAllowance,
+    ServiceAllowanceReservation,
 )
 
 
@@ -163,6 +165,41 @@ class BankTransferFundingRequestSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("Requested amount must be greater than zero.")
         return value
+
+
+class ServiceAllowanceSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source="organization.name", read_only=True)
+    reserved_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    reserved_patients = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ServiceAllowance
+        fields = "__all__"
+        read_only_fields = ("status", "approved_by", "approved_at", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        monetary_limit = attrs.get("monetary_limit", getattr(self.instance, "monetary_limit", None))
+        patient_limit = attrs.get("patient_limit", getattr(self.instance, "patient_limit", None))
+        if monetary_limit is None and patient_limit is None:
+            raise serializers.ValidationError("Provide a monetary limit, a patient limit, or both.")
+        if monetary_limit is not None and monetary_limit <= 0:
+            raise serializers.ValidationError({"monetary_limit": "Must be greater than zero."})
+        if patient_limit is not None and patient_limit <= 0:
+            raise serializers.ValidationError({"patient_limit": "Must be greater than zero."})
+        organization = attrs.get("organization", getattr(self.instance, "organization", None))
+        contract = attrs.get("contract", getattr(self.instance, "contract", None))
+        if contract and organization and contract.organization_id != organization.id:
+            raise serializers.ValidationError({"contract": "Contract and allowance organisation must match."})
+        return attrs
+
+
+class ServiceAllowanceReservationSerializer(serializers.ModelSerializer):
+    encounter_id = serializers.CharField(source="financial_record.encounter.encounter_id", read_only=True)
+
+    class Meta:
+        model = ServiceAllowanceReservation
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in ServiceAllowanceReservation._meta.fields)
 
 
 class PartnerFinanceSummarySerializer(serializers.Serializer):

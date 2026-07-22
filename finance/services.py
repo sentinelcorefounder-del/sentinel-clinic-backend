@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -12,6 +12,8 @@ from .models import (
     FinancialAuditLog,
     PartnerContract,
     PricingRule,
+    ServiceAllowance,
+    ServiceAllowanceReservation,
 )
 
 
@@ -719,6 +721,125 @@ def reserve_financial_record_from_originating_wallet(financial_record, actor=Non
 
 
 @transaction.atomic
+def approve_service_allowance(allowance, actor=None):
+    allowance = ServiceAllowance.objects.select_for_update().get(pk=allowance.pk)
+    if allowance.status == ServiceAllowance.Status.ACTIVE:
+        return allowance
+    if allowance.status != ServiceAllowance.Status.DRAFT:
+        raise ValidationError("Only a draft allowance can be approved.")
+    allowance.full_clean()
+    if allowance.expires_at <= timezone.now():
+        raise ValidationError("An expired allowance cannot be approved.")
+    allowance.status = ServiceAllowance.Status.ACTIVE
+    allowance.approved_by = actor
+    allowance.approved_at = timezone.now()
+    allowance.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+    return allowance
+
+
+@transaction.atomic
+def reserve_service_allowance(financial_record, actor=None):
+    """Reserve non-cash service authority; never mark a record releasable."""
+    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+        "contract", "payer_organization"
+    ).get(pk=financial_record.pk)
+    existing = ServiceAllowanceReservation.objects.select_for_update().filter(
+        financial_record=record, status=ServiceAllowanceReservation.Status.ACTIVE
+    ).first()
+    if existing:
+        return existing
+    if record.status not in {
+        EncounterFinancialRecord.Status.AWAITING_PAYMENT,
+        EncounterFinancialRecord.Status.PRICED,
+        EncounterFinancialRecord.Status.APPROVED_CREDIT,
+    }:
+        raise ValidationError("This financial record is not eligible for a service allowance.")
+    if not record.payer_organization_id:
+        raise ValidationError("A service allowance requires an organisation payer.")
+
+    today = timezone.localdate()
+    ServiceAllowance.objects.select_for_update().filter(
+        organization=record.payer_organization,
+        status=ServiceAllowance.Status.ACTIVE,
+        expires_at__lte=timezone.now(),
+    ).update(status=ServiceAllowance.Status.EXPIRED)
+    candidates = ServiceAllowance.objects.select_for_update().filter(
+        organization=record.payer_organization,
+        currency=record.currency,
+        status=ServiceAllowance.Status.ACTIVE,
+        valid_from__lte=today,
+        expires_at__gt=timezone.now(),
+    ).filter(Q(contract__isnull=True) | Q(contract=record.contract)).order_by("expires_at", "id")
+
+    amount = record.outstanding_amount
+    for allowance in candidates:
+        active = allowance.reservations.filter(status=ServiceAllowanceReservation.Status.ACTIVE)
+        used_amount = active.aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
+        used_patients = active.count()
+        if allowance.monetary_limit is not None and used_amount + amount > allowance.monetary_limit:
+            continue
+        if allowance.patient_limit is not None and used_patients + 1 > allowance.patient_limit:
+            continue
+        reservation = ServiceAllowanceReservation.objects.create(
+            allowance=allowance, financial_record=record, amount=amount,
+            currency=record.currency, actor=actor,
+        )
+        amount_exhausted = (
+            allowance.monetary_limit is not None
+            and used_amount + amount >= allowance.monetary_limit
+        )
+        patients_exhausted = (
+            allowance.patient_limit is not None
+            and used_patients + 1 >= allowance.patient_limit
+        )
+        if amount_exhausted or patients_exhausted:
+            allowance.status = ServiceAllowance.Status.EXHAUSTED
+            allowance.save(update_fields=["status", "updated_at"])
+        previous_status = record.status
+        record.status = EncounterFinancialRecord.Status.APPROVED_CREDIT
+        record.secured_at = record.secured_at or timezone.now()
+        record.financially_releasable = False
+        record.exception_reason = "Service permitted under allowance; genuine funding is still required."
+        record.save(update_fields=[
+            "status", "secured_at", "financially_releasable", "exception_reason", "updated_at"
+        ])
+        _audit(record, "service_allowance_reserved", actor=actor, previous_status=previous_status,
+               details={"allowance_id": allowance.id, "reservation_id": reservation.id})
+        return reservation
+    raise ValidationError("No active service allowance has sufficient monetary and patient capacity.")
+
+
+@transaction.atomic
+def fund_allowance_reservation(financial_record, actor=None, reference=""):
+    """Replace an allowance with cash already present in the organisation wallet."""
+    record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    allowance_reservation = ServiceAllowanceReservation.objects.select_for_update().filter(
+        financial_record=record, status=ServiceAllowanceReservation.Status.ACTIVE
+    ).first()
+    if not allowance_reservation:
+        return reserve_financial_record_from_originating_wallet(record, actor=actor, reference=reference)
+    previous_status = record.status
+    record.status = EncounterFinancialRecord.Status.AWAITING_PAYMENT
+    record.save(update_fields=["status", "updated_at"])
+    wallet_reservation = reserve_financial_record_from_originating_wallet(
+        record, actor=actor, reference=reference
+    )
+    allowance_reservation.status = ServiceAllowanceReservation.Status.FUNDED
+    allowance_reservation.closed_at = timezone.now()
+    allowance_reservation.save(update_fields=["status", "closed_at", "updated_at"])
+    allowance = ServiceAllowance.objects.select_for_update().get(pk=allowance_reservation.allowance_id)
+    if allowance.status == ServiceAllowance.Status.EXHAUSTED and allowance.expires_at > timezone.now():
+        allowance.status = ServiceAllowance.Status.ACTIVE
+        allowance.save(update_fields=["status", "updated_at"])
+    record.exception_reason = ""
+    record.save(update_fields=["exception_reason", "updated_at"])
+    _audit(record, "service_allowance_funded", actor=actor, previous_status=previous_status,
+           details={"allowance_reservation_id": allowance_reservation.id,
+                    "wallet_reservation_id": wallet_reservation.id})
+    return wallet_reservation
+
+
+@transaction.atomic
 def capture_financial_record_wallet_reservation(financial_record, actor=None, reference=""):
     from .models import WalletReservation
 
@@ -778,6 +899,17 @@ def capture_finance_for_hospital_publication(encounter, actor=None):
 
     if record.service_pathway != EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED:
         raise ValidationError("This financial trigger only applies to hospital-referred services.")
+
+    if record.status == EncounterFinancialRecord.Status.APPROVED_CREDIT:
+        try:
+            fund_allowance_reservation(
+                record, actor=actor, reference=f"EFR-{record.id}-HOSPITAL-FUNDING"
+            )
+        except ValidationError as exc:
+            raise ValidationError(
+                "PAYMENT_REQUIRED: This report is on financial hold until its service is fully funded."
+            ) from exc
+        record.refresh_from_db()
 
     if record.status == EncounterFinancialRecord.Status.WALLET_RESERVED:
         capture_financial_record_wallet_reservation(
@@ -912,6 +1044,17 @@ def cancel_financial_record(financial_record, actor=None, reason="Encounter canc
     from .models import WalletReservation
 
     record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    allowance_reservation = ServiceAllowanceReservation.objects.select_for_update().filter(
+        financial_record=record, status=ServiceAllowanceReservation.Status.ACTIVE
+    ).first()
+    if allowance_reservation:
+        allowance_reservation.status = ServiceAllowanceReservation.Status.RELEASED
+        allowance_reservation.closed_at = timezone.now()
+        allowance_reservation.save(update_fields=["status", "closed_at", "updated_at"])
+        allowance = ServiceAllowance.objects.select_for_update().get(pk=allowance_reservation.allowance_id)
+        if allowance.status == ServiceAllowance.Status.EXHAUSTED and allowance.expires_at > timezone.now():
+            allowance.status = ServiceAllowance.Status.ACTIVE
+            allowance.save(update_fields=["status", "updated_at"])
     for reservation in record.wallet_reservations.filter(
         status__in=[WalletReservation.Status.ACTIVE, WalletReservation.Status.PARTIALLY_CAPTURED]
     ):
@@ -977,16 +1120,27 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
                 record, actor=actor, reference=f"EFR-{record.id}-AUTO"
             )
         except ValidationError:
-            if record.contract and record.contract.credit_allowed:
-                approve_financial_record_credit(record, actor=actor)
-            else:
-                raise
+            try:
+                reserve_service_allowance(record, actor=actor)
+            except ValidationError:
+                if record.contract and record.contract.credit_allowed:
+                    approve_financial_record_credit(record, actor=actor)
+                else:
+                    raise
         record.refresh_from_db()
 
     if (
         encounter.screening_status == "completed"
         and record.service_pathway == EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT
     ):
+        if record.status == EncounterFinancialRecord.Status.APPROVED_CREDIT:
+            try:
+                fund_allowance_reservation(
+                    record, actor=actor, reference=f"EFR-{record.id}-COMPLETION-FUNDING"
+                )
+            except ValidationError:
+                pass
+            record.refresh_from_db()
         if record.status == EncounterFinancialRecord.Status.WALLET_RESERVED:
             capture_financial_record_wallet_reservation(
                 record, actor=actor, reference=f"EFR-{record.id}-COMPLETE"
