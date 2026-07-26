@@ -7,29 +7,21 @@ class ConsentRecord(models.Model):
     CONSENT_TYPE_CHOICES = [
         ("care_delivery", "Care Delivery"),
         ("data_sharing", "Data Sharing"),
+        ("ai_clinical_review", "AI Clinical Review"),
         ("ai_training", "AI Training"),
         ("research_use", "Research Use"),
     ]
-
     CONSENT_STATUS_CHOICES = [
         ("granted", "Granted"),
         ("declined", "Declined"),
         ("withdrawn", "Withdrawn"),
         ("expired", "Expired"),
     ]
-
     consent_id = models.CharField(max_length=30, unique=True)
-    patient = models.ForeignKey(
-        Patient,
-        on_delete=models.CASCADE,
-        related_name="consents"
-    )
+    patient = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name="consents")
     encounter = models.ForeignKey(
-        ScreeningEncounter,
-        on_delete=models.CASCADE,
-        related_name="consents",
-        null=True,
-        blank=True
+        ScreeningEncounter, on_delete=models.CASCADE, related_name="consents",
+        null=True, blank=True,
     )
     consent_type = models.CharField(max_length=30, choices=CONSENT_TYPE_CHOICES)
     consent_status = models.CharField(max_length=20, choices=CONSENT_STATUS_CHOICES)
