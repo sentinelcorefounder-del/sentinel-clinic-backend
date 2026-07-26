@@ -1,5 +1,8 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
 from django.utils.dateparse import parse_date
+from django.db import transaction
+from datetime import timedelta
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -86,6 +89,22 @@ class IsFinanceAdministrator(FinanceRolePermission):
     required_role = "admin"
 
 
+class IsContractPricingOps(BasePermission):
+    message = "Only approved Sentinel Finance/Ops users may change contracts and pricing."
+    allowed_groups = {
+        "finance_admin", "ops_admin", "sentinel_ops",
+        "super_admin", "finance_tester",
+    }
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser:
+            return True
+        return user.groups.filter(name__in=self.allowed_groups).exists()
+
+
 class FinanceAdminViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsFinanceAdministrator]
 
@@ -95,13 +114,148 @@ class FinanceAdminViewSet(viewsets.ModelViewSet):
 
 
 class PartnerContractViewSet(FinanceAdminViewSet):
-    queryset = PartnerContract.objects.select_related("organization").all()
+    queryset = PartnerContract.objects.select_related("organization").prefetch_related(
+        "pricing_rules"
+    ).all()
     serializer_class = PartnerContractSerializer
+
+    def destroy(self, request, *args, **kwargs):
+        contract = self.get_object()
+        if contract.status != PartnerContract.Status.DRAFT:
+            return Response(
+                {"detail": "Only unused draft contracts may be deleted. Suspend or end this contract instead."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if contract.financial_records.exists() or contract.pricing_rules.filter(
+            financial_records__isnull=False
+        ).exists():
+            return Response(
+                {"detail": "This contract has financial history and cannot be deleted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        contract.pricing_rules.all().delete()
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"])
+    def suspend(self, request, pk=None):
+        contract = self.get_object()
+        contract.status = PartnerContract.Status.SUSPENDED
+        contract.pricing_rules.update(is_active=False)
+        contract.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(contract).data)
+
+    @action(detail=True, methods=["post"])
+    def end(self, request, pk=None):
+        contract = self.get_object()
+        end_date = parse_date(request.data.get("effective_to", "")) or timezone.localdate()
+        if end_date < contract.effective_from:
+            return Response(
+                {"detail": "End date cannot precede the contract start date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        contract.effective_to = end_date
+        contract.status = PartnerContract.Status.EXPIRED
+        contract.pricing_rules.update(is_active=False, effective_to=end_date)
+        contract.save(update_fields=["effective_to", "status", "updated_at"])
+        return Response(self.get_serializer(contract).data)
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def replace(self, request, pk=None):
+        current = self.get_object()
+        start_date = parse_date(request.data.get("effective_from", ""))
+        if not start_date:
+            return Response(
+                {"detail": "A valid effective_from date is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if start_date <= current.effective_from:
+            return Response(
+                {"detail": "The replacement must start after the current contract."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        current.effective_to = start_date - timedelta(days=1)
+        current.status = PartnerContract.Status.EXPIRED
+        current.pricing_rules.update(is_active=False, effective_to=current.effective_to)
+        current.save(update_fields=["effective_to", "status", "updated_at"])
+
+        payload = request.data.copy()
+        payload["organization"] = current.organization_id
+        payload["programme"] = current.programme
+        payload["status"] = PartnerContract.Status.ACTIVE
+        serializer = self.get_serializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        replacement = serializer.save()
+        return Response(self.get_serializer(replacement).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="revise-pricing")
+    @transaction.atomic
+    def revise_pricing(self, request, pk=None):
+        contract = self.get_object()
+        incoming_rules = request.data.get("pricing_rules", [])
+        if not isinstance(incoming_rules, list) or not incoming_rules:
+            return Response(
+                {"detail": "At least one pricing rule is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allowed_fields = {
+            "name", "service_type", "source_type", "workflow_route",
+            "payment_responsibility", "equipment_owner_type",
+            "min_monthly_volume", "max_monthly_volume", "gross_amount",
+            "priority", "effective_from", "effective_to", "notes",
+        }
+        for rule_data in incoming_rules:
+            service_type = rule_data.get("service_type")
+            current = contract.pricing_rules.filter(
+                service_type=service_type, is_active=True
+            ).order_by("-version", "-effective_from", "-id").first()
+            payload = {key: value for key, value in rule_data.items() if key in allowed_fields}
+            payload.update({"contract": contract.id, "is_active": True})
+            if current and current.financial_records.exists():
+                proposed_start = parse_date(str(payload.get("effective_from", "")))
+                if not proposed_start or proposed_start <= current.effective_from:
+                    return Response(
+                        {
+                            "detail": (
+                                f"New {service_type} pricing must start after "
+                                f"{current.effective_from}."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                payload["version"] = current.version + 1
+                payload["supersedes"] = current.id
+                serializer = PricingRuleSerializer(data=payload)
+                serializer.is_valid(raise_exception=True)
+                new_rule = serializer.save()
+                current.is_active = False
+                current.effective_to = new_rule.effective_from - timedelta(days=1)
+                current.save(update_fields=["is_active", "effective_to", "updated_at"])
+            elif current:
+                serializer = PricingRuleSerializer(current, data=payload, partial=True)
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
+            else:
+                payload.setdefault("version", 1)
+                serializer = PricingRuleSerializer(data=payload)
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
+        contract.refresh_from_db()
+        return Response(self.get_serializer(contract).data)
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsContractPricingOps
+        return [IsAuthenticated(), role()]
 
 
 class PricingRuleViewSet(FinanceAdminViewSet):
     queryset = PricingRule.objects.select_related("contract", "contract__organization").all()
     serializer_class = PricingRuleSerializer
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsContractPricingOps
+        return [IsAuthenticated(), role()]
 
 
 class AllocationRuleViewSet(FinanceAdminViewSet):

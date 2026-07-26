@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.db.models import Q
 
 from .models import (
     AllocationRule,
@@ -46,6 +47,21 @@ class PricingRuleSerializer(serializers.ModelSerializer):
         supersedes = attrs.get("supersedes", getattr(self.instance, "supersedes", None))
         if supersedes and contract and supersedes.contract_id != contract.id:
             raise serializers.ValidationError({"supersedes": "Must belong to the same contract."})
+        service_type = attrs.get(
+            "service_type", getattr(self.instance, "service_type", "retinal_assessment")
+        )
+        if contract:
+            organization_type = contract.organization.organization_type
+            if organization_type == "hospital" and service_type in {
+                "ocular_ai_review", "sentinel_ai_analysis"
+            }:
+                raise serializers.ValidationError({
+                    "service_type": "Clinic AI charges cannot be added to a hospital contract."
+                })
+            if service_type == "ocular_ai_review" and organization_type != "clinic":
+                raise serializers.ValidationError({
+                    "service_type": "Ocular AI review pricing is available only for clinic contracts."
+                })
         return attrs
 
     def update(self, instance, validated_data):
@@ -58,11 +74,56 @@ class PricingRuleSerializer(serializers.ModelSerializer):
 
 class PartnerContractSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source="organization.name", read_only=True)
+    organization_type = serializers.CharField(
+        source="organization.organization_type", read_only=True
+    )
+    pricing_rules = PricingRuleSerializer(many=True, read_only=True)
+    has_financial_history = serializers.SerializerMethodField()
 
     class Meta:
         model = PartnerContract
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
+
+    def get_has_financial_history(self, obj):
+        return obj.financial_records.exists()
+
+    def validate(self, attrs):
+        organization = attrs.get(
+            "organization", getattr(self.instance, "organization", None)
+        )
+        programme = attrs.get(
+            "programme", getattr(self.instance, "programme", "diabetic_screening")
+        )
+        contract_status = attrs.get(
+            "status", getattr(self.instance, "status", PartnerContract.Status.DRAFT)
+        )
+        effective_from = attrs.get(
+            "effective_from", getattr(self.instance, "effective_from", None)
+        )
+        effective_to = attrs.get(
+            "effective_to", getattr(self.instance, "effective_to", None)
+        )
+        if effective_from and effective_to and effective_to < effective_from:
+            raise serializers.ValidationError({
+                "effective_to": "Effective-to cannot precede effective-from."
+            })
+        if contract_status == PartnerContract.Status.ACTIVE and organization and effective_from:
+            overlapping = PartnerContract.objects.filter(
+                organization=organization,
+                programme=programme,
+                status=PartnerContract.Status.ACTIVE,
+            ).exclude(pk=getattr(self.instance, "pk", None))
+            if effective_to:
+                overlapping = overlapping.filter(effective_from__lte=effective_to)
+            overlapping = overlapping.filter(
+                Q(effective_to__isnull=True) | Q(effective_to__gte=effective_from)
+            )
+            if overlapping.exists():
+                raise serializers.ValidationError(
+                    "Only one active contract may cover an organisation, programme, and date."
+                )
+        return attrs
 
 
 class EncounterAllocationSerializer(serializers.ModelSerializer):

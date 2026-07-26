@@ -4,6 +4,7 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import Q
 
 
 class TimeStampedModel(models.Model):
@@ -46,6 +47,21 @@ class PartnerContract(TimeStampedModel):
     def clean(self):
         if self.effective_to and self.effective_to < self.effective_from:
             raise ValidationError({"effective_to": "Effective-to cannot precede effective-from."})
+        if self.status == self.Status.ACTIVE and self.organization_id:
+            overlapping = PartnerContract.objects.filter(
+                organization_id=self.organization_id,
+                programme=self.programme,
+                status=self.Status.ACTIVE,
+            ).exclude(pk=self.pk)
+            if self.effective_to:
+                overlapping = overlapping.filter(effective_from__lte=self.effective_to)
+            overlapping = overlapping.filter(
+                Q(effective_to__isnull=True) | Q(effective_to__gte=self.effective_from)
+            )
+            if overlapping.exists():
+                raise ValidationError(
+                    "Only one active contract may cover an organisation, programme, and date."
+                )
 
     def __str__(self):
         return f"{self.organization.name} - {self.name}"
@@ -105,6 +121,17 @@ class PricingRule(TimeStampedModel):
             raise ValidationError({"supersedes": "A pricing rule cannot supersede itself."})
         if self.supersedes_id and self.supersedes.contract_id != self.contract_id:
             raise ValidationError({"supersedes": "A pricing rule can only supersede a rule in the same contract."})
+        if self.contract_id:
+            organization_type = self.contract.organization.organization_type
+            clinic_only_services = {"ocular_ai_review", "sentinel_ai_analysis"}
+            if organization_type == "hospital" and self.service_type in clinic_only_services:
+                raise ValidationError(
+                    {"service_type": "Clinic AI charges cannot be added to a hospital contract."}
+                )
+            if self.service_type == "ocular_ai_review" and organization_type != "clinic":
+                raise ValidationError(
+                    {"service_type": "Ocular AI review pricing is available only for clinic contracts."}
+                )
 
     def __str__(self):
         return self.name

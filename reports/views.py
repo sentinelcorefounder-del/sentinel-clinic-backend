@@ -195,6 +195,12 @@ class StructuredReportListCreateView(
         patient = serializer.validated_data.get("patient")
         encounter = serializer.validated_data.get("encounter")
 
+        if not encounter.includes_diabetic_screening:
+            raise PermissionDenied(
+                "General ocular assessments use the ocular clinical record, "
+                "not the diabetic grading report."
+            )
+
         self._validate_report_prerequisites(serializer, patient, encounter)
         self._apply_encounter_va_defaults(serializer, encounter)
 

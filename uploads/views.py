@@ -66,10 +66,13 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
 
         image_upload = serializer.save(patient=encounter.patient)
 
-        try:
-            run_ai_analysis(image_upload)
-        except Exception as exc:
-            print("AI analysis failed after upload:", exc)
+        # General ocular images must not enter the diabetic AI/dataset
+        # workflow. Combined encounters retain the diabetic component.
+        if encounter.includes_diabetic_screening:
+            try:
+                run_ai_analysis(image_upload)
+            except Exception as exc:
+                print("AI analysis failed after upload:", exc)
 
         try:
             if hasattr(encounter, "update_status_from_related_records"):

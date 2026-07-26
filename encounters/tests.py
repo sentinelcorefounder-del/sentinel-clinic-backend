@@ -1,3 +1,380 @@
-from django.test import TestCase
+from datetime import date
+from decimal import Decimal
 
-# Create your tests here.
+from django.contrib.auth.models import User
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+from unittest.mock import patch
+
+from organizations.models import Organization, OrganizationProfile
+from patients.models import Patient
+from users.models import UserOrganization
+from finance.models import (
+    OrganizationWallet,
+    PartnerContract,
+    PricingRule,
+    WalletLedgerEntry,
+)
+from finance.services import top_up_wallet
+from consents.models import ConsentRecord
+
+from .models import (
+    OcularAIReview,
+    OcularDiagnosticAssessment,
+    OcularInvestigation,
+    ScreeningEncounter,
+)
+
+
+class OcularDiagnosticWorkflowTests(TestCase):
+    def setUp(self):
+        self.clinic = Organization.objects.create(
+            clinic_id="CLINIC-OCULAR",
+            name="Ocular Test Clinic",
+            organization_type="clinic",
+        )
+        self.profile = OrganizationProfile.objects.create(
+            organization=self.clinic,
+            ocular_diagnostics_enabled=True,
+            clinic_direct_screening_enabled=True,
+            workflow_mode="clinic_managed",
+            default_payment_responsibility="patient",
+        )
+        self.user = User.objects.create_user("ocular-clinician", password="test")
+        UserOrganization.objects.create(
+            user=self.user, organization=self.clinic
+        )
+        self.patient = Patient.objects.create(
+            patient_id="PAT-OCULAR-1",
+            first_name="Test",
+            last_name="Patient",
+            date_of_birth=date(1980, 1, 1),
+            sex="female",
+            assigned_clinic=self.clinic,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.wallet = OrganizationWallet.objects.create(
+            organization=self.clinic,
+            currency="NGN",
+        )
+        top_up_wallet(
+            self.wallet,
+            "10000.00",
+            "ocular-ai-test-opening-balance",
+        )
+        self.clinical_ai_consent = ConsentRecord.objects.create(
+            consent_id="CNS-OCULAR-AI-1",
+            patient=self.patient,
+            consent_type="ai_clinical_review",
+            consent_status="granted",
+            consent_date=date(2026, 7, 26),
+            captured_by="Test clinician",
+        )
+
+    def payload(self, programme):
+        return {
+            "encounter_id": f"ENC-{programme}",
+            "patient": self.patient.id,
+            "encounter_date": "2026-07-26",
+            "programme": programme,
+            "source_type": "clinic_direct",
+            "workflow_route": "clinic_managed",
+            "payment_responsibility": "patient",
+        }
+
+    def test_ocular_encounter_creates_separate_clinical_record(self):
+        response = self.client.post(
+            "/api/encounters/",
+            self.payload("ocular_diagnostics"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        encounter = ScreeningEncounter.objects.get(pk=response.data["id"])
+        self.assertEqual(encounter.encounter_type, "ocular_assessment")
+        self.assertIsNone(encounter.hospital_referral)
+        self.assertTrue(
+            OcularDiagnosticAssessment.objects.filter(
+                encounter=encounter
+            ).exists()
+        )
+
+    def test_combined_encounter_has_both_programme_flags(self):
+        response = self.client.post(
+            "/api/encounters/",
+            self.payload("combined_assessment"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        encounter = ScreeningEncounter.objects.get(pk=response.data["id"])
+        self.assertTrue(encounter.includes_diabetic_screening)
+        self.assertTrue(encounter.includes_ocular_diagnostics)
+        self.assertTrue(hasattr(encounter, "ocular_assessment"))
+
+    def test_disabled_clinic_cannot_create_ocular_encounter(self):
+        self.profile.ocular_diagnostics_enabled = False
+        self.profile.save(update_fields=["ocular_diagnostics_enabled"])
+        response = self.client.post(
+            "/api/encounters/",
+            self.payload("ocular_diagnostics"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def create_ocular_encounter(self, suffix=""):
+        payload = self.payload("ocular_diagnostics")
+        if suffix:
+            payload["encounter_id"] = (
+                f"{payload['encounter_id']}-{suffix}"
+            )[:30]
+        response = self.client.post(
+            "/api/encounters/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        return ScreeningEncounter.objects.get(pk=response.data["id"])
+
+    def upload_visual_field(self, encounter):
+        visual_field = SimpleUploadedFile(
+            "right-field.pdf",
+            b"%PDF-1.4 test visual field",
+            content_type="application/pdf",
+        )
+        return self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-investigations/",
+            {
+                "investigation_type": "visual_field",
+                "laterality": "right",
+                "test_type": "24-2 SITA Fast",
+                "device_name": "Humphrey",
+                "reliability": "reliable",
+                "file": visual_field,
+            },
+            format="multipart",
+        )
+
+    def test_visual_field_pdf_is_linked_to_ocular_encounter(self):
+        encounter = self.create_ocular_encounter()
+        response = self.upload_visual_field(encounter)
+        self.assertEqual(response.status_code, 201, response.data)
+        investigation = OcularInvestigation.objects.get(
+            pk=response.data["id"]
+        )
+        self.assertEqual(investigation.encounter, encounter)
+        self.assertEqual(investigation.investigation_type, "visual_field")
+        self.assertEqual(investigation.original_filename, "right-field.pdf")
+
+    def test_ai_review_requires_locked_clinician_assessment(self):
+        encounter = self.create_ocular_encounter()
+        self.upload_visual_field(encounter)
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(OcularAIReview.objects.count(), 0)
+
+    def test_ai_review_requires_separate_clinical_ai_consent_before_charge(self):
+        encounter = self.create_ocular_encounter("NO-CONSENT")
+        self.upload_visual_field(encounter)
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Glaucoma suspect"
+        assessment.management_plan = "Refer"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+        self.clinical_ai_consent.delete()
+
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(OcularAIReview.objects.count(), 0)
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("10000.00"))
+
+    def test_ai_review_requires_file_privacy_confirmation_before_charge(self):
+        encounter = self.create_ocular_encounter("NO-PRIVACY")
+        self.upload_visual_field(encounter)
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Glaucoma suspect"
+        assessment.management_plan = "Refer"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(OcularAIReview.objects.count(), 0)
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("10000.00"))
+
+    @patch("encounters.views.run_ocular_ai_review")
+    def test_completed_assessment_can_request_structured_ai_review(self, run):
+        encounter = self.create_ocular_encounter()
+        self.upload_visual_field(encounter)
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Suspicious glaucomatous optic neuropathy"
+        assessment.management_plan = "Refer for glaucoma assessment"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+        run.return_value = (
+            {
+                "suspected_conditions": [
+                    {"label": "Glaucoma suspect", "certainty": "probable", "eye": "right"}
+                ],
+                "supporting_findings": ["Repeatable arcuate field defect"],
+                "differential_diagnoses": ["Neurological field defect"],
+                "suggested_urgency": "priority",
+                "suggested_management": "Specialist glaucoma assessment",
+                "limitations": ["Fundus correlation required"],
+                "agreement_status": "partial_agreement",
+                "disagreement_reasons": [],
+                "expert_review_required": False,
+            },
+            type("Response", (), {"model": "test-model"})(),
+        )
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["provider"], "openai")
+        self.assertEqual(
+            response.data["clinical_ai_consent"],
+            self.clinical_ai_consent.pk,
+        )
+        self.assertFalse(
+            response.data["transmitted_data_manifest"]["direct_identifiers_included"]
+        )
+        self.assertEqual(response.data["agreement_status"], "partial_agreement")
+        self.assertEqual(response.data["clinician_decision"], "pending")
+        self.assertEqual(response.data["fee_amount"], "0.00")
+        self.assertEqual(response.data["payment_status"], "free")
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("10000.00"))
+
+        second = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(
+            WalletLedgerEntry.objects.filter(
+                metadata__service_type="ocular_ai_review"
+            ).count(),
+            0,
+        )
+
+    @patch("encounters.views.run_ocular_ai_review")
+    def test_failed_ai_review_is_refunded_and_cannot_be_retried(self, run):
+        encounter = self.create_ocular_encounter()
+        self.upload_visual_field(encounter)
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Glaucoma suspect"
+        assessment.management_plan = "Refer"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+        run.side_effect = RuntimeError("Provider unavailable")
+
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["payment_status"], "free_failed")
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("10000.00"))
+
+        second = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(second.status_code, 409)
+
+    @patch("encounters.views.run_ocular_ai_review")
+    def test_contract_price_applies_after_clinic_free_review(self, run):
+        OcularAIReview.objects.create(
+            review_id="OAI-PRIORFREE",
+            encounter=self.create_ocular_encounter("PRIOR"),
+            requested_by=self.user,
+            status="completed",
+            provider="hybrid",
+            fee_amount=Decimal("0.00"),
+            fee_currency="NGN",
+            payment_status="free",
+            clinician_impression_snapshot="Prior",
+            clinician_management_snapshot="Prior",
+        )
+        contract = PartnerContract.objects.create(
+            organization=self.clinic,
+            name="Ocular contract",
+            programme="ocular_diagnostics",
+            status=PartnerContract.Status.ACTIVE,
+            currency="NGN",
+            effective_from=date(2026, 1, 1),
+        )
+        rule = PricingRule.objects.create(
+            contract=contract,
+            name="AI review price",
+            service_type="ocular_ai_review",
+            gross_amount=Decimal("2750.00"),
+            effective_from=date(2026, 1, 1),
+        )
+        encounter = self.create_ocular_encounter("PAID")
+        self.upload_visual_field(encounter)
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Glaucoma suspect"
+        assessment.management_plan = "Refer"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+        run.return_value = (
+            {
+                "suspected_conditions": [],
+                "supporting_findings": [],
+                "differential_diagnoses": [],
+                "suggested_urgency": "routine",
+                "suggested_management": "Review",
+                "limitations": [],
+                "agreement_status": "agreement",
+                "disagreement_reasons": [],
+                "expert_review_required": False,
+            },
+            type("Response", (), {"model": "test-model"})(),
+        )
+
+        quote = self.client.get(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/"
+        )
+        self.assertEqual(quote.data["pricing"]["amount_due"], "2750.00")
+        self.assertFalse(quote.data["pricing"]["free_review_available"])
+        self.assertEqual(quote.data["pricing"]["pricing_source"], "contract")
+
+        response = self.client.post(
+            f"/api/encounters/{encounter.id}/ocular-ai-reviews/",
+            {"privacy_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["fee_amount"], "2750.00")
+        self.assertEqual(response.data["payment_status"], "charged")
+        self.assertEqual(response.data["pricing_rule"], rule.pk)
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.available_balance, Decimal("7250.00"))
