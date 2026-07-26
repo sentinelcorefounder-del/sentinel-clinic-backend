@@ -126,9 +126,7 @@ class OcularDiagnosticWorkflowTests(TestCase):
     def create_ocular_encounter(self, suffix=""):
         payload = self.payload("ocular_diagnostics")
         if suffix:
-            payload["encounter_id"] = (
-                f"{payload['encounter_id']}-{suffix}"
-            )[:30]
+            payload["encounter_id"] = f"ENC-OCULAR-{suffix}"[:30]
         response = self.client.post(
             "/api/encounters/",
             payload,
@@ -378,3 +376,65 @@ class OcularDiagnosticWorkflowTests(TestCase):
         self.assertEqual(response.data["pricing_rule"], rule.pk)
         self.wallet.refresh_from_db()
         self.assertEqual(self.wallet.available_balance, Decimal("7250.00"))
+
+    def test_ocular_report_composition_rejects_foreign_investigation(self):
+        first = self.create_ocular_encounter("REPORT-A")
+        second = self.create_ocular_encounter("REPORT-B")
+        investigation_response = self.upload_visual_field(second)
+        response = self.client.patch(
+            f"/api/encounters/{first.id}/ocular-assessment/",
+            {
+                "report_layout": "with_investigations",
+                "selected_ocular_investigation_ids": [
+                    investigation_response.data["id"]
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_ocular_pdf_is_clinic_branded_and_excludes_ai_output(self):
+        self.clinic.report_footer_note = "Independent clinical eye report."
+        self.clinic.save(update_fields=["report_footer_note"])
+        encounter = self.create_ocular_encounter("REPORT")
+        assessment = encounter.ocular_assessment
+        assessment.impression = "Glaucoma suspect"
+        assessment.management_plan = "Refer for specialist assessment"
+        assessment.completed_at = timezone.now()
+        assessment.completed_by = self.user
+        assessment.save()
+        OcularAIReview.objects.create(
+            review_id="OAI-REPORT",
+            encounter=encounter,
+            requested_by=self.user,
+            status="completed",
+            provider="hybrid",
+            fee_amount=Decimal("0.00"),
+            payment_status="free",
+            clinician_impression_snapshot=assessment.impression,
+            clinician_management_snapshot=assessment.management_plan,
+            suggested_management="RAW AI TEXT MUST NOT APPEAR",
+        )
+
+        response = self.client.get(
+            f"/api/encounters/{encounter.id}/ocular-assessment/pdf/"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertNotIn(b"RAW AI TEXT MUST NOT APPEAR", response.content)
+        self.assertNotIn(b"Sentinel", response.content)
+
+    def test_other_clinic_cannot_download_ocular_pdf(self):
+        encounter = self.create_ocular_encounter("SCOPED")
+        other = Organization.objects.create(
+            clinic_id="CLINIC-OTHER",
+            name="Other Clinic",
+            organization_type="clinic",
+        )
+        other_user = User.objects.create_user("other-clinician", password="test")
+        UserOrganization.objects.create(user=other_user, organization=other)
+        self.client.force_authenticate(other_user)
+        response = self.client.get(
+            f"/api/encounters/{encounter.id}/ocular-assessment/pdf/"
+        )
+        self.assertEqual(response.status_code, 403)

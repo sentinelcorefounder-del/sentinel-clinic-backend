@@ -5,6 +5,7 @@ from .views import (
     PatientEncounterListView,
     PatientActiveReferralListView,
     OcularDiagnosticAssessmentDetailView,
+    OcularDiagnosticAssessmentPDFView,
     OcularInvestigationListCreateView,
     OcularInvestigationDetailView,
     OcularAIReviewListCreateView,
@@ -18,6 +19,11 @@ urlpatterns = [
         "<int:encounter_id>/ocular-assessment/",
         OcularDiagnosticAssessmentDetailView.as_view(),
         name="ocular-assessment-detail",
+    ),
+    path(
+        "<int:encounter_id>/ocular-assessment/pdf/",
+        OcularDiagnosticAssessmentPDFView.as_view(),
+        name="ocular-assessment-pdf",
     ),
     path(
         "<int:encounter_id>/ocular-investigations/",

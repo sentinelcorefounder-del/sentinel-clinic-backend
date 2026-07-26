@@ -218,6 +218,17 @@ class OcularDiagnosticAssessment(models.Model):
         blank=True,
         default="",
     )
+    report_layout = models.CharField(
+        max_length=20,
+        choices=[
+            ("text_only", "Text only"),
+            ("with_investigations", "With investigations"),
+        ],
+        default="text_only",
+    )
+    selected_fundus_upload_ids = models.JSONField(default=list, blank=True)
+    selected_ocular_investigation_ids = models.JSONField(default=list, blank=True)
+    attachment_captions = models.JSONField(default=dict, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

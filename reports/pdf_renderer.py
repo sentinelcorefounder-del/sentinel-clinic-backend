@@ -19,6 +19,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from organizations.report_branding import resolve_report_branding
 
 REPORT_FORMATS = {"clinician", "patient", "hospital", "ops"}
 
@@ -76,6 +77,7 @@ class ForegroundWatermarkCanvas(pdf_canvas.Canvas):
     """
 
     report = None
+    branding = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -128,6 +130,8 @@ class ForegroundWatermarkCanvas(pdf_canvas.Canvas):
             8 * mm,
             f"Confidential clinical document · Report {report_id}",
         )
+        if self.branding is not None and self.branding.powered_by_sentinel:
+            self.drawCentredString(width / 2, 8 * mm, "Powered by Sentinel")
         self.drawRightString(
             width - 18 * mm,
             8 * mm,
@@ -144,6 +148,11 @@ class ReportPDFRenderer:
         self.patient = report.patient
         self.encounter = report.encounter
         self.clinic = getattr(self.patient, "assigned_clinic", None)
+        self.branding = resolve_report_branding(
+            self.encounter,
+            clinic=self.clinic,
+            report=self.report,
+        )
         self._image_buffers: list[BytesIO] = []
 
         styles = getSampleStyleSheet()
@@ -225,7 +234,10 @@ class ReportPDFRenderer:
             topMargin=18 * mm,
             bottomMargin=18 * mm,
             title=f"{self.report.report_id} {self.report_format.title()} Report",
-            author="Sentinel",
+            author=_display(
+                getattr(self.branding.primary_organization, "name", None),
+                "Clinical service",
+            ),
         )
 
         story = self._build_story()
@@ -235,6 +247,7 @@ class ReportPDFRenderer:
             def __init__(canvas_self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 canvas_self.report = report
+                canvas_self.branding = self.branding
 
         doc.build(
             story,
@@ -255,25 +268,53 @@ class ReportPDFRenderer:
         else:
             story = self._clinician_story()
 
-        if self.report_format in {"patient", "clinician", "hospital", "ops"}:
+        if (
+            self.report_format in {"patient", "clinician", "hospital", "ops"}
+            and self.report.report_layout == "with_investigations"
+        ):
             story.extend(self._image_page())
         return story
 
-    def _logo_flowable(self):
-        logo_path = os.path.join(settings.BASE_DIR, "assets", "sentinel-logo.png")
-        if os.path.exists(logo_path):
-            return Image(logo_path, width=38 * mm, height=18 * mm, kind="proportional")
-        return Paragraph("<b>Sentinel</b>", self.styles["Heading2"])
+    def _brand_flowable(self, brand):
+        logo = getattr(brand.organization, "logo", None)
+        logo_path = brand.logo_path
+        if logo:
+            try:
+                logo.open("rb")
+                image_buffer = BytesIO(logo.read())
+                logo.close()
+                self._image_buffers.append(image_buffer)
+                return Image(image_buffer, width=38 * mm, height=18 * mm, kind="proportional")
+            except Exception:
+                pass
+        if logo_path:
+            try:
+                return Image(logo_path, width=38 * mm, height=18 * mm, kind="proportional")
+            except Exception:
+                pass
+        return Paragraph(
+            f"<b>{_display(brand.name, 'Clinical report')}</b>",
+            self.styles["Heading2"],
+        )
 
     def _header(self, title: str, subtitle: str = ""):
-        clinic_name = _display(getattr(self.clinic, "name", None), "Sentinel")
-        right_text = f"<b>{clinic_name}</b>"
+        primary = self.branding.primary_organization
+        primary_name = _display(getattr(primary, "name", None), "Clinical service")
+        right_text = f"<b>{primary_name}</b>"
+        address = _display(getattr(primary, "address", None), "")
+        phone = _display(getattr(primary, "phone", None), "")
+        email = _display(getattr(primary, "contact_email", None), "")
+        contact = " · ".join(value for value in (address, phone, email) if value)
+        if contact:
+            right_text += f"<br/><font size='7'>{contact}</font>"
         if subtitle:
             right_text += f"<br/><font size='8'>{subtitle}</font>"
 
+        brand_cells = [self._brand_flowable(brand) for brand in self.branding.brands]
+        brand_width = 95 * mm / max(len(brand_cells), 1)
         logo_table = Table(
-            [[self._logo_flowable(), Paragraph(right_text, self.styles["BodySmall"])]],
-            colWidths=[95 * mm, 77 * mm],
+            [[*brand_cells, Paragraph(right_text, self.styles["BodySmall"])]],
+            colWidths=[brand_width] * len(brand_cells) + [77 * mm],
         )
         logo_table.setStyle(
             TableStyle(
@@ -352,7 +393,7 @@ class ReportPDFRenderer:
             or self.patient.patient_id
         )
         rows = [
-            ["Patient", f"{self.patient.first_name} {self.patient.last_name}", "Sentinel Patient ID", sentinel_patient_id],
+            ["Patient", f"{self.patient.first_name} {self.patient.last_name}", "Patient reference", sentinel_patient_id],
             ["Date of birth", _display(self.patient.date_of_birth), "Local Patient ID", self.patient.patient_id],
             ["Sex", _human(self.patient.sex), "Report format", self.report_format.title()],
         ]
@@ -486,6 +527,17 @@ class ReportPDFRenderer:
         )
         return table
 
+    def _organisation_footer(self):
+        organization = self.branding.primary_organization
+        note = _display(getattr(organization, "report_footer_note", None), "")
+        lines = [note] if note else []
+        if not lines:
+            return []
+        return [
+            Spacer(1, 9),
+            Paragraph("<br/>".join(lines), self.styles["Footer"]),
+        ]
+
     def _clinician_story(self):
         story = self._header(
             "Clinician Retinal Assessment Report",
@@ -519,6 +571,7 @@ class ReportPDFRenderer:
             self._section_title("Clinical sign-off"),
             self._signature_block(),
         ]
+        story += self._organisation_footer()
         return story
 
     def _patient_story(self):
@@ -566,6 +619,7 @@ class ReportPDFRenderer:
             self._section_title("Clinical sign-off"),
             self._signature_block(),
         ]
+        story += self._organisation_footer()
         return story
 
     def _hospital_story(self):
@@ -618,6 +672,7 @@ class ReportPDFRenderer:
             self._section_title("Clinical sign-off"),
             self._signature_block(),
         ]
+        story += self._organisation_footer()
         return story
 
     def _ops_story(self):
@@ -716,36 +771,38 @@ class ReportPDFRenderer:
         return story
 
     def _image_page(self):
-        uploads = list(
-            self.encounter.image_uploads.all().order_by("eye_laterality", "id")
+        fundus_ids = list(self.report.selected_fundus_upload_ids or [])
+        investigation_ids = list(self.report.selected_ocular_investigation_ids or [])
+        uploads_by_id = {
+            item.id: item
+            for item in self.encounter.image_uploads.filter(id__in=fundus_ids)
+        }
+        investigations_by_id = {
+            item.id: item
+            for item in self.encounter.ocular_investigations.filter(id__in=investigation_ids)
+        }
+        selected_items = (
+            [("fundus", uploads_by_id[item_id]) for item_id in fundus_ids if item_id in uploads_by_id]
+            + [
+                ("investigation", investigations_by_id[item_id])
+                for item_id in investigation_ids
+                if item_id in investigations_by_id
+            ]
         )
-        if not uploads:
+        if not selected_items:
             return []
-
-        selected = {}
-        for upload in uploads:
-            eye = (upload.eye_laterality or "").strip().lower()
-            if eye not in selected:
-                selected[eye] = upload
-
-        ordered = []
-        for key in ("right", "od", "left", "os"):
-            if key in selected and selected[key] not in ordered:
-                ordered.append(selected[key])
-        for upload in uploads:
-            if upload not in ordered:
-                ordered.append(upload)
-        ordered = ordered[:2]
 
         story = [
             PageBreak(),
-            *self._header("Retinal Photographs", "Images captured for this assessment"),
+            *self._header("Selected Clinical Investigations", "Clinician-selected supporting material"),
         ]
 
-        for index, upload in enumerate(ordered):
-            file_obj = getattr(upload, "image_file", None)
+        captions = self.report.attachment_captions or {}
+        for index, (kind, item) in enumerate(selected_items):
+            file_obj = getattr(item, "image_file", None) if kind == "fundus" else getattr(item, "file", None)
             image_flowable = None
-            if file_obj:
+            filename = (getattr(file_obj, "name", "") or "").lower()
+            if file_obj and not filename.endswith(".pdf"):
                 try:
                     file_obj.open("rb")
                     image_buffer = BytesIO(file_obj.read())
@@ -760,11 +817,22 @@ class ReportPDFRenderer:
                 except Exception:
                     image_flowable = None
 
-            eye_label = _human(getattr(upload, "eye_laterality", "")) or f"Image {index + 1}"
-            quality = _human(getattr(upload, "image_quality", ""))
-            gradable = "Yes" if getattr(upload, "gradable", False) else "No"
+            if kind == "fundus":
+                title = f"Fundus photograph — {_human(getattr(item, 'eye_laterality', ''))}"
+                detail = f"Quality: {_human(getattr(item, 'image_quality', ''))}"
+                caption_key = f"fundus:{item.id}"
+            else:
+                title = f"{_human(item.investigation_type)} — {_human(item.laterality)}"
+                detail = " · ".join(
+                    value for value in (
+                        _display(item.test_type, ""),
+                        _display(item.device_name, ""),
+                        _human(item.reliability),
+                    ) if value
+                )
+                caption_key = f"investigation:{item.id}"
 
-            story.append(self._section_title(f"{eye_label} eye"))
+            story.append(self._section_title(title or f"Investigation {index + 1}"))
             if image_flowable:
                 wrapper = Table([[image_flowable]], colWidths=[172 * mm])
                 wrapper.setStyle(
@@ -782,7 +850,8 @@ class ReportPDFRenderer:
             else:
                 story.append(
                     Paragraph(
-                        "Image could not be embedded in this PDF.",
+                        "The selected supporting file is a PDF or could not be embedded as an image. "
+                        "Its clinician-entered details remain listed below.",
                         self.styles["Body"],
                     )
                 )
@@ -791,10 +860,10 @@ class ReportPDFRenderer:
                 Table(
                     [
                         [
-                            "Image quality",
-                            quality,
-                            "Gradable",
-                            gradable,
+                            "Details",
+                            detail or "-",
+                            "Caption",
+                            _display(captions.get(caption_key), "-"),
                         ]
                     ],
                     colWidths=[32 * mm, 54 * mm, 28 * mm, 58 * mm],

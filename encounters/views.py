@@ -4,6 +4,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied
@@ -32,6 +33,7 @@ from .models import (
     ScreeningEncounter,
 )
 from .ocular_ai_service import run_ocular_ai_review
+from .ocular_report_pdf import build_ocular_report_pdf
 from .serializers import (
     OcularAIReviewSerializer,
     OcularDiagnosticAssessmentSerializer,
@@ -586,6 +588,30 @@ class OcularDiagnosticAssessmentDetailView(
             )
         if complete:
             assessment.encounter.update_status_from_related_records()
+
+
+class OcularDiagnosticAssessmentPDFView(APIView):
+    def get(self, request, encounter_id):
+        org = get_user_clinic(request.user)
+        if not org or org.organization_type != "clinic":
+            raise PermissionDenied("You are not linked to a clinic.")
+        assessment = OcularDiagnosticAssessment.objects.select_related(
+            "encounter", "encounter__patient",
+            "encounter__patient__assigned_clinic", "completed_by",
+        ).filter(
+            encounter_id=encounter_id,
+            encounter__patient__assigned_clinic=org,
+        ).first()
+        if not assessment:
+            raise PermissionDenied("Ocular assessment not found for this clinic.")
+        response = HttpResponse(
+            build_ocular_report_pdf(assessment),
+            content_type="application/pdf",
+        )
+        response["Content-Disposition"] = (
+            f'inline; filename="{assessment.encounter.encounter_id}-ocular-report.pdf"'
+        )
+        return response
 
 
 class OcularInvestigationListCreateView(generics.ListCreateAPIView):

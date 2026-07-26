@@ -76,6 +76,10 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "generated_clinical_summary",
             "final_clinical_summary",
             "clinical_summary_overridden",
+            "report_layout",
+            "selected_fundus_upload_ids",
+            "selected_ocular_investigation_ids",
+            "attachment_captions",
             "report_status",
             "notes",
             "submitted_to_ops_at",
@@ -170,6 +174,35 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             if duplicate_qs.exists():
                 raise serializers.ValidationError(
                     {"encounter": "A structured report already exists for this encounter. Edit the existing report instead."}
+                )
+
+        layout = attrs.get("report_layout", getattr(self.instance, "report_layout", "text_only"))
+        fundus_ids = attrs.get(
+            "selected_fundus_upload_ids",
+            getattr(self.instance, "selected_fundus_upload_ids", []),
+        )
+        investigation_ids = attrs.get(
+            "selected_ocular_investigation_ids",
+            getattr(self.instance, "selected_ocular_investigation_ids", []),
+        )
+        if layout == "text_only" and (fundus_ids or investigation_ids):
+            raise serializers.ValidationError(
+                {"report_layout": "Text-only reports cannot include investigation attachments."}
+            )
+        if encounter:
+            valid_upload_ids = set(
+                encounter.image_uploads.filter(id__in=fundus_ids).values_list("id", flat=True)
+            )
+            if valid_upload_ids != set(fundus_ids):
+                raise serializers.ValidationError(
+                    {"selected_fundus_upload_ids": "Every selected fundus image must belong to this encounter."}
+                )
+            valid_investigation_ids = set(
+                encounter.ocular_investigations.filter(id__in=investigation_ids).values_list("id", flat=True)
+            )
+            if valid_investigation_ids != set(investigation_ids):
+                raise serializers.ValidationError(
+                    {"selected_ocular_investigation_ids": "Every selected investigation must belong to this encounter."}
                 )
 
         return attrs
