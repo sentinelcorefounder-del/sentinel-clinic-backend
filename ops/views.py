@@ -2016,6 +2016,8 @@ class OpsHospitalDetailView(OpsOnlyMixin, APIView):
                     "screening_fee_amount": hospital.screening_fee_amount,
                     "hospital_commission_amount": hospital.hospital_commission_amount,
                     "currency": hospital.currency,
+                    "logo": request.build_absolute_uri(hospital.logo.url) if hospital.logo else "",
+                    "report_footer_note": hospital.report_footer_note,
                 },
                 "referrals": OpsReferralSerializer(referrals, many=True).data,
                 "payments": OpsPaymentSerializer(payments, many=True).data,
@@ -2152,6 +2154,8 @@ class OpsClinicDetailView(OpsOnlyMixin, APIView):
                     "phone": clinic.phone,
                     "address": clinic.address,
                     "is_active": clinic.is_active,
+                    "logo": request.build_absolute_uri(clinic.logo.url) if clinic.logo else "",
+                    "report_footer_note": clinic.report_footer_note,
                     "capability_profile": capability_profile_data(clinic),
                 },
                 "patients": [

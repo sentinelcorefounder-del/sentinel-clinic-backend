@@ -24,6 +24,14 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
+    def validate_logo(self, logo):
+        if logo.size > 2 * 1024 * 1024:
+            raise serializers.ValidationError("Logo must be 2 MB or smaller.")
+        content_type = getattr(logo, "content_type", "")
+        if content_type and content_type not in {"image/png", "image/jpeg"}:
+            raise serializers.ValidationError("Logo must be a PNG or JPEG image.")
+        return logo
+
 
 
 class OrganizationProfileSerializer(serializers.ModelSerializer):

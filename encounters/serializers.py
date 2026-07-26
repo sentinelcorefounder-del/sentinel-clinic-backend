@@ -92,6 +92,8 @@ class OcularDiagnosticAssessmentSerializer(serializers.ModelSerializer):
             "presenting_complaint", "ocular_history", "anterior_eye_findings",
             "fundus_findings", "visual_field_summary", "tonometry_summary",
             "impression", "management_plan", "management_outcome",
+            "report_layout", "selected_fundus_upload_ids",
+            "selected_ocular_investigation_ids", "attachment_captions",
             "completed_at", "completed_by", "completed_by_display",
             "created_at", "updated_at",
         ]
@@ -103,6 +105,47 @@ class OcularDiagnosticAssessmentSerializer(serializers.ModelSerializer):
     def get_completed_by_display(self, obj):
         user = obj.completed_by
         return user.get_full_name() or user.username if user else ""
+
+    def validate(self, attrs):
+        assessment = self.instance
+        if not assessment:
+            return attrs
+        layout = attrs.get("report_layout", assessment.report_layout)
+        fundus_ids = attrs.get(
+            "selected_fundus_upload_ids",
+            assessment.selected_fundus_upload_ids,
+        )
+        investigation_ids = attrs.get(
+            "selected_ocular_investigation_ids",
+            assessment.selected_ocular_investigation_ids,
+        )
+        if layout == "text_only" and (fundus_ids or investigation_ids):
+            raise serializers.ValidationError({
+                "report_layout": "Text-only reports cannot include attachments."
+            })
+        valid_fundus_ids = set(
+            assessment.encounter.image_uploads.filter(
+                id__in=fundus_ids
+            ).values_list("id", flat=True)
+        )
+        if valid_fundus_ids != set(fundus_ids):
+            raise serializers.ValidationError({
+                "selected_fundus_upload_ids": (
+                    "Every selected fundus image must belong to this encounter."
+                )
+            })
+        valid_investigation_ids = set(
+            assessment.encounter.ocular_investigations.filter(
+                id__in=investigation_ids
+            ).values_list("id", flat=True)
+        )
+        if valid_investigation_ids != set(investigation_ids):
+            raise serializers.ValidationError({
+                "selected_ocular_investigation_ids": (
+                    "Every selected investigation must belong to this encounter."
+                )
+            })
+        return attrs
 
 
 class ScreeningEncounterSerializer(serializers.ModelSerializer):

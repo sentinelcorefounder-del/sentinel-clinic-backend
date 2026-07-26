@@ -145,6 +145,14 @@ class StructuredReport(models.Model):
     generated_clinical_summary = models.TextField(blank=True, default="")
     final_clinical_summary = models.TextField(blank=True, default="")
     clinical_summary_overridden = models.BooleanField(default=False)
+    report_layout = models.CharField(
+        max_length=20,
+        choices=[("text_only", "Text only"), ("with_investigations", "With investigations")],
+        default="text_only",
+    )
+    selected_fundus_upload_ids = models.JSONField(default=list, blank=True)
+    selected_ocular_investigation_ids = models.JSONField(default=list, blank=True)
+    attachment_captions = models.JSONField(default=dict, blank=True)
 
     report_status = models.CharField(
         max_length=30,

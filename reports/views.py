@@ -661,6 +661,7 @@ class StructuredReportPDFView(APIView):
             "hospital_referrals",
             "status_events",
             "encounter__image_uploads",
+            "encounter__ocular_investigations",
         )
 
         try:

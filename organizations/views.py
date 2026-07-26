@@ -36,14 +36,14 @@ class OrganizationListView(generics.ListAPIView):
         return queryset.filter(id=org.id)
 
 
-class OrganizationDetailView(generics.RetrieveAPIView):
+class OrganizationDetailView(generics.RetrieveUpdateAPIView):
     serializer_class = OrganizationWithProfileSerializer
 
     def get_queryset(self):
         queryset = Organization.objects.all()
 
         user = self.request.user
-        if user.is_superuser:
+        if user.is_superuser or user.groups.filter(name="ops_admin").exists():
             return queryset
 
         org = get_user_organization(user)
@@ -51,6 +51,21 @@ class OrganizationDetailView(generics.RetrieveAPIView):
             return Organization.objects.none()
 
         return queryset.filter(id=org.id)
+
+    def perform_update(self, serializer):
+        organization = serializer.save()
+        branding_policy = self.request.data.get("branding_policy")
+        if branding_policy:
+            profile, _ = OrganizationProfile.objects.get_or_create(
+                organization=organization
+            )
+            allowed = {
+                value
+                for value, _label in OrganizationProfile.BRANDING_POLICY_CHOICES
+            }
+            if branding_policy in allowed:
+                profile.branding_policy = branding_policy
+                profile.save(update_fields=["branding_policy", "updated_at"])
 
 
 class ClinicProvisionView(APIView):
