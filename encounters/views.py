@@ -16,6 +16,10 @@ import uuid
 from audit.services import record_patient_event
 from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
+from organizations.services.branches import (
+    accessible_branch_ids,
+    get_user_default_branch,
+)
 from referrals.models import HospitalReferral
 from users.models import UserOrganization
 from finance.models import (
@@ -199,6 +203,9 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
             "hospital_referral",
             "hospital_referral__source_hospital",
         ).filter(patient__assigned_clinic=org)
+        branch_ids = accessible_branch_ids(self.request.user, org)
+        if branch_ids is not None:
+            queryset = queryset.filter(service_branch_id__in=branch_ids)
 
         search = self.request.query_params.get("search")
         status_value = self.request.query_params.get("status")
@@ -407,6 +414,9 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
                 "assessment pathway."
             )
 
+        values["service_branch"] = (
+            patient.assigned_branch or get_user_default_branch(user, org)
+        )
         encounter = serializer.save(**values)
         if encounter.includes_ocular_diagnostics:
             OcularDiagnosticAssessment.objects.get_or_create(
@@ -486,12 +496,16 @@ class ScreeningEncounterDetailView(
         if not org or org.organization_type != "clinic":
             return ScreeningEncounter.objects.none()
 
-        return ScreeningEncounter.objects.select_related(
+        queryset = ScreeningEncounter.objects.select_related(
             "patient",
             "patient__assigned_clinic",
             "hospital_referral",
             "hospital_referral__source_hospital",
         ).filter(patient__assigned_clinic=org)
+        branch_ids = accessible_branch_ids(self.request.user, org)
+        return queryset if branch_ids is None else queryset.filter(
+            service_branch_id__in=branch_ids
+        )
 
     def perform_update(self, serializer):
         org = get_user_clinic(self.request.user)

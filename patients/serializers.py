@@ -34,8 +34,10 @@ class PatientSerializer(serializers.ModelSerializer):
             "referring_hospital_id", "referring_hospital_name",
             "referral_id_display", "referring_hospitals",
             "sentinel_patient_id", "master_patient_id",
+            "assigned_branch",
             "created_at", "updated_at",
         ]
+        read_only_fields = ["assigned_branch"]
 
     def _clinic_referrals(self, obj):
         prefetched = getattr(obj, "clinic_source_referrals", None)

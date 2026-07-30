@@ -1,6 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
-from organizations.models import Organization
+from organizations.models import Organization, OrganizationBranch
 
 
 class UserOrganization(models.Model):
@@ -29,3 +29,39 @@ class UserSecurityProfile(models.Model):
 
     def __str__(self):
         return f"{self.user.username} security profile"
+
+
+class UserBranchAccess(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="branch_access",
+    )
+    branch = models.ForeignKey(
+        OrganizationBranch,
+        on_delete=models.CASCADE,
+        related_name="user_access",
+    )
+    has_all_branch_access = models.BooleanField(default=False)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "branch"],
+                name="unique_user_branch_access",
+            )
+        ]
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        try:
+            organization_id = self.user.organization_link.organization_id
+        except Exception:
+            organization_id = None
+        if organization_id and self.branch.organization_id != organization_id:
+            raise ValidationError(
+                {"branch": "Branch must belong to the user's organization."}
+            )

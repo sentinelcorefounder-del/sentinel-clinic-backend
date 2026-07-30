@@ -6,12 +6,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
-from .models import Organization, OrganizationProfile
+from .models import Organization, OrganizationBranch, OrganizationProfile
 from .provision_serializers import ClinicProvisionSerializer, HospitalProvisionSerializer
 from .serializers import (
     OrganizationSerializer,
     OrganizationProfileSerializer,
     OrganizationWithProfileSerializer,
+    OrganizationBranchSerializer,
 )
 from .services.provisioning import (
     provision_clinic_with_admin,
@@ -151,3 +152,60 @@ class MyOrganizationCapabilityProfileView(APIView):
         return Response(
             OrganizationProfileSerializer(profile).data
         )
+
+
+class OrganizationBranchListCreateView(generics.ListCreateAPIView):
+    serializer_class = OrganizationBranchSerializer
+    permission_classes = [IsAuthenticated]
+
+    def _organization(self):
+        organization_id = self.kwargs["organization_id"]
+        user = self.request.user
+        queryset = Organization.objects.filter(pk=organization_id)
+        if user.is_superuser or user.groups.filter(name="ops_admin").exists():
+            return queryset.first()
+        organization = get_user_organization(user)
+        return organization if organization and organization.id == organization_id else None
+
+    def get_queryset(self):
+        organization = self._organization()
+        if not organization:
+            return OrganizationBranch.objects.none()
+        return organization.branches.all()
+
+    def perform_create(self, serializer):
+        organization = self._organization()
+        if not organization:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You cannot manage branches for this organization.")
+        allowed = self.request.user.is_superuser or self.request.user.groups.filter(
+            name__in=["ops_admin", "clinic_admin", "hospital_admin"]
+        ).exists()
+        if not allowed:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only organisation administrators can create branches.")
+        serializer.save(organization=organization)
+
+
+class OrganizationBranchDetailView(generics.RetrieveUpdateAPIView):
+    serializer_class = OrganizationBranchSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = OrganizationBranch.objects.filter(
+            organization_id=self.kwargs["organization_id"]
+        )
+        if user.is_superuser or user.groups.filter(name="ops_admin").exists():
+            return queryset
+        organization = get_user_organization(user)
+        return queryset.filter(organization=organization) if organization else queryset.none()
+
+    def perform_update(self, serializer):
+        allowed = self.request.user.is_superuser or self.request.user.groups.filter(
+            name__in=["ops_admin", "clinic_admin", "hospital_admin"]
+        ).exists()
+        if not allowed:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only organisation administrators can update branches.")
+        serializer.save()

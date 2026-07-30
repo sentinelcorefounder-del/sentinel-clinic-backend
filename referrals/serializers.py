@@ -9,6 +9,8 @@ from reports.release_control import (
 class HospitalReferralSerializer(serializers.ModelSerializer):
     source_hospital_name = serializers.CharField(source="source_hospital.name", read_only=True)
     matched_clinic_name = serializers.CharField(source="matched_clinic.name", read_only=True)
+    source_branch_name = serializers.CharField(source="source_branch.name", read_only=True)
+    matched_branch_name = serializers.CharField(source="matched_branch.name", read_only=True)
     report_id_display = serializers.CharField(source="report.report_id", read_only=True)
     report_pk = serializers.IntegerField(source="report.id", read_only=True)
     patient_linked_id = serializers.CharField(source="patient.patient_id", read_only=True)
@@ -28,6 +30,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "referral_id",
             "source_hospital",
             "source_hospital_name",
+            "source_branch", "source_branch_name",
             "patient",
             "patient_linked_id",
             "patient_id_text",
@@ -42,6 +45,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "email",
             "matched_clinic",
             "matched_clinic_name",
+            "matched_branch", "matched_branch_name",
             "report",
             "report_pk",
             "report_id_display",

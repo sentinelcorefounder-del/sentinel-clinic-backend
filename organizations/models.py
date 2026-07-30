@@ -51,6 +51,42 @@ class Organization(models.Model):
         return f"{self.name} ({self.clinic_id})"
 
 
+class OrganizationBranch(models.Model):
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="branches",
+    )
+    branch_code = models.CharField(max_length=50)
+    name = models.CharField(max_length=255)
+    address = models.TextField(blank=True)
+    contact_email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+    is_head_office = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    inherits_branding = models.BooleanField(default=True)
+    inherits_contract = models.BooleanField(default=True)
+    inherits_wallet = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["organization__name", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "branch_code"],
+                name="unique_branch_code_per_organization",
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "name"],
+                name="unique_branch_name_per_organization",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.organization.name} — {self.name}"
+
+
 class OrganizationProfile(models.Model):
     WORKFLOW_MODE_CHOICES = [
         ("sentinel_managed", "Sentinel Managed"),
@@ -248,4 +284,3 @@ class OrganizationProfile(models.Model):
 
         self.full_clean()
         super().save(*args, **kwargs)
-

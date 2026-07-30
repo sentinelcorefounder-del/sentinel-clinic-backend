@@ -58,6 +58,13 @@ class HospitalReferral(models.Model):
         blank=True,
         related_name="submitted_hospital_referrals",
     )
+    source_branch = models.ForeignKey(
+        "organizations.OrganizationBranch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="submitted_hospital_referrals",
+    )
 
     patient = models.ForeignKey(
         Patient,
@@ -80,6 +87,13 @@ class HospitalReferral(models.Model):
 
     matched_clinic = models.ForeignKey(
         Organization,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="matched_hospital_referrals",
+    )
+    matched_branch = models.ForeignKey(
+        "organizations.OrganizationBranch",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

@@ -72,6 +72,13 @@ class ScreeningEncounter(models.Model):
         blank=True,
         related_name="originated_screening_encounters",
     )
+    service_branch = models.ForeignKey(
+        "organizations.OrganizationBranch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="screening_encounters",
+    )
     hospital_referral = models.ForeignKey(
         "referrals.HospitalReferral",
         on_delete=models.SET_NULL,

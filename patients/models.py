@@ -40,6 +40,13 @@ class Patient(models.Model):
         blank=True,
         related_name="patients",
     )
+    assigned_branch = models.ForeignKey(
+        "organizations.OrganizationBranch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="patients",
+    )
     referral_id = models.CharField(max_length=50, blank=True)
     referral_status = models.CharField(max_length=50, blank=True)
     appointment_date = models.DateField(null=True, blank=True)
@@ -100,6 +107,12 @@ class MasterPatient(models.Model):
 
     def __str__(self):
         return f"{self.sentinel_patient_id} - {self.first_name} {self.last_name}"
+
+
+class MasterPatientSequence(models.Model):
+    """Single locked counter used to issue collision-safe Sentinel IDs."""
+
+    next_value = models.PositiveBigIntegerField(default=1)
 
 
 class PatientOrganizationIdentity(models.Model):

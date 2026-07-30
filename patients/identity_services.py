@@ -5,6 +5,7 @@ from django.db import transaction
 
 from .models import (
     MasterPatient,
+    MasterPatientSequence,
     Patient,
     PatientIdentityReview,
     PatientOrganizationIdentity,
@@ -16,27 +17,23 @@ def normalise_text(value):
 
 
 def normalise_phone(value):
-    return re.sub(r"\D", "", value or "")[-11:]
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 13 and digits.startswith("234"):
+        return f"0{digits[3:]}"
+    return digits
 
 
 def generate_sentinel_patient_id():
-    latest = (
-        MasterPatient.objects.filter(
-            sentinel_patient_id__startswith="SNT-PAT-"
-        )
-        .order_by("-id")
-        .first()
+    sequence, _ = MasterPatientSequence.objects.select_for_update().get_or_create(
+        pk=1,
+        defaults={"next_value": 1},
     )
-    next_number = (latest.id + 1) if latest else 1
-    candidate = f"SNT-PAT-{next_number:08d}"
-
-    while MasterPatient.objects.filter(
-        sentinel_patient_id=candidate
-    ).exists():
-        next_number += 1
-        candidate = f"SNT-PAT-{next_number:08d}"
-
-    return candidate
+    value = sequence.next_value
+    sequence.next_value = value + 1
+    sequence.save(update_fields=["next_value"])
+    return f"SNT-PAT-{value:08d}"
 
 
 def score_master_match(patient, master):

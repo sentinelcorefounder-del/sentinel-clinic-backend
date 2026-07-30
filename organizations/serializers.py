@@ -1,5 +1,6 @@
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
-from .models import Organization, OrganizationProfile
+from .models import Organization, OrganizationBranch, OrganizationProfile
 
 
 class OrganizationSerializer(serializers.ModelSerializer):
@@ -171,3 +172,79 @@ class OrganizationWithProfileSerializer(OrganizationSerializer):
             organization=obj
         )
         return OrganizationProfileSerializer(profile).data
+
+
+class OrganizationBranchSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(
+        source="organization.name",
+        read_only=True,
+    )
+
+    class Meta:
+        model = OrganizationBranch
+        fields = [
+            "id", "organization", "organization_name", "branch_code", "name",
+            "address", "contact_email", "phone", "is_head_office", "is_active",
+            "inherits_branding", "inherits_contract", "inherits_wallet",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["organization", "created_at", "updated_at"]
+
+    def validate_branch_code(self, value):
+        return value.strip().upper().replace(" ", "-")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        organization = (
+            self.instance.organization
+            if self.instance
+            else self.context["view"]._organization()
+        )
+        branch_code = attrs.get(
+            "branch_code",
+            getattr(self.instance, "branch_code", ""),
+        )
+
+        if organization and branch_code:
+            duplicates = OrganizationBranch.objects.filter(
+                organization=organization,
+                branch_code=branch_code,
+            )
+            if self.instance:
+                duplicates = duplicates.exclude(pk=self.instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError(
+                    {
+                        "branch_code": (
+                            "A branch with this code already exists for this "
+                            "organisation."
+                        )
+                    }
+                )
+
+        return attrs
+
+    def create(self, validated_data):
+        try:
+            with transaction.atomic():
+                return super().create(validated_data)
+        except IntegrityError as exc:
+            organization = validated_data.get("organization")
+            branch_code = validated_data.get("branch_code")
+            if (
+                organization
+                and branch_code
+                and OrganizationBranch.objects.filter(
+                    organization=organization,
+                    branch_code=branch_code,
+                ).exists()
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "branch_code": (
+                            "A branch with this code already exists for this "
+                            "organisation."
+                        )
+                    }
+                ) from exc
+            raise
