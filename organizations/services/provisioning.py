@@ -4,13 +4,54 @@ from django.contrib.auth.models import Group
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.db import transaction
+from rest_framework.exceptions import ValidationError
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 
-from organizations.models import Organization
-from users.models import UserOrganization, UserSecurityProfile
+from organizations.models import Organization, OrganizationBranch
+from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 
 User = get_user_model()
+
+
+def _reject_probable_duplicate(*, code, name, email="", phone="", exclude_id=None):
+    queryset = Organization.objects.all()
+    if exclude_id:
+        queryset = queryset.exclude(pk=exclude_id)
+    normal_name = " ".join((name or "").lower().split())
+    for organization in queryset:
+        same_name = " ".join(organization.name.lower().split()) == normal_name
+        same_email = bool(email and organization.contact_email and email.lower() == organization.contact_email.lower())
+        same_phone = bool(phone and organization.phone and "".join(filter(str.isdigit, phone))[-10:] == "".join(filter(str.isdigit, organization.phone))[-10:])
+        if same_name or same_email or same_phone:
+            raise ValidationError({
+                "detail": "A possible existing organization was found. Review it in Ops and add a branch instead of creating a duplicate account.",
+                "possible_match": {
+                    "id": organization.id,
+                    "code": organization.clinic_id,
+                    "name": organization.name,
+                },
+            })
+
+
+def _ensure_main_branch_and_access(organization, user):
+    branch, _ = OrganizationBranch.objects.get_or_create(
+        organization=organization,
+        branch_code="MAIN",
+        defaults={
+            "name": "Main Branch",
+            "address": organization.address,
+            "contact_email": organization.contact_email,
+            "phone": organization.phone,
+            "is_head_office": True,
+        },
+    )
+    UserBranchAccess.objects.update_or_create(
+        user=user,
+        branch=branch,
+        defaults={"has_all_branch_access": True, "is_default": True},
+    )
+    return branch
 
 
 def _build_activation_link(user):
@@ -77,6 +118,14 @@ def _prepare_user_for_activation(user, payload):
 
 @transaction.atomic
 def provision_clinic_with_admin(payload):
+    existing = Organization.objects.filter(clinic_id=payload["clinic_id"]).first()
+    _reject_probable_duplicate(
+        code=payload["clinic_id"],
+        name=payload["name"],
+        email=payload.get("contact_email", ""),
+        phone=payload.get("phone", ""),
+        exclude_id=existing.id if existing else None,
+    )
     organization, organization_created = Organization.objects.update_or_create(
         clinic_id=payload["clinic_id"],
         defaults={
@@ -109,6 +158,7 @@ def provision_clinic_with_admin(payload):
         user=user,
         defaults={"organization": organization},
     )
+    _ensure_main_branch_and_access(organization, user)
 
     role_name = payload.get("admin_role", "clinic_admin")
     group, _ = Group.objects.get_or_create(name=role_name)
@@ -137,6 +187,14 @@ def provision_clinic_with_admin(payload):
 
 @transaction.atomic
 def provision_hospital_with_admin(payload):
+    existing = Organization.objects.filter(clinic_id=payload["hospital_id"]).first()
+    _reject_probable_duplicate(
+        code=payload["hospital_id"],
+        name=payload["hospital_name"],
+        email=payload.get("contact_email", ""),
+        phone=payload.get("phone", ""),
+        exclude_id=existing.id if existing else None,
+    )
     organization, organization_created = Organization.objects.update_or_create(
         clinic_id=payload["hospital_id"],
         defaults={
@@ -165,6 +223,7 @@ def provision_hospital_with_admin(payload):
         user=user,
         defaults={"organization": organization},
     )
+    _ensure_main_branch_and_access(organization, user)
 
     role_name = payload.get("admin_role", "hospital_admin")
     group, _ = Group.objects.get_or_create(name=role_name)

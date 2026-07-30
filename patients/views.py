@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 from audit.services import record_patient_event
 from common.tenant import get_user_organization
 from organizations.models import Organization, OrganizationProfile
+from organizations.services.branches import accessible_branch_ids, get_user_default_branch
 from referrals.models import HospitalReferral
 from users.models import UserOrganization
 
@@ -71,6 +72,9 @@ class PatientListCreateView(generics.ListCreateAPIView):
                 )
             )
         )
+        branch_ids = accessible_branch_ids(user, org)
+        if branch_ids is not None:
+            queryset = queryset.filter(assigned_branch_id__in=branch_ids)
 
         search = (self.request.query_params.get("search") or "").strip()
         source = (self.request.query_params.get("source") or "all").strip()
@@ -140,7 +144,7 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
             .order_by("-updated_at", "-id")
         )
 
-        return (
+        queryset = (
             Patient.objects.select_related("assigned_clinic")
             .filter(assigned_clinic=org)
             .prefetch_related(
@@ -150,6 +154,10 @@ class PatientDetailView(generics.RetrieveUpdateDestroyAPIView):
                     to_attr="clinic_source_referrals",
                 )
             )
+        )
+        branch_ids = accessible_branch_ids(user, org)
+        return queryset if branch_ids is None else queryset.filter(
+            assigned_branch_id__in=branch_ids
         )
 
     def perform_update(self, serializer):
@@ -255,6 +263,7 @@ class ClinicDirectPatientCreateView(APIView):
             referral_id="",
             referral_status="clinic_direct",
             source_system="clinic_direct",
+            assigned_branch=get_user_default_branch(user, org),
         )
 
         request.clinic_organization = org

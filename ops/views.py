@@ -19,11 +19,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from organizations.models import Organization, OrganizationProfile
+from organizations.services.branches import get_main_branch
 from organizations.services.provisioning import (
     provision_clinic_with_admin,
     provision_hospital_with_admin,
 )
 from patients.models import Patient
+from patients.identity_services import ensure_master_identity
 from payments.services.paystack import initialize_transaction, verify_transaction
 from finance.services import capture_finance_for_hospital_publication
 from referrals.models import HospitalReferral
@@ -304,22 +306,30 @@ class OpsAssignClinicView(OpsOnlyMixin, APIView):
                     "country": "Nigeria",
                     "consent_status": "pending",
                     "assigned_clinic": clinic,
+                    "assigned_branch": get_main_branch(clinic),
                     "referral_id": referral.referral_id,
                     "referral_status": "clinic_matched",
                     "source_system": "sentinel_ops",
                 },
             )
             referral.patient = patient
+            ensure_master_identity(
+                patient,
+                organization=clinic,
+                local_id=patient.patient_id,
+            )
         else:
             patient.assigned_clinic = clinic
+            patient.assigned_branch = patient.assigned_branch or get_main_branch(clinic)
             patient.referral_status = "clinic_matched"
             patient.referral_id = referral.referral_id
-            patient.save(update_fields=["assigned_clinic", "referral_status", "referral_id", "updated_at"])
+            patient.save(update_fields=["assigned_clinic", "assigned_branch", "referral_status", "referral_id", "updated_at"])
 
         referral.matched_clinic = clinic
+        referral.matched_branch = get_main_branch(clinic)
         referral.referral_status = "clinic_matched"
         referral.notes = f"{referral.notes or ''}\nAssigned to clinic: {clinic.name}. Patient linked to clinic record.".strip()
-        referral.save(update_fields=["matched_clinic", "referral_status", "patient", "notes", "updated_at"])
+        referral.save(update_fields=["matched_clinic", "matched_branch", "referral_status", "patient", "notes", "updated_at"])
 
         clinic_email_sent = False
         try:
@@ -2387,7 +2397,9 @@ class PublicSelfReferralView(APIView):
             email=email,
             country="Nigeria",
             consent_status="pending",
+            source_system="self_referral",
         )
+        ensure_master_identity(patient, local_id=patient.patient_id)
 
         referral.patient = patient
         referral.save(update_fields=["patient", "updated_at"])

@@ -10,7 +10,9 @@ from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
 from organizations.models import Organization
+from organizations.services.branches import get_user_default_branch
 from patients.models import Patient
+from patients.identity_services import ensure_master_identity
 from reports.models import StructuredReport, ReportStatusEvent
 from reports.release_control import (
     hospital_released_referral_q,
@@ -578,6 +580,11 @@ def _create_or_update_patient_from_referral(org, data, referral_id):
             "referral_status": "submitted",
         },
     )
+    ensure_master_identity(
+        patient,
+        organization=org,
+        local_id=data.get("hospital_mrn") or patient.patient_id,
+    )
     return patient
 
 
@@ -622,6 +629,7 @@ class HospitalReferralSubmitView(APIView):
         hospital_referral = HospitalReferral.objects.create(
             referral_id=referral_id,
             source_hospital=org,
+            source_branch=get_user_default_branch(user, org),
             patient=patient,
             patient_id_text=data.get("patient_id", patient.patient_id),
             first_name=data["first_name"],
