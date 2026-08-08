@@ -12,7 +12,7 @@ from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -49,8 +49,18 @@ def _get_open_mobile_session(token):
 def _assert_session_access(user, session):
     if user.is_superuser:
         return
+
+    roles = set(user.groups.values_list("name", flat=True))
+    if roles.intersection({"ops_admin", "sentinel_ops", "super_admin"}):
+        return
+
     org = get_user_organization(user)
-    if not org or session.encounter.patient.assigned_clinic_id != org.id:
+    if (
+        not org
+        or not org.is_active
+        or org.organization_type != "clinic"
+        or session.encounter.patient.assigned_clinic_id != org.id
+    ):
         raise PermissionDenied("You cannot access this encounter transfer.")
 
 
@@ -66,7 +76,7 @@ def _pending_payload(item, request):
 
 
 class MobileTransferCreateView(APIView):
-    permission_classes = [CanManageUploads]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, encounter_id):
         from encounters.models import ScreeningEncounter
@@ -150,7 +160,7 @@ class MobileTransferPublicView(APIView):
 
 
 class MobileTransferReviewView(APIView):
-    permission_classes = [CanManageUploads]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, session_id):
         try:
@@ -169,12 +179,12 @@ class MobileTransferReviewView(APIView):
 
 
 class MobileTransferImageReviewView(APIView):
-    permission_classes = [CanManageUploads]
+    permission_classes = [IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, session_id, image_id):
         try:
-            item = PendingMobileImage.objects.select_for_update().select_related(
+            item = PendingMobileImage.objects.select_for_update(of=("self",)).select_related(
                 "session", "session__encounter", "session__encounter__patient",
                 "session__encounter__patient__assigned_clinic",
             ).get(id=image_id, session__session_id=session_id)
