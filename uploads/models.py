@@ -1,5 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
+from django.conf import settings
+from django.core.validators import FileExtensionValidator
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
 import uuid
@@ -69,6 +71,88 @@ class ImageUpload(models.Model):
                 sync_dataset_from_report(report)
         except Exception as exc:
             print("ImageUpload dataset refresh failed:", exc)
+
+
+class MobileTransferSession(models.Model):
+    STATUS_CHOICES = [
+        ("open", "Open"),
+        ("completed", "Completed"),
+        ("expired", "Expired"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    session_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    token_hash = models.CharField(max_length=64, unique=True, editable=False)
+    encounter = models.ForeignKey(
+        ScreeningEncounter,
+        on_delete=models.CASCADE,
+        related_name="mobile_transfer_sessions",
+    )
+    initiated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="initiated_mobile_transfers",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open")
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.session_id} - {self.encounter.encounter_id}"
+
+
+class PendingMobileImage(models.Model):
+    STATUS_CHOICES = [
+        ("pending", "Pending review"),
+        ("confirmed", "Confirmed"),
+        ("rejected", "Rejected"),
+    ]
+
+    session = models.ForeignKey(
+        MobileTransferSession,
+        on_delete=models.CASCADE,
+        related_name="pending_images",
+    )
+    image_file = models.ImageField(
+        upload_to="mobile_transfer_pending/",
+        validators=[FileExtensionValidator(["jpg", "jpeg", "png"])],
+    )
+    original_filename = models.CharField(max_length=255)
+    checksum_sha256 = models.CharField(max_length=64)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reviewed_mobile_images",
+    )
+    confirmed_upload = models.OneToOneField(
+        ImageUpload,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="mobile_transfer_source",
+    )
+
+    class Meta:
+        ordering = ["uploaded_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["session", "checksum_sha256"],
+                name="unique_mobile_image_per_session",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.original_filename} - {self.session.session_id}"
 
 
 class AIAnalysis(models.Model):
