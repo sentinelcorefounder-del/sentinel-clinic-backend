@@ -10,7 +10,8 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
-from organizations.models import Organization
+from organizations.models import Organization, PartnerNotification
+from users.models import UserOrganization
 from patients.models import Patient
 from referrals.models import HospitalReferral
 
@@ -21,7 +22,9 @@ from .models import (
     ServiceAllowance, ServiceAllowanceReservation,
     SettlementBatch, SettlementItem, EncounterAllocation,
     FinanceActionRequest, FinanceControlAudit,
+    BillingProfile,
 )
+from .documents import render_bank_transfer_document
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation,
@@ -436,6 +439,8 @@ class BankTransferFundingTests(WalletEngineTests):
         super().setUp()
         self.user = get_user_model().objects.create_user(username="finance-verifier")
         self.approver = get_user_model().objects.create_user(username="finance-approver")
+        self.partner_user = get_user_model().objects.create_user(username="hospital-finance-user")
+        UserOrganization.objects.create(user=self.partner_user, organization=self.organization)
         self.request = BankTransferFundingRequest.objects.create(
             wallet=self.wallet,
             requested_amount=Decimal("50000.00"),
@@ -471,6 +476,13 @@ class BankTransferFundingTests(WalletEngineTests):
         self.assertEqual(first.ledger_entry_id, second.ledger_entry_id)
         self.assertEqual(self.wallet.available_balance, Decimal("50000.00"))
         self.assertEqual(WalletLedgerEntry.objects.count(), 1)
+        self.assertEqual(
+            PartnerNotification.objects.filter(
+                recipient=self.partner_user,
+                notification_type="wallet_credited",
+            ).count(),
+            1,
+        )
 
     def test_underpayment_is_flagged_and_credits_only_received_amount(self):
         request = self._submit_and_verify(amount="45000.00")
@@ -510,6 +522,38 @@ class BankTransferFundingTests(WalletEngineTests):
             submit_bank_transfer_proof(self.request, proof, actor=self.user)
         self.request.refresh_from_db()
         self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+
+    def test_funding_request_and_credited_receipt_render_as_pdfs(self):
+        self.request.billing_snapshot = {
+            "legal_entity_name": "Afriophthalmics", "trading_name": "Sentinel",
+            "bank_name": "Test Bank", "bank_account_name": "Afriophthalmics",
+            "bank_account_number": "0000000000", "currency": "NGN",
+            "receipt_prefix": "SEN-RCPT",
+        }
+        self.request.customer_snapshot = {"name": "Test Hospital", "address": "Test address"}
+        self.request.save(update_fields=["billing_snapshot", "customer_snapshot", "updated_at"])
+        self.assertTrue(render_bank_transfer_document(self.request).startswith(b"%PDF"))
+        request = self._submit_and_verify()
+        request = approve_bank_transfer(request, actor=self.approver)
+        self.assertTrue(request.receipt_reference.startswith("SEN-RCPT-"))
+        self.assertTrue(render_bank_transfer_document(request, receipt=True).startswith(b"%PDF"))
+
+    def test_rejection_notifies_only_the_funding_organization(self):
+        other_org = Organization.objects.create(
+            clinic_id="HOSP-NOTIFY-OTHER", name="Other Hospital", organization_type="hospital"
+        )
+        other_user = get_user_model().objects.create_user(username="other-hospital-finance-user")
+        UserOrganization.objects.create(user=other_user, organization=other_org)
+        from .services import reject_bank_transfer
+
+        reject_bank_transfer(self.request, "Reference could not be verified.", actor=self.approver)
+        self.assertTrue(
+            PartnerNotification.objects.filter(
+                recipient=self.partner_user,
+                notification_type="bank_transfer_rejected",
+            ).exists()
+        )
+        self.assertFalse(PartnerNotification.objects.filter(recipient=other_user).exists())
 
 
 class VersionedPricingAndSettlementTests(WalletEngineTests):
@@ -806,3 +850,16 @@ class FinanceApiCapabilityTests(TestCase):
         self.assign("finance_viewer")
         self.assertEqual(self.client.get("/api/finance/wallets/").status_code, 200)
         self.assertEqual(self.client.post("/api/finance/wallets/", {}).status_code, 403)
+
+    def test_only_finance_admin_can_change_billing_profile(self):
+        payload = {
+            "legal_entity_name": "Afriophthalmics", "trading_name": "Sentinel",
+            "bank_name": "Test Bank", "bank_account_name": "Afriophthalmics",
+            "bank_account_number": "0000000000", "currency": "NGN", "is_active": True,
+        }
+        self.assign("finance_viewer")
+        self.assertEqual(self.client.post("/api/finance/billing-profile/", payload).status_code, 403)
+        self.assign("finance_admin")
+        response = self.client.post("/api/finance/billing-profile/", payload)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(BillingProfile.objects.count(), 1)

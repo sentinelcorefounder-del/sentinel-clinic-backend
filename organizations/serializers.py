@@ -1,6 +1,16 @@
 from django.db import IntegrityError, transaction
 from rest_framework import serializers
-from .models import Organization, OrganizationBranch, OrganizationProfile
+from .models import Organization, OrganizationBranch, OrganizationProfile, PartnerNotification
+
+
+class PartnerNotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PartnerNotification
+        fields = [
+            "id", "title", "message", "level", "notification_type",
+            "action_path", "entity_type", "entity_id", "is_read",
+            "created_at", "read_at",
+        ]
 
 
 class OrganizationSerializer(serializers.ModelSerializer):

@@ -13,11 +13,18 @@ from .models import (
     SettlementBatch,
     SettlementItem,
     BankTransferFundingRequest,
+    BillingProfile,
     ServiceAllowance,
     ServiceAllowanceReservation,
     FinanceActionRequest,
     FinanceControlAudit,
 )
+
+
+@admin.register(BillingProfile)
+class BillingProfileAdmin(admin.ModelAdmin):
+    list_display = ("legal_entity_name", "trading_name", "bank_name", "currency", "is_active", "updated_at")
+    readonly_fields = ("created_at", "updated_at")
 
 
 class AllocationRuleInline(admin.TabularInline):

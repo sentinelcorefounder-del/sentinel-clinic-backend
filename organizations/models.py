@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 
 
 class Organization(models.Model):
@@ -85,6 +86,49 @@ class OrganizationBranch(models.Model):
 
     def __str__(self):
         return f"{self.organization.name} — {self.name}"
+
+
+class PartnerNotification(models.Model):
+    LEVEL_CHOICES = [
+        ("info", "Info"),
+        ("success", "Success"),
+        ("warning", "Warning"),
+        ("danger", "Danger"),
+    ]
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="partner_notifications",
+    )
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="partner_notifications",
+    )
+    title = models.CharField(max_length=255)
+    message = models.TextField(blank=True)
+    level = models.CharField(max_length=20, choices=LEVEL_CHOICES, default="info")
+    notification_type = models.CharField(max_length=80)
+    action_path = models.CharField(max_length=255, blank=True)
+    entity_type = models.CharField(max_length=80, blank=True)
+    entity_id = models.CharField(max_length=120, blank=True)
+    deduplication_key = models.CharField(max_length=255)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["recipient", "deduplication_key"],
+                name="unique_partner_notification_per_recipient",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.recipient}: {self.title}"
 
 
 class OrganizationProfile(models.Model):

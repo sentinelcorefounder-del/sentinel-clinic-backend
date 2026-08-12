@@ -4,16 +4,55 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.utils import timezone
 
 from common.tenant import get_user_organization
-from .models import Organization, OrganizationBranch, OrganizationProfile
+from .models import Organization, OrganizationBranch, OrganizationProfile, PartnerNotification
 from .provision_serializers import ClinicProvisionSerializer, HospitalProvisionSerializer
 from .serializers import (
     OrganizationSerializer,
     OrganizationProfileSerializer,
     OrganizationWithProfileSerializer,
     OrganizationBranchSerializer,
+    PartnerNotificationSerializer,
 )
+
+
+class MyPartnerNotificationListView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = PartnerNotificationSerializer
+
+    def get_queryset(self):
+        queryset = PartnerNotification.objects.filter(recipient=self.request.user)
+        if self.request.query_params.get("unread", "").lower() == "true":
+            queryset = queryset.filter(is_read=False)
+        return queryset
+
+
+class MyPartnerNotificationMarkReadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        notification = PartnerNotification.objects.filter(
+            pk=pk, recipient=request.user
+        ).first()
+        if notification is None:
+            return Response({"detail": "Notification not found."}, status=status.HTTP_404_NOT_FOUND)
+        if not notification.is_read:
+            notification.is_read = True
+            notification.read_at = timezone.now()
+            notification.save(update_fields=["is_read", "read_at"])
+        return Response(PartnerNotificationSerializer(notification).data)
+
+
+class MyPartnerNotificationMarkAllReadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        PartnerNotification.objects.filter(recipient=request.user, is_read=False).update(
+            is_read=True, read_at=timezone.now()
+        )
+        return Response({"message": "All notifications marked as read."})
 from .services.provisioning import (
     provision_clinic_with_admin,
     provision_hospital_with_admin,

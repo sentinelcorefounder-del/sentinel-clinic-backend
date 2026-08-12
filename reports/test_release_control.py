@@ -17,7 +17,7 @@ from finance.services import (
     top_up_wallet,
 )
 from ops.models import OpsAuditLog
-from organizations.models import Organization, OrganizationProfile
+from organizations.models import Organization, OrganizationProfile, PartnerNotification
 from patients.models import Patient
 from referrals.models import HospitalReferral
 from referrals.serializers import HospitalReferralSerializer
@@ -274,6 +274,16 @@ class ReleaseControlTestCase(TestCase):
         self.assertEqual(
             self.financial_record.wallet_ledger_entries.filter(entry_type="service_capture").count(),
             1,
+        )
+        self.assertEqual(
+            PartnerNotification.objects.filter(
+                recipient=self.hospital_user,
+                notification_type="report_released",
+            ).count(),
+            1,
+        )
+        self.assertFalse(
+            PartnerNotification.objects.filter(recipient=self.other_hospital_user).exists()
         )
 
         self.client.force_authenticate(self.hospital_user)
