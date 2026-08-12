@@ -706,6 +706,58 @@ def bank_transfer_request_reference():
     return f"SEN-BT-{uuid.uuid4().hex[:12].upper()}"
 
 
+class BillingProfile(TimeStampedModel):
+    """Ops-managed legal identity and bank instructions used on finance documents."""
+
+    legal_entity_name = models.CharField(max_length=255, default="Afriophthalmics")
+    trading_name = models.CharField(max_length=255, default="Sentinel")
+    registered_address = models.TextField(blank=True, default="")
+    company_registration_number = models.CharField(max_length=100, blank=True, default="")
+    tax_identification_number = models.CharField(max_length=100, blank=True, default="")
+    finance_email = models.EmailField(blank=True, default="")
+    finance_phone = models.CharField(max_length=60, blank=True, default="")
+    bank_name = models.CharField(max_length=180, blank=True, default="")
+    bank_account_name = models.CharField(max_length=180, blank=True, default="")
+    bank_account_number = models.CharField(max_length=80, blank=True, default="")
+    bank_branch_code = models.CharField(max_length=80, blank=True, default="")
+    currency = models.CharField(max_length=3, default="NGN")
+    transfer_instructions = models.TextField(blank=True, default="")
+    funding_request_prefix = models.CharField(max_length=20, default="SEN-BT")
+    receipt_prefix = models.CharField(max_length=20, default="SEN-RCPT")
+    is_active = models.BooleanField(default=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="updated_billing_profiles",
+    )
+
+    class Meta:
+        ordering = ["-is_active", "-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_active"], condition=Q(is_active=True),
+                name="fin_single_active_billing_profile",
+            )
+        ]
+
+    @property
+    def is_complete(self):
+        return all((self.legal_entity_name, self.bank_name, self.bank_account_name,
+                    self.bank_account_number, self.currency))
+
+    def clean(self):
+        import re
+        for field_name in ("funding_request_prefix", "receipt_prefix"):
+            if not re.fullmatch(r"[A-Z0-9-]{2,20}", getattr(self, field_name, "")):
+                raise ValidationError({field_name: "Use 2–20 uppercase letters, numbers or hyphens."})
+        if self.is_active:
+            duplicate = BillingProfile.objects.filter(is_active=True).exclude(pk=self.pk)
+            if duplicate.exists():
+                raise ValidationError("Only one billing profile may be active.")
+
+    def __str__(self):
+        return f"{self.legal_entity_name} ({self.currency})"
+
+
 class BankTransferFundingRequest(TimeStampedModel):
     class Status(models.TextChoices):
         AWAITING_TRANSFER = "awaiting_transfer", "Awaiting transfer"
@@ -771,6 +823,9 @@ class BankTransferFundingRequest(TimeStampedModel):
     )
     notes = models.TextField(blank=True, default="")
     rejection_reason = models.TextField(blank=True, default="")
+    billing_snapshot = models.JSONField(default=dict, blank=True)
+    customer_snapshot = models.JSONField(default=dict, blank=True)
+    receipt_reference = models.CharField(max_length=40, unique=True, null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]

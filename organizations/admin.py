@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Organization, OrganizationProfile
+from .models import Organization, OrganizationProfile, PartnerNotification
 
 
 @admin.register(Organization)
@@ -38,3 +38,11 @@ class OrganizationProfileAdmin(admin.ModelAdmin):
         "organization__name",
         "organization__clinic_id",
     )
+
+
+@admin.register(PartnerNotification)
+class PartnerNotificationAdmin(admin.ModelAdmin):
+    list_display = ("title", "organization", "recipient", "notification_type", "is_read", "created_at")
+    list_filter = ("notification_type", "level", "is_read", "organization__organization_type")
+    search_fields = ("title", "message", "recipient__username", "organization__name", "entity_id")
+    readonly_fields = ("created_at", "read_at")

@@ -5,6 +5,8 @@ from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from organizations.notification_service import notify_organization
+
 from .models import (
     AllocationRule,
     EncounterAllocation,
@@ -573,6 +575,7 @@ def verify_bank_transfer(funding_request, received_amount, bank_transaction_refe
 
 @transaction.atomic
 def approve_bank_transfer(funding_request, actor=None):
+    import uuid
     from .models import BankTransferFundingRequest, WalletLedgerEntry
 
     funding_request = BankTransferFundingRequest.objects.select_for_update().select_related("wallet").get(
@@ -604,7 +607,32 @@ def approve_bank_transfer(funding_request, actor=None):
     funding_request.approved_by = actor
     funding_request.approved_at = timezone.now()
     funding_request.ledger_entry = entry
-    funding_request.save(update_fields=["status", "approved_by", "approved_at", "ledger_entry", "updated_at"])
+    if not funding_request.receipt_reference:
+        prefix = (funding_request.billing_snapshot or {}).get("receipt_prefix", "SEN-RCPT")
+        funding_request.receipt_reference = f"{prefix}-{uuid.uuid4().hex[:12].upper()}"
+    funding_request.save(update_fields=["status", "approved_by", "approved_at", "ledger_entry", "receipt_reference", "updated_at"])
+    organization = funding_request.wallet.organization
+    finance_path = "/hospital/finance" if organization.organization_type == "hospital" else "/finance"
+    notify_organization(
+        organization=organization,
+        notification_type="wallet_credited",
+        title="Wallet credited and receipt ready",
+        message=(
+            f"Bank transfer {funding_request.request_reference} has been approved. "
+            f"Receipt {funding_request.receipt_reference} is ready to download."
+        ),
+        action_path=finance_path,
+        deduplication_key=f"bank-transfer:{funding_request.pk}:credited",
+        level="success",
+        entity_type="bank_transfer_funding_request",
+        entity_id=funding_request.pk,
+        email_subject="Sentinel wallet credited — receipt ready",
+        email_message=(
+            f"Your bank transfer {funding_request.request_reference} has been verified and "
+            f"credited to your organisation wallet. Receipt {funding_request.receipt_reference} "
+            "is now available in the Sentinel Finance page."
+        ),
+    )
     return funding_request
 
 
@@ -626,6 +654,27 @@ def reject_bank_transfer(funding_request, reason, actor=None):
     funding_request.verified_by = actor
     funding_request.verified_at = timezone.now()
     funding_request.save(update_fields=["status", "rejection_reason", "verified_by", "verified_at", "updated_at"])
+    organization = funding_request.wallet.organization
+    finance_path = "/hospital/finance" if organization.organization_type == "hospital" else "/finance"
+    notify_organization(
+        organization=organization,
+        notification_type="bank_transfer_rejected",
+        title="Bank-transfer funding needs attention",
+        message=(
+            f"Funding request {funding_request.request_reference} was not approved. "
+            "Open Finance to review the reason and create a new request if needed."
+        ),
+        action_path=finance_path,
+        deduplication_key=f"bank-transfer:{funding_request.pk}:rejected",
+        level="warning",
+        entity_type="bank_transfer_funding_request",
+        entity_id=funding_request.pk,
+        email_subject="Sentinel bank-transfer funding needs attention",
+        email_message=(
+            f"Funding request {funding_request.request_reference} was not approved. "
+            "Please sign in to Sentinel Finance to review the status."
+        ),
+    )
     return funding_request
 
 

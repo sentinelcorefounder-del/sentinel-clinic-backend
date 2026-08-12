@@ -14,6 +14,7 @@ from .views import (
     ServiceAllowanceReservationViewSet,
     FinanceActionRequestViewSet,
     FinanceControlAuditViewSet,
+    BillingProfileViewSet,
 )
 
 router = DefaultRouter()
@@ -30,6 +31,7 @@ router.register("service-allowances", ServiceAllowanceViewSet, basename="finance
 router.register("allowance-reservations", ServiceAllowanceReservationViewSet, basename="finance-allowance-reservation")
 router.register("action-requests", FinanceActionRequestViewSet, basename="finance-action-request")
 router.register("control-audit", FinanceControlAuditViewSet, basename="finance-control-audit")
+router.register("billing-profile", BillingProfileViewSet, basename="finance-billing-profile")
 
 urlpatterns = router.urls
 

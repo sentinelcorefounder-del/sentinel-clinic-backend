@@ -17,6 +17,7 @@ from .models import (
     ServiceAllowanceReservation,
     FinanceActionRequest,
     FinanceControlAudit,
+    BillingProfile,
 )
 
 
@@ -245,12 +246,45 @@ class BankTransferFundingRequestSerializer(serializers.ModelSerializer):
             "bank_transaction_reference", "value_date", "requester", "verified_by",
             "verified_at", "approved_by", "approved_at", "ledger_entry",
             "rejection_reason", "created_at", "updated_at",
+            "billing_snapshot", "customer_snapshot", "receipt_reference",
         )
 
     def validate_requested_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError("Requested amount must be greater than zero.")
         return value
+
+
+class BillingProfileSerializer(serializers.ModelSerializer):
+    is_complete = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = BillingProfile
+        fields = "__all__"
+        read_only_fields = ("updated_by", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        import re
+        active = attrs.get("is_active", getattr(self.instance, "is_active", True))
+        if active:
+            required = ("legal_entity_name", "bank_name", "bank_account_name",
+                        "bank_account_number", "currency")
+            missing = [name for name in required if not str(
+                attrs.get(name, getattr(self.instance, name, "")) or ""
+            ).strip()]
+            if missing:
+                raise serializers.ValidationError({name: "Required for an active billing profile." for name in missing})
+        for name in ("funding_request_prefix", "receipt_prefix"):
+            if name in attrs:
+                value = attrs[name]
+            elif self.instance is not None:
+                value = getattr(self.instance, name, "")
+            else:
+                value = BillingProfile._meta.get_field(name).get_default()
+            value = str(value or "")
+            if not re.fullmatch(r"[A-Z0-9-]{2,20}", value):
+                raise serializers.ValidationError({name: "Use 2–20 uppercase letters, numbers or hyphens."})
+        return attrs
 
 
 class ServiceAllowanceSerializer(serializers.ModelSerializer):

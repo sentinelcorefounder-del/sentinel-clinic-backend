@@ -24,6 +24,7 @@ from organizations.services.provisioning import (
     provision_clinic_with_admin,
     provision_hospital_with_admin,
 )
+from organizations.notification_service import notify_organization
 from patients.models import Patient
 from patients.identity_services import ensure_master_identity
 from payments.services.paystack import initialize_transaction, verify_transaction
@@ -1290,6 +1291,27 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
             entity_id=report.id,
             entity_label=report.report_id,
             created_by=request.user,
+        )
+
+        notify_organization(
+            organization=referral.source_hospital,
+            notification_type="report_released",
+            title="Report ready to download",
+            message=(
+                f"Report {report.report_id} for referral {referral.referral_id} "
+                "has been released and is ready in the Hospital Portal."
+            ),
+            action_path=f"/hospital/reports/{report.id}",
+            deduplication_key=f"report:{report.pk}:released-to-hospital",
+            level="success",
+            entity_type="report",
+            entity_id=report.pk,
+            email_subject=f"Sentinel report ready — {referral.referral_id}",
+            email_message=(
+                f"The report for referral {referral.referral_id} has been released and is "
+                "ready to view securely in the Sentinel Hospital Portal. Patient details and "
+                "the clinical report are not included in this email."
+            ),
         )
 
         return Response({

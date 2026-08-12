@@ -3,6 +3,8 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.db import transaction
 from datetime import timedelta
+import uuid
+from django.http import HttpResponse
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -14,6 +16,7 @@ from .models import (
     BankTransferFundingRequest,
     ServiceAllowance, ServiceAllowanceReservation,
     FinanceActionRequest, FinanceControlAudit,
+    BillingProfile,
 )
 from .serializers import (
     AllocationRuleSerializer,
@@ -24,7 +27,9 @@ from .serializers import (
     BankTransferFundingRequestSerializer,
     ServiceAllowanceSerializer, ServiceAllowanceReservationSerializer,
     FinanceActionRequestSerializer, FinanceControlAuditSerializer,
+    BillingProfileSerializer,
 )
+from .documents import render_bank_transfer_document
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
@@ -263,6 +268,24 @@ class AllocationRuleViewSet(FinanceAdminViewSet):
         "pricing_rule", "beneficiary_organization"
     ).all()
     serializer_class = AllocationRuleSerializer
+
+
+class BillingProfileViewSet(viewsets.ModelViewSet):
+    """Singleton-style billing configuration controlled by Finance Admin."""
+
+    serializer_class = BillingProfileSerializer
+    queryset = BillingProfile.objects.all()
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
+    def perform_create(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
 
 
 class ServiceAllowanceViewSet(FinanceAdminViewSet):
@@ -515,9 +538,77 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
             if organization is None or wallet.organization_id != organization.id:
                 from rest_framework.exceptions import PermissionDenied
                 raise PermissionDenied("You can only request funding for your own organisation.")
-        instance = serializer.save(requester=self.request.user, currency=wallet.currency)
+        profile = BillingProfile.objects.filter(is_active=True, currency=wallet.currency).first()
+        if not profile or not profile.is_complete:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError("Sentinel bank-transfer details have not been configured for this currency.")
+        billing_snapshot = {
+            "legal_entity_name": profile.legal_entity_name,
+            "trading_name": profile.trading_name,
+            "registered_address": profile.registered_address,
+            "company_registration_number": profile.company_registration_number,
+            "tax_identification_number": profile.tax_identification_number,
+            "finance_email": profile.finance_email,
+            "finance_phone": profile.finance_phone,
+            "bank_name": profile.bank_name,
+            "bank_account_name": profile.bank_account_name,
+            "bank_account_number": profile.bank_account_number,
+            "bank_branch_code": profile.bank_branch_code,
+            "currency": profile.currency,
+            "transfer_instructions": profile.transfer_instructions,
+            "funding_request_prefix": profile.funding_request_prefix,
+            "receipt_prefix": profile.receipt_prefix,
+        }
+        organization = wallet.organization
+        customer_snapshot = {
+            "organization_id": organization.id,
+            "name": organization.name,
+            "address": organization.address,
+            "email": organization.contact_email,
+            "phone": organization.phone,
+        }
+        request_reference = f"{profile.funding_request_prefix}-{uuid.uuid4().hex[:12].upper()}"
+        instance = serializer.save(
+            requester=self.request.user, currency=wallet.currency,
+            request_reference=request_reference, billing_snapshot=billing_snapshot,
+            customer_snapshot=customer_snapshot,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
         instance.full_clean()
         instance.save()
+
+    @action(detail=True, methods=["get"], url_path="funding-request-pdf")
+    def funding_request_pdf(self, request, pk=None):
+        funding_request = self.get_object()
+        if not funding_request.billing_snapshot:
+            return Response(
+                {"detail": "This request predates billing-document configuration."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        response = HttpResponse(
+            render_bank_transfer_document(funding_request), content_type="application/pdf"
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="{funding_request.request_reference}.pdf"'
+        )
+        return response
+
+    @action(detail=True, methods=["get"], url_path="receipt-pdf")
+    def receipt_pdf(self, request, pk=None):
+        funding_request = self.get_object()
+        if funding_request.status != BankTransferFundingRequest.Status.CREDITED:
+            return Response(
+                {"detail": "A receipt is available only after the transfer is approved and credited."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        response = HttpResponse(
+            render_bank_transfer_document(funding_request, receipt=True),
+            content_type="application/pdf",
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="{funding_request.receipt_reference}.pdf"'
+        )
+        return response
 
     @action(detail=True, methods=["post"], url_path="submit-proof")
     def submit_proof(self, request, pk=None):
