@@ -29,7 +29,7 @@ from .serializers import (
     FinanceActionRequestSerializer, FinanceControlAuditSerializer,
     BillingProfileSerializer,
 )
-from .documents import render_bank_transfer_document
+from .documents import UnreliableDocumentSnapshot, render_bank_transfer_document
 from .services import (
     price_encounter, top_up_wallet, adjust_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation, refund_to_wallet,
@@ -580,13 +580,15 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="funding-request-pdf")
     def funding_request_pdf(self, request, pk=None):
         funding_request = self.get_object()
-        if not funding_request.billing_snapshot:
+        try:
+            document = render_bank_transfer_document(funding_request)
+        except UnreliableDocumentSnapshot as exc:
             return Response(
-                {"detail": "This request predates billing-document configuration."},
+                {"detail": str(exc)},
                 status=status.HTTP_409_CONFLICT,
             )
         response = HttpResponse(
-            render_bank_transfer_document(funding_request), content_type="application/pdf"
+            document, content_type="application/pdf"
         )
         response["Content-Disposition"] = (
             f'attachment; filename="{funding_request.request_reference}.pdf"'
@@ -601,10 +603,11 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
                 {"detail": "A receipt is available only after the transfer is approved and credited."},
                 status=status.HTTP_409_CONFLICT,
             )
-        response = HttpResponse(
-            render_bank_transfer_document(funding_request, receipt=True),
-            content_type="application/pdf",
-        )
+        try:
+            document = render_bank_transfer_document(funding_request, receipt=True)
+        except UnreliableDocumentSnapshot as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        response = HttpResponse(document, content_type="application/pdf")
         response["Content-Disposition"] = (
             f'attachment; filename="{funding_request.receipt_reference}.pdf"'
         )
