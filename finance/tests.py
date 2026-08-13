@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 from decimal import Decimal
+import importlib
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
@@ -24,7 +26,7 @@ from .models import (
     FinanceActionRequest, FinanceControlAudit,
     BillingProfile,
 )
-from .documents import render_bank_transfer_document
+from .documents import build_bank_transfer_document_story, render_bank_transfer_document
 from .services import (
     price_encounter, top_up_wallet, reserve_wallet_funds,
     capture_wallet_reservation, release_wallet_reservation,
@@ -447,7 +449,36 @@ class BankTransferFundingTests(WalletEngineTests):
             currency="NGN",
             requester=self.user,
             expires_at=timezone.now() + timedelta(days=7),
+            billing_snapshot={
+                "legal_entity_name": "Snapshot Legal Entity", "trading_name": "Sentinel",
+                "registered_address": "10 Finance Avenue", "company_registration_number": "RC-123",
+                "finance_email": "finance@example.test", "finance_phone": "+234 000 0000",
+                "bank_name": "Test Bank", "bank_account_name": "Snapshot Legal Entity",
+                "bank_account_number": "0000000000", "bank_branch_code": "001",
+                "transfer_instructions": "Use the exact funding reference.",
+                "receipt_prefix": "SEN-RCPT",
+            },
+            customer_snapshot={"name": "Test Hospital", "address": "20 Partner Road"},
         )
+
+    def _story_text(self, receipt=False):
+        _, story = build_bank_transfer_document_story(self.request, receipt=receipt)
+        values = []
+
+        def collect(item):
+            if hasattr(item, "getPlainText"):
+                values.append(item.getPlainText())
+            for row in getattr(item, "_cellvalues", []):
+                for cell in row:
+                    if isinstance(cell, (list, tuple)):
+                        for child in cell:
+                            collect(child)
+                    else:
+                        collect(cell)
+
+        for flowable in story:
+            collect(flowable)
+        return " ".join(values)
 
     def _submit_and_verify(self, amount="50000.00", reference="BANK-TXN-001"):
         proof = SimpleUploadedFile("receipt.pdf", b"test receipt", content_type="application/pdf")
@@ -537,6 +568,85 @@ class BankTransferFundingTests(WalletEngineTests):
         request = approve_bank_transfer(request, actor=self.approver)
         self.assertTrue(request.receipt_reference.startswith("SEN-RCPT-"))
         self.assertTrue(render_bank_transfer_document(request, receipt=True).startswith(b"%PDF"))
+
+    def test_document_stories_use_titles_stable_references_and_no_clinical_data(self):
+        proforma_text = self._story_text()
+        self.assertIn("Proforma Invoice", proforma_text)
+        self.assertIn(self.request.request_reference, proforma_text)
+        self.assertNotIn("patient name:", proforma_text.lower())
+        self.request = self._submit_and_verify()
+        self.request = approve_bank_transfer(self.request, actor=self.approver)
+        receipt_text = self._story_text(receipt=True)
+        self.assertIn("Payment Receipt", receipt_text)
+        self.assertIn(self.request.receipt_reference, receipt_text)
+        self.assertNotIn("clinical", receipt_text.lower())
+
+    def test_snapshot_identity_is_unchanged_when_live_profile_changes(self):
+        profile = BillingProfile.objects.create(
+            legal_entity_name="Live Identity", bank_name="Live Bank", bank_account_name="Live Account",
+            bank_account_number="1111111111", currency="NGN",
+        )
+        before = self._story_text()
+        profile.legal_entity_name = "New Live Identity"
+        profile.save(update_fields=["legal_entity_name", "updated_at"])
+        after = self._story_text()
+        self.assertEqual(before, after)
+        self.assertIn("Snapshot Legal Entity", after)
+        self.assertNotIn("New Live Identity", after)
+
+    def test_logo_failure_and_long_optional_content_render_safely(self):
+        self.request.billing_snapshot["registered_address"] = "Long address " * 120
+        self.request.billing_snapshot["transfer_instructions"] = "Detailed instruction " * 100
+        self.request.customer_snapshot["address"] = "Partner address " * 100
+        with patch("finance.documents.Path.is_file", return_value=False):
+            document = render_bank_transfer_document(self.request)
+        self.assertTrue(document.startswith(b"%PDF"))
+
+    def test_pdf_endpoints_enforce_state_snapshot_and_organization_scope(self):
+        self.client.force_login(self.partner_user)
+        proforma = self.client.get(
+            f"/api/finance/bank-transfer-funding/{self.request.id}/funding-request-pdf/"
+        )
+        self.assertEqual(proforma.status_code, 200)
+        self.assertEqual(proforma["Content-Type"], "application/pdf")
+        self.assertIn(self.request.request_reference, proforma["Content-Disposition"])
+        self.assertEqual(
+            self.client.get(f"/api/finance/bank-transfer-funding/{self.request.id}/receipt-pdf/").status_code,
+            409,
+        )
+        self.request = self._submit_and_verify()
+        self.request = approve_bank_transfer(self.request, actor=self.approver)
+        receipt = self.client.get(f"/api/finance/bank-transfer-funding/{self.request.id}/receipt-pdf/")
+        self.assertEqual(receipt.status_code, 200)
+        self.assertIn(self.request.receipt_reference, receipt["Content-Disposition"])
+
+        other = Organization.objects.create(clinic_id="OTHER-001", name="Other Hospital", organization_type="hospital")
+        other_wallet = OrganizationWallet.objects.create(organization=other, currency="NGN")
+        other_request = BankTransferFundingRequest.objects.create(
+            wallet=other_wallet, requested_amount=Decimal("1000.00"), billing_snapshot=self.request.billing_snapshot,
+            customer_snapshot={"name": other.name},
+        )
+        self.assertEqual(
+            self.client.get(f"/api/finance/bank-transfer-funding/{other_request.id}/funding-request-pdf/").status_code,
+            404,
+        )
+
+    def test_legacy_snapshot_failure_is_controlled_for_both_documents(self):
+        self.request.billing_snapshot = {}
+        self.request.customer_snapshot = {}
+        self.request.save(update_fields=["billing_snapshot", "customer_snapshot", "updated_at"])
+        self.client.force_login(self.partner_user)
+        self.assertEqual(
+            self.client.get(f"/api/finance/bank-transfer-funding/{self.request.id}/funding-request-pdf/").status_code,
+            409,
+        )
+        self.request.status = BankTransferFundingRequest.Status.CREDITED
+        self.request.receipt_reference = "SEN-RCPT-LEGACY"
+        self.request.save(update_fields=["status", "receipt_reference", "updated_at"])
+        self.assertEqual(
+            self.client.get(f"/api/finance/bank-transfer-funding/{self.request.id}/receipt-pdf/").status_code,
+            409,
+        )
 
     def test_rejection_notifies_only_the_funding_organization(self):
         other_org = Organization.objects.create(
@@ -863,3 +973,46 @@ class FinanceApiCapabilityTests(TestCase):
         response = self.client.post("/api/finance/billing-profile/", payload)
         self.assertEqual(response.status_code, 201)
         self.assertEqual(BillingProfile.objects.count(), 1)
+
+    def test_finance_admin_can_patch_existing_billing_profile_without_duplicate(self):
+        self.assign("finance_admin")
+        profile = BillingProfile.objects.create(
+            legal_entity_name="Original", trading_name="Sentinel", bank_name="Test Bank",
+            bank_account_name="Original", bank_account_number="0000000000", currency="NGN",
+        )
+        response = self.client.patch(
+            f"/api/finance/billing-profile/{profile.id}/",
+            {"legal_entity_name": "Updated Legal Entity"}, format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(BillingProfile.objects.count(), 1)
+        profile.refresh_from_db()
+        self.assertEqual(profile.legal_entity_name, "Updated Legal Entity")
+
+    def test_duplicate_active_billing_profile_remains_blocked(self):
+        self.assign("finance_admin")
+        BillingProfile.objects.create(
+            legal_entity_name="Existing", bank_name="Test Bank", bank_account_name="Existing",
+            bank_account_number="0000000000", currency="NGN",
+        )
+        response = self.client.post("/api/finance/billing-profile/", {
+            "legal_entity_name": "Duplicate", "trading_name": "Sentinel", "bank_name": "Test Bank",
+            "bank_account_name": "Duplicate", "bank_account_number": "1111111111",
+            "currency": "NGN", "is_active": True,
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(BillingProfile.objects.count(), 1)
+
+
+class FinanceGroupProvisioningTests(TestCase):
+    def test_group_provisioning_is_idempotent_and_preserves_membership(self):
+        migration = importlib.import_module("finance.migrations.0012_provision_finance_groups")
+        user = get_user_model().objects.create_user(username="existing-finance-member")
+        group, _ = Group.objects.get_or_create(name="finance_viewer")
+        user.groups.add(group)
+        migration.provision_finance_groups(importlib.import_module("django.apps").apps, None)
+        migration.provision_finance_groups(importlib.import_module("django.apps").apps, None)
+        self.assertEqual(Group.objects.filter(name__in=migration.FINANCE_GROUPS).count(), 5)
+        self.assertEqual(Group.objects.filter(name="finance_viewer").count(), 1)
+        self.assertTrue(user.groups.filter(name="finance_viewer").exists())
+        self.assertEqual(user.groups.count(), 1)
