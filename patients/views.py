@@ -321,7 +321,9 @@ class PatientSyncView(APIView):
 
         try:
             clinic = Organization.objects.get(
-                clinic_id=data["assigned_clinic_id"]
+                clinic_id=data["assigned_clinic_id"],
+                organization_type="clinic",
+                is_active=True,
             )
         except Organization.DoesNotExist:
             return Response(

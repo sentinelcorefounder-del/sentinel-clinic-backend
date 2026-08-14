@@ -709,9 +709,17 @@ class HospitalReferralStatusSyncView(APIView):
         matched_clinic_name = data.get("matched_clinic_name", "").strip()
 
         if matched_clinic_code:
-            matched_clinic = Organization.objects.filter(clinic_id=matched_clinic_code).first()
+            matched_clinic = Organization.objects.filter(
+                clinic_id=matched_clinic_code,
+                organization_type="clinic",
+                is_active=True,
+            ).first()
         elif matched_clinic_name:
-            matched_clinic = Organization.objects.filter(name__iexact=matched_clinic_name).first()
+            matched_clinic = Organization.objects.filter(
+                name__iexact=matched_clinic_name,
+                organization_type="clinic",
+                is_active=True,
+            ).first()
 
         if matched_clinic and hospital_referral.matched_clinic_id != matched_clinic.id:
             hospital_referral.matched_clinic = matched_clinic

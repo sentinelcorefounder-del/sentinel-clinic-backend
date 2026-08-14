@@ -1280,8 +1280,8 @@ def cancel_settlement_batch(batch, reason, actor=None):
     from .models import EncounterAllocation, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
-    if batch.status not in {SettlementBatch.Status.DRAFT, SettlementBatch.Status.APPROVED}:
-        raise ValidationError("Only draft or approved settlement batches can be cancelled.")
+    if batch.status != SettlementBatch.Status.DRAFT:
+        raise ValidationError("Only draft settlement batches can be cancelled.")
     reason = str(reason or "").strip()
     if not reason:
         raise ValidationError("A settlement cancellation reason is required.")
@@ -1428,3 +1428,72 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
             earn_financial_record_allocations(record, actor=actor)
 
     return record
+
+
+def _session_snapshot(session):
+    branch = session.service_branch
+    partner = session.service_partner
+    return {
+        "session_reference": session.session_reference,
+        "service_date": session.service_date.isoformat(),
+        "location_type": session.location_type,
+        "participating_organization_id": session.participating_organization_id,
+        "participating_organization_code": session.participating_organization.clinic_id,
+        "participating_organization_name": session.participating_organization.name,
+        "service_branch_id": session.service_branch_id,
+        "service_branch_name": branch.name if branch else "",
+        "provider_type": session.provider_type,
+        "service_partner_id": session.service_partner_id,
+        "service_partner_code": partner.clinic_id if partner else "",
+        "service_partner_name": partner.name if partner else "",
+        "camera_team_rate": str(session.camera_team_rate),
+        "sentinel_arranged_transport": session.sentinel_arranged_transport,
+        "logistics_allocation_rate": str(session.logistics_allocation_rate),
+        "currency": session.currency,
+        "configuration_version": session.configuration_version,
+    }
+
+
+@transaction.atomic
+def attach_encounter_to_service_session(encounter, session, actor):
+    from encounters.models import AssessmentServiceSession, ScreeningEncounter
+    from .models import FinanceControlAudit
+
+    session = AssessmentServiceSession.objects.select_for_update().select_related(
+        "participating_organization", "service_branch", "service_partner"
+    ).get(pk=session.pk)
+    encounter = ScreeningEncounter.objects.select_for_update().get(pk=encounter.pk)
+    if encounter.service_session_id == session.id and encounter.service_delivery_snapshot:
+        return encounter
+    if encounter.service_session_id or encounter.service_delivery_snapshot:
+        raise ValidationError("This encounter already has an immutable service-session snapshot.")
+    if session.status != AssessmentServiceSession.Status.ACTIVE:
+        raise ValidationError("Only an active service session can accept encounters.")
+    if encounter.encounter_date != session.service_date:
+        raise ValidationError("Encounter date must match the service-session date.")
+    if encounter.originating_organization_id != session.participating_organization_id:
+        raise ValidationError("Encounter does not belong to the participating organisation.")
+    if session.service_branch_id:
+        if encounter.service_branch_id != session.service_branch_id:
+            raise ValidationError("Encounter branch must match the service-session branch.")
+    elif encounter.service_branch_id:
+        raise ValidationError("A branch-specific encounter requires a branch-specific service session.")
+    snapshot = _session_snapshot(session)
+    ScreeningEncounter.objects.filter(pk=encounter.pk).update(
+        service_session=session,
+        service_delivery_snapshot=snapshot,
+        updated_at=timezone.now(),
+    )
+    encounter.service_session = session
+    encounter.service_delivery_snapshot = snapshot
+    FinanceControlAudit.objects.create(
+        action="service_session_encounter_attached", actor=actor,
+        metadata={
+            "session_id": session.id,
+            "session_reference": session.session_reference,
+            "encounter_id": encounter.id,
+            "encounter_reference": encounter.encounter_id,
+            "configuration_version": session.configuration_version,
+        },
+    )
+    return encounter

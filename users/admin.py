@@ -10,5 +10,11 @@ class UserOrganizationAdmin(admin.ModelAdmin):
 
 @admin.register(UserSecurityProfile)
 class UserSecurityProfileAdmin(admin.ModelAdmin):
-    list_display = ("user", "must_change_password")
+    list_display = ("user", "must_change_password", "is_internal_sentinel_staff")
+    list_filter = ("is_internal_sentinel_staff",)
     search_fields = ("user__username",)
+
+    def get_readonly_fields(self, request, obj=None):
+        if request.user.is_superuser:
+            return ()
+        return ("is_internal_sentinel_staff",)

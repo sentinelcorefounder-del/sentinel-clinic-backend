@@ -1,9 +1,130 @@
 from django.conf import settings
 from django.core.validators import FileExtensionValidator
 from django.db import models
+from django.core.exceptions import ValidationError
+import uuid
 
 from organizations.models import Organization
 from patients.models import Patient
+
+
+def assessment_session_reference():
+    return f"SEN-SESSION-{uuid.uuid4().hex[:12].upper()}"
+
+
+class AssessmentServiceSession(models.Model):
+    class LocationType(models.TextChoices):
+        MOBILE = "mobile", "Mobile"
+        HOSPITAL = "hospital", "Hospital"
+        CLINIC = "clinic", "Clinic"
+
+    class ProviderType(models.TextChoices):
+        SENTINEL = "sentinel", "Sentinel"
+        SERVICE_PARTNER = "service_partner", "Service partner"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        ACTIVE = "active", "Active"
+        COMPLETED = "completed", "Completed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    session_reference = models.CharField(
+        max_length=40, unique=True, default=assessment_session_reference, editable=False
+    )
+    service_date = models.DateField()
+    location_type = models.CharField(max_length=20, choices=LocationType.choices)
+    participating_organization = models.ForeignKey(
+        Organization, on_delete=models.PROTECT, related_name="assessment_service_sessions"
+    )
+    service_branch = models.ForeignKey(
+        "organizations.OrganizationBranch", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="assessment_service_sessions",
+    )
+    provider_type = models.CharField(max_length=30, choices=ProviderType.choices)
+    service_partner = models.ForeignKey(
+        Organization, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="provided_assessment_service_sessions",
+    )
+    sentinel_arranged_transport = models.BooleanField(default=False)
+    camera_team_rate = models.DecimalField(max_digits=14, decimal_places=2, default=5000)
+    logistics_allocation_rate = models.DecimalField(max_digits=14, decimal_places=2, default=2500)
+    currency = models.CharField(max_length=3, default="NGN")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    notes = models.TextField(blank=True, default="")
+    configuration_version = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_assessment_sessions"
+    )
+    activated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="activated_assessment_sessions",
+    )
+    activated_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="completed_assessment_sessions",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="cancelled_assessment_sessions",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    IMMUTABLE_TERMS = (
+        "service_date", "location_type", "participating_organization_id",
+        "service_branch_id", "provider_type", "service_partner_id",
+        "sentinel_arranged_transport", "camera_team_rate",
+        "logistics_allocation_rate", "currency",
+    )
+
+    class Meta:
+        ordering = ["-service_date", "-created_at"]
+        indexes = [models.Index(fields=["status", "service_date"])]
+
+    def clean(self):
+        errors = {}
+        participant = self.participating_organization
+        if not participant.is_active or participant.organization_type not in {"clinic", "hospital"}:
+            errors["participating_organization"] = "Choose an active clinic or hospital."
+        if self.service_branch_id and self.service_branch.organization_id != participant.id:
+            errors["service_branch"] = "Branch must belong to the participating organisation."
+        if self.provider_type == self.ProviderType.SERVICE_PARTNER:
+            if not self.service_partner_id or not self.service_partner.is_active or self.service_partner.organization_type != "service_partner":
+                errors["service_partner"] = "Choose an active service-partner organisation."
+        elif self.service_partner_id:
+            errors["service_partner"] = "A Sentinel-provided session cannot have a service partner."
+        if self.camera_team_rate < 0:
+            errors["camera_team_rate"] = "Amount cannot be negative."
+        if self.logistics_allocation_rate < 0:
+            errors["logistics_allocation_rate"] = "Amount cannot be negative."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = AssessmentServiceSession.objects.get(pk=self.pk)
+            allowed_transitions = {
+                self.Status.DRAFT: {self.Status.DRAFT, self.Status.ACTIVE, self.Status.CANCELLED},
+                self.Status.ACTIVE: {self.Status.ACTIVE, self.Status.COMPLETED, self.Status.CANCELLED},
+                self.Status.COMPLETED: {self.Status.COMPLETED},
+                self.Status.CANCELLED: {self.Status.CANCELLED},
+            }
+            if self.status not in allowed_transitions[previous.status]:
+                if previous.status in {self.Status.COMPLETED, self.Status.CANCELLED}:
+                    raise ValidationError("Completed or cancelled sessions cannot be reopened.")
+                raise ValidationError("This service-session status transition is not permitted.")
+            frozen = previous.status != self.Status.DRAFT or previous.encounters.exists()
+            if frozen and any(getattr(previous, field) != getattr(self, field) for field in self.IMMUTABLE_TERMS):
+                raise ValidationError("Material session terms are frozen after activation or encounter attachment.")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.session_reference
 
 
 class ScreeningEncounter(models.Model):
@@ -79,6 +200,11 @@ class ScreeningEncounter(models.Model):
         blank=True,
         related_name="screening_encounters",
     )
+    service_session = models.ForeignKey(
+        AssessmentServiceSession, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="encounters",
+    )
+    service_delivery_snapshot = models.JSONField(default=dict, blank=True)
     hospital_referral = models.ForeignKey(
         "referrals.HospitalReferral",
         on_delete=models.SET_NULL,
@@ -133,6 +259,21 @@ class ScreeningEncounter(models.Model):
 
     def __str__(self):
         return f"{self.encounter_id} - {self.patient}"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = ScreeningEncounter.objects.filter(pk=self.pk).values(
+                "service_session_id", "service_delivery_snapshot"
+            ).first()
+            if previous and previous["service_delivery_snapshot"]:
+                if (
+                    previous["service_session_id"] != self.service_session_id
+                    or previous["service_delivery_snapshot"] != self.service_delivery_snapshot
+                ):
+                    raise ValidationError(
+                        "The service-session link and delivery snapshot are immutable."
+                    )
+        return super().save(*args, **kwargs)
 
     @property
     def includes_diabetic_screening(self):

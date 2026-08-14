@@ -4,11 +4,15 @@ from django.utils.dateparse import parse_date
 from django.db import transaction
 from datetime import timedelta
 import uuid
-from django.http import HttpResponse
+from django.http import FileResponse, Http404, HttpResponse
+from django.shortcuts import get_object_or_404
+from django.db.models import Count
+from pathlib import Path
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from .models import (
     AllocationRule, EncounterFinancialRecord, PartnerContract, PricingRule,
@@ -18,6 +22,8 @@ from .models import (
     FinanceActionRequest, FinanceControlAudit,
     BillingProfile,
 )
+from encounters.models import AssessmentServiceSession
+from organizations.models import Organization
 from .serializers import (
     AllocationRuleSerializer,
     EncounterFinancialRecordSerializer,
@@ -28,6 +34,11 @@ from .serializers import (
     ServiceAllowanceSerializer, ServiceAllowanceReservationSerializer,
     FinanceActionRequestSerializer, FinanceControlAuditSerializer,
     BillingProfileSerializer,
+    AssessmentServiceSessionSerializer, ServicePartnerSerializer,
+)
+from .permissions import (
+    IsInternalFinanceAdministrator, IsInternalFinanceApprover,
+    IsInternalFinanceOperator, has_internal_finance_role,
 )
 from .documents import UnreliableDocumentSnapshot, render_bank_transfer_document
 from .services import (
@@ -63,9 +74,6 @@ class FinanceRolePermission(BasePermission):
     role_groups = {
         "viewer": {"finance_viewer", "finance_operator", "finance_approver", "finance_admin",
                    "ops_admin", "sentinel_ops", "super_admin", "finance_tester"},
-        "operator": {"finance_operator", "finance_admin", "super_admin", "finance_tester"},
-        "approver": {"finance_approver", "finance_admin", "super_admin", "finance_tester"},
-        "admin": {"finance_admin", "super_admin", "finance_tester"},
     }
     required_role = "viewer"
 
@@ -82,39 +90,169 @@ class IsFinanceViewer(FinanceRolePermission):
     required_role = "viewer"
 
 
-class IsFinanceOperator(FinanceRolePermission):
-    required_role = "operator"
+def _audit_internal(action, actor, *, before=None, after=None, metadata=None):
+    FinanceControlAudit.objects.create(
+        action=action, actor=actor, before_state=before or {},
+        after_state=after or {}, metadata=metadata or {},
+    )
 
 
-class IsFinanceApprover(FinanceRolePermission):
-    required_role = "approver"
+def _internal_evidence_role(user):
+    return any(has_internal_finance_role(user, role) for role in (
+        "administrator", "operator", "approver"
+    ))
 
 
-class IsFinanceAdministrator(FinanceRolePermission):
-    required_role = "admin"
+def _evidence_response(file_field):
+    if not file_field or not file_field.name:
+        raise Http404("Evidence file not found.")
+    try:
+        stream = file_field.open("rb")
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise Http404("Evidence file not found.") from exc
+    filename = Path(file_field.name).name
+    return FileResponse(stream, as_attachment=True, filename=filename)
 
 
-class IsContractPricingOps(BasePermission):
-    message = "Only approved Sentinel Finance/Ops users may change contracts and pricing."
-    allowed_groups = {
-        "finance_admin", "ops_admin", "sentinel_ops",
-        "super_admin", "finance_tester",
-    }
+class ServicePartnerViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]
+    serializer_class = ServicePartnerSerializer
+    queryset = Organization.objects.filter(organization_type="service_partner").order_by("name")
+    http_method_names = ["get", "post", "patch", "head", "options"]
 
-    def has_permission(self, request, view):
-        user = request.user
-        if not user or not user.is_authenticated:
-            return False
-        if user.is_superuser:
-            return True
-        return user.groups.filter(name__in=self.allowed_groups).exists()
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            partner = serializer.save()
+            _audit_internal(
+                "service_partner_created", self.request.user,
+                after={"id": partner.id, "code": partner.clinic_id, "name": partner.name,
+                       "is_active": partner.is_active},
+            )
 
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            partner = get_object_or_404(
+                self.get_queryset().select_for_update(), pk=serializer.instance.pk
+            )
+            self.check_object_permissions(self.request, partner)
+            changed = any(
+                getattr(partner, field) != value
+                for field, value in serializer.validated_data.items()
+            )
+            serializer.instance = partner
+            if not changed:
+                return
+            before = {"code": partner.clinic_id, "name": partner.name, "is_active": partner.is_active}
+            partner = serializer.save()
+            action_name = "service_partner_deactivated" if before["is_active"] and not partner.is_active else "service_partner_updated"
+            _audit_internal(
+                action_name, self.request.user, before=before,
+                after={"code": partner.clinic_id, "name": partner.name, "is_active": partner.is_active},
+                metadata={"service_partner_id": partner.id},
+            )
+
+
+class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]
+    serializer_class = AssessmentServiceSessionSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        return AssessmentServiceSession.objects.select_related(
+            "participating_organization", "service_branch", "service_partner",
+            "created_by", "activated_by", "completed_by", "cancelled_by",
+        ).annotate(linked_encounter_count=Count("encounters"))
+
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            session = serializer.save()
+            _audit_internal(
+                "service_session_created", self.request.user,
+                after={"session_id": session.id, "session_reference": session.session_reference,
+                       "status": session.status, "configuration_version": session.configuration_version},
+            )
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            session = get_object_or_404(
+                self.get_queryset().select_for_update(), pk=serializer.instance.pk
+            )
+            self.check_object_permissions(self.request, session)
+            if session.status != AssessmentServiceSession.Status.DRAFT:
+                raise DRFValidationError("Only draft sessions may be edited.")
+            changed = any(
+                getattr(session, field) != value
+                for field, value in serializer.validated_data.items()
+            )
+            serializer.instance = session
+            if not changed:
+                return
+            before = {"session_reference": session.session_reference, "configuration_version": session.configuration_version}
+            session = serializer.save(configuration_version=session.configuration_version + 1)
+            _audit_internal(
+                "service_session_draft_edited", self.request.user, before=before,
+                after={"session_reference": session.session_reference,
+                       "configuration_version": session.configuration_version},
+                metadata={"session_id": session.id},
+            )
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        with transaction.atomic():
+            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            self.check_object_permissions(request, session)
+            if session.status != AssessmentServiceSession.Status.DRAFT:
+                return Response({"detail": "Only a draft session can be activated."}, status=status.HTTP_409_CONFLICT)
+            session.status = AssessmentServiceSession.Status.ACTIVE
+            session.activated_by = request.user
+            session.activated_at = timezone.now()
+            session.save(update_fields=["status", "activated_by", "activated_at", "updated_at"])
+            _audit_internal("service_session_activated", request.user,
+                            metadata={"session_id": session.id, "session_reference": session.session_reference,
+                                      "configuration_version": session.configuration_version})
+        return Response(self.get_serializer(session).data)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        with transaction.atomic():
+            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            self.check_object_permissions(request, session)
+            if session.status != AssessmentServiceSession.Status.ACTIVE:
+                return Response({"detail": "Only an active session can be completed."}, status=status.HTTP_409_CONFLICT)
+            session.status = AssessmentServiceSession.Status.COMPLETED
+            session.completed_by = request.user
+            session.completed_at = timezone.now()
+            session.save(update_fields=["status", "completed_by", "completed_at", "updated_at"])
+            _audit_internal("service_session_completed", request.user,
+                            metadata={"session_id": session.id, "session_reference": session.session_reference,
+                                      "configuration_version": session.configuration_version})
+        return Response(self.get_serializer(session).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": ["A cancellation reason is required."]}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            self.check_object_permissions(request, session)
+            if session.status not in {AssessmentServiceSession.Status.DRAFT, AssessmentServiceSession.Status.ACTIVE}:
+                return Response({"detail": "Only a draft or active session can be cancelled."}, status=status.HTTP_409_CONFLICT)
+            session.status = AssessmentServiceSession.Status.CANCELLED
+            session.cancelled_by = request.user
+            session.cancelled_at = timezone.now()
+            session.cancellation_reason = reason
+            session.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"])
+            _audit_internal("service_session_cancelled", request.user,
+                            metadata={"session_id": session.id, "session_reference": session.session_reference,
+                                      "reason": reason, "configuration_version": session.configuration_version})
+        return Response(self.get_serializer(session).data)
 
 class FinanceAdminViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, IsFinanceAdministrator]
+    permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceAdministrator
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
 
@@ -250,7 +388,7 @@ class PartnerContractViewSet(FinanceAdminViewSet):
         return Response(self.get_serializer(contract).data)
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsContractPricingOps
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
 
@@ -259,7 +397,7 @@ class PricingRuleViewSet(FinanceAdminViewSet):
     serializer_class = PricingRuleSerializer
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsContractPricingOps
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
 
@@ -278,7 +416,7 @@ class BillingProfileViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "head", "options"]
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceAdministrator
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
     def perform_create(self, serializer):
@@ -298,9 +436,9 @@ class ServiceAllowanceViewSet(FinanceAdminViewSet):
         if self.action in {"list", "retrieve"}:
             role = IsFinanceViewer
         elif self.action == "approve":
-            role = IsFinanceApprover
+            role = IsInternalFinanceApprover
         else:
-            role = IsFinanceAdministrator
+            role = IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
     @action(detail=True, methods=["post"])
@@ -332,7 +470,7 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
     ).prefetch_related("allocations", "allocations__beneficiary_organization")
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceOperator
         return [IsAuthenticated(), role()]
 
     def get_queryset(self):
@@ -402,9 +540,9 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
         if self.action in {"list", "retrieve"}:
             role = IsFinanceViewer
         elif self.action in {"top_up", "reserve"}:
-            role = IsFinanceOperator
+            role = IsInternalFinanceOperator
         else:
-            role = IsFinanceAdministrator
+            role = IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
 
     @action(detail=True, methods=["post"], url_path="top-up")
@@ -476,7 +614,7 @@ class WalletReservationViewSet(viewsets.ReadOnlyModelViewSet):
     ).all()
 
     def get_permissions(self):
-        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsFinanceOperator
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceOperator
         return [IsAuthenticated(), role()]
 
     @action(detail=True, methods=["post"])
@@ -525,6 +663,8 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        if _internal_evidence_role(self.request.user):
+            return queryset
         if self._is_finance_ops():
             status_value = (self.request.query_params.get("status") or "").strip()
             return queryset.filter(status=status_value) if status_value else queryset
@@ -613,6 +753,18 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
         )
         return response
 
+    @action(detail=True, methods=["get"], url_path="proof-download")
+    def proof_download(self, request, pk=None):
+        funding_request = self.get_object()
+        organization = get_user_organization(request.user)
+        owns_request = bool(
+            organization and funding_request.wallet.organization_id == organization.id
+        )
+        if not owns_request and not _internal_evidence_role(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You do not have permission to download this evidence.")
+        return _evidence_response(funding_request.proof)
+
     @action(detail=True, methods=["post"], url_path="submit-proof")
     def submit_proof(self, request, pk=None):
         try:
@@ -636,7 +788,7 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
-        self._require_finance_role(IsFinanceOperator)
+        self._require_finance_role(IsInternalFinanceOperator)
         try:
             funding_request = verify_bank_transfer(
                 self.get_object(),
@@ -653,7 +805,7 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        self._require_finance_role(IsFinanceApprover)
+        self._require_finance_role(IsInternalFinanceApprover)
         try:
             funding_request = approve_bank_transfer(self.get_object(), actor=request.user)
         except (DjangoValidationError, ValueError, TypeError) as exc:
@@ -663,7 +815,7 @@ class BankTransferFundingRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def reject(self, request, pk=None):
-        self._require_finance_role(IsFinanceApprover)
+        self._require_finance_role(IsInternalFinanceApprover)
         try:
             funding_request = reject_bank_transfer(
                 self.get_object(), reason=request.data.get("reason"), actor=request.user
@@ -682,10 +834,12 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
     def get_permissions(self):
         if self.action in {"list", "retrieve"}:
             role = IsFinanceViewer
-        elif self.action in {"approve", "mark_paid"}:
-            role = IsFinanceApprover
+        elif self.action == "evidence_download":
+            return [IsAuthenticated()]
+        elif self.action == "approve":
+            role = IsInternalFinanceApprover
         else:
-            role = IsFinanceOperator
+            role = IsInternalFinanceOperator
         return [IsAuthenticated(), role()]
 
     def create(self, request, *args, **kwargs):
@@ -736,6 +890,13 @@ class SettlementBatchViewSet(FinanceAdminViewSet):
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(batch).data)
+
+    @action(detail=True, methods=["get"], url_path="evidence-download")
+    def evidence_download(self, request, pk=None):
+        if not _internal_evidence_role(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You do not have permission to download this evidence.")
+        return _evidence_response(self.get_object().payment_evidence)
 
 
 from django.db import models
@@ -819,13 +980,19 @@ class FinanceOrganizationOptionsView(APIView):
     permission_classes = [IsAuthenticated, IsFinanceViewer]
 
     def get(self, request):
-        organizations = Organization.objects.filter(is_active=True).order_by("name")
+        organizations = Organization.objects.filter(
+            is_active=True, organization_type__in={"clinic", "hospital"}
+        ).prefetch_related("branches").order_by("name")
         return Response([
             {
                 "id": organization.id,
                 "name": organization.name,
                 "organization_type": organization.organization_type,
                 "clinic_id": organization.clinic_id,
+                "branches": [
+                    {"id": branch.id, "name": branch.name}
+                    for branch in organization.branches.all() if branch.is_active
+                ],
             }
             for organization in organizations
         ])
@@ -842,9 +1009,9 @@ class FinanceActionRequestViewSet(viewsets.ReadOnlyModelViewSet):
     def get_permissions(self):
         role = IsFinanceViewer
         if self.action == "create":
-            role = IsFinanceOperator
+            role = IsInternalFinanceOperator
         elif self.action in {"approve", "reject"}:
-            role = IsFinanceApprover
+            role = IsInternalFinanceApprover
         return [IsAuthenticated(), role()]
 
     def create(self, request, *args, **kwargs):
@@ -887,6 +1054,13 @@ class FinanceActionRequestViewSet(viewsets.ReadOnlyModelViewSet):
             return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(action_request).data)
 
+    @action(detail=True, methods=["get"], url_path="evidence-download")
+    def evidence_download(self, request, pk=None):
+        if not _internal_evidence_role(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You do not have permission to download this evidence.")
+        return _evidence_response(self.get_object().evidence)
+
 
 class FinanceControlAuditViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = FinanceControlAuditSerializer
@@ -912,12 +1086,21 @@ class FinanceCapabilitiesView(APIView):
 
         return Response({
             "can_view": True,
-            "can_operate": allowed(IsFinanceOperator),
-            "can_approve": allowed(IsFinanceApprover),
-            "can_administer": allowed(IsFinanceAdministrator),
-            "can_request_corrections": allowed(IsFinanceOperator),
-            "can_decide_corrections": allowed(IsFinanceApprover),
-            "can_prepare_settlements": allowed(IsFinanceOperator),
-            "can_approve_settlements": allowed(IsFinanceApprover),
-            "can_configure_pricing": allowed(IsFinanceAdministrator),
+            "can_operate": allowed(IsInternalFinanceOperator),
+            "can_verify": allowed(IsInternalFinanceOperator),
+            "can_approve": allowed(IsInternalFinanceApprover),
+            "can_administer": allowed(IsInternalFinanceAdministrator),
+            "can_request_corrections": allowed(IsInternalFinanceOperator),
+            "can_decide_corrections": allowed(IsInternalFinanceApprover),
+            "can_prepare_settlements": allowed(IsInternalFinanceOperator),
+            "can_approve_settlements": allowed(IsInternalFinanceApprover),
+            "can_mark_settlements_paid": allowed(IsInternalFinanceOperator),
+            "can_configure_pricing": allowed(IsInternalFinanceAdministrator),
+            "internal_finance": {
+                "can_administer": allowed(IsInternalFinanceAdministrator),
+                "can_operate": allowed(IsInternalFinanceOperator),
+                "can_approve": allowed(IsInternalFinanceApprover),
+                "can_manage_service_partners": allowed(IsInternalFinanceAdministrator),
+                "can_manage_service_sessions": allowed(IsInternalFinanceAdministrator),
+            },
         })

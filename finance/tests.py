@@ -13,7 +13,7 @@ from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
 from organizations.models import Organization, PartnerNotification
-from users.models import UserOrganization
+from users.models import UserOrganization, UserSecurityProfile
 from patients.models import Patient
 from referrals.models import HospitalReferral
 
@@ -722,14 +722,13 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
         self.assertEqual(paid.status, SettlementBatch.Status.PAID)
         self.assertTrue(paid.payment_evidence.name)
 
-    def test_cancel_approved_settlement_restores_earned_allocations(self):
+    def test_cancel_draft_settlement_releases_allocations_for_one_replacement(self):
         self._earned_allocations()
         batch = create_settlement_batch(self.organization, date.today(), date.today())
-        approve_settlement_batch(batch)
         self.assertEqual(
             EncounterAllocation.objects.filter(
                 settlement_items__batch=batch,
-                status=EncounterAllocation.Status.SETTLEMENT_PENDING,
+                status=EncounterAllocation.Status.EARNED,
             ).count(), 1,
         )
         cancel_settlement_batch(batch, "Payment details need correction")
@@ -745,6 +744,40 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
         )
         self.assertNotEqual(replacement.pk, batch.pk)
         self.assertEqual(replacement.items.count(), 1)
+        with self.assertRaisesMessage(ValidationError, "No unsettled allocations"):
+            create_settlement_batch(self.organization, date.today(), date.today())
+
+    def test_approved_settlement_cannot_be_cancelled_or_edited(self):
+        self._earned_allocations()
+        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        original_total = batch.total_amount
+        original_items = list(batch.items.values_list("allocation_id", "amount", "currency"))
+        approve_settlement_batch(batch)
+        with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
+            cancel_settlement_batch(batch, "Operator cannot undo approval")
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, SettlementBatch.Status.APPROVED)
+        self.assertEqual(batch.total_amount, original_total)
+        self.assertEqual(
+            list(batch.items.values_list("allocation_id", "amount", "currency")),
+            original_items,
+        )
+
+    def test_paid_settlement_cannot_be_cancelled(self):
+        self._earned_allocations()
+        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        approve_settlement_batch(batch)
+        evidence = SimpleUploadedFile("paid.pdf", b"paid", content_type="application/pdf")
+        mark_settlement_batch_paid(batch, "PAY-CANCEL-GUARD", payment_evidence=evidence)
+        with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
+            cancel_settlement_batch(batch, "Paid history is immutable")
+
+    def test_repeated_draft_cancellation_is_rejected(self):
+        self._earned_allocations()
+        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        cancel_settlement_batch(batch, "First cancellation")
+        with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
+            cancel_settlement_batch(batch, "Second cancellation")
 
 
 class ServiceAllowanceTests(TestCase):
@@ -924,10 +957,13 @@ class FinanceApiCapabilityTests(TestCase):
         self.client = APIClient()
         self.user = get_user_model().objects.create_user(username="finance-api-user")
 
-    def assign(self, *groups):
+    def assign(self, *groups, internal=True):
         self.user.groups.clear()
         for name in groups:
             self.user.groups.add(Group.objects.get_or_create(name=name)[0])
+        profile, _ = UserSecurityProfile.objects.get_or_create(user=self.user)
+        profile.is_internal_sentinel_staff = internal
+        profile.save(update_fields=["is_internal_sentinel_staff"])
         self.client.force_authenticate(self.user)
 
     def test_viewer_receives_read_only_capabilities(self):
@@ -942,19 +978,37 @@ class FinanceApiCapabilityTests(TestCase):
     def test_operator_can_prepare_but_not_approve(self):
         self.assign("finance_operator")
         response = self.client.get("/api/finance/capabilities/")
+        self.assertTrue(response.data["can_verify"])
         self.assertTrue(response.data["can_prepare_settlements"])
+        self.assertTrue(response.data["can_mark_settlements_paid"])
         self.assertFalse(response.data["can_approve_settlements"])
+        self.assertFalse(response.data["can_administer"])
 
     def test_approver_can_decide_but_not_configure(self):
         self.assign("finance_approver")
         response = self.client.get("/api/finance/capabilities/")
         self.assertTrue(response.data["can_decide_corrections"])
+        self.assertTrue(response.data["can_approve_settlements"])
+        self.assertFalse(response.data["can_mark_settlements_paid"])
+        self.assertFalse(response.data["can_operate"])
         self.assertFalse(response.data["can_configure_pricing"])
 
-    def test_finance_admin_has_all_capabilities(self):
+    def test_finance_admin_does_not_inherit_operator_or_approver(self):
         self.assign("finance_admin")
         response = self.client.get("/api/finance/capabilities/")
-        self.assertTrue(all(response.data.values()))
+        self.assertTrue(response.data["can_administer"])
+        self.assertTrue(response.data["can_configure_pricing"])
+        self.assertFalse(response.data["can_operate"])
+        self.assertFalse(response.data["can_approve"])
+        self.assertFalse(response.data["can_mark_settlements_paid"])
+
+    def test_internal_marker_and_exact_group_are_both_required(self):
+        self.assign("finance_operator", internal=False)
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertFalse(response.data["can_operate"])
+        self.assign("finance_approver", internal=False)
+        response = self.client.get("/api/finance/capabilities/")
+        self.assertFalse(response.data["can_approve"])
 
     def test_viewer_can_list_but_cannot_create_wallets(self):
         self.assign("finance_viewer")

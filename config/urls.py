@@ -3,6 +3,11 @@ from django.urls import path, include, re_path
 from django.conf import settings
 from django.http import JsonResponse
 from django.views.static import serve
+from django.http import Http404
+
+
+def deny_public_finance_media(request, path):
+    raise Http404("Not found.")
 
 
 def home(request):
@@ -25,5 +30,6 @@ urlpatterns = [
     path("api/ops/", include("ops.urls")),
     path("api/audit/", include("audit.urls")),
     path("api/finance/", include("finance.urls")),
+    re_path(r"^media/finance/(?P<path>.*)$", deny_public_finance_media),
     re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
 ]
