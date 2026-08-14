@@ -21,6 +21,7 @@ from .models import (
     ServiceAllowance, ServiceAllowanceReservation,
     FinanceActionRequest, FinanceControlAudit,
     BillingProfile,
+    ServicePartnerEarning, ServicePartnerSettlementBatch, ServicePartnerCorrectionRequest,
 )
 from encounters.models import AssessmentServiceSession
 from organizations.models import Organization
@@ -35,6 +36,8 @@ from .serializers import (
     FinanceActionRequestSerializer, FinanceControlAuditSerializer,
     BillingProfileSerializer,
     AssessmentServiceSessionSerializer, ServicePartnerSerializer,
+    ServicePartnerEarningSerializer, ServicePartnerSettlementSerializer,
+    ServicePartnerCorrectionSerializer, ServicePartnerAdjustmentSerializer,
 )
 from .permissions import (
     IsInternalFinanceAdministrator, IsInternalFinanceApprover,
@@ -52,6 +55,10 @@ from .services import (
     approve_service_allowance,
     create_finance_action_request, approve_finance_action_request,
     reject_finance_action_request, reconcile_finance_controls,
+    service_partner_payable_summary, prepare_service_partner_settlement,
+    decide_service_partner_settlement, cancel_service_partner_settlement,
+    mark_service_partner_settlement_paid,
+    request_service_partner_correction, decide_service_partner_correction,
 )
 
 
@@ -88,6 +95,11 @@ class FinanceRolePermission(BasePermission):
 
 class IsFinanceViewer(FinanceRolePermission):
     required_role = "viewer"
+
+
+class IsInternalFinancePayablesViewer(BasePermission):
+    def has_permission(self, request, view):
+        return _internal_evidence_role(request.user)
 
 
 def _audit_internal(action, actor, *, before=None, after=None, metadata=None):
@@ -247,6 +259,166 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
                             metadata={"session_id": session.id, "session_reference": session.session_reference,
                                       "reason": reason, "configuration_version": session.configuration_version})
         return Response(self.get_serializer(session).data)
+
+
+class ServicePartnerPayablesViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ServicePartnerEarningSerializer
+    permission_classes = [IsAuthenticated, IsInternalFinancePayablesViewer]
+
+    def get_queryset(self):
+        queryset = ServicePartnerEarning.objects.select_related(
+            "service_partner", "encounter", "service_session", "active_settlement",
+        )
+        params = self.request.query_params
+        if params.get("service_partner"):
+            queryset = queryset.filter(service_partner_id=params["service_partner"])
+        if params.get("assessment_date"):
+            queryset = queryset.filter(assessment_date=params["assessment_date"])
+        if params.get("session"):
+            queryset = queryset.filter(service_session_id=params["session"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        return queryset
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        return Response(list(service_partner_payable_summary(self.get_queryset())))
+
+    @action(detail=False, methods=["get"], url_path="settlements")
+    def settlements(self, request):
+        queryset = ServicePartnerSettlementBatch.objects.select_related(
+            "service_partner", "prepared_by", "approved_by", "paid_by",
+        ).prefetch_related("items", "items__earning")
+        if request.query_params.get("service_partner"):
+            queryset = queryset.filter(service_partner_id=request.query_params["service_partner"])
+        if request.query_params.get("assessment_date"):
+            queryset = queryset.filter(assessment_date=request.query_params["assessment_date"])
+        if request.query_params.get("status"):
+            queryset = queryset.filter(status=request.query_params["status"])
+        return Response(ServicePartnerSettlementSerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=["get"])
+    def adjustments(self, request):
+        from .models import ServicePartnerAdjustment
+        queryset = ServicePartnerAdjustment.objects.select_related(
+            "original_earning", "service_partner", "active_settlement",
+        )
+        return Response(ServicePartnerAdjustmentSerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=["get"])
+    def corrections(self, request):
+        queryset = ServicePartnerCorrectionRequest.objects.select_related(
+            "earning", "requested_by", "decided_by", "adjustment", "adjustment__service_partner",
+            "adjustment__original_earning",
+        )
+        return Response(ServicePartnerCorrectionSerializer(queryset, many=True).data)
+
+    @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceOperator], url_path="request-correction")
+    def request_correction(self, request):
+        try:
+            earning = get_object_or_404(ServicePartnerEarning, pk=request.data.get("earning"))
+            correction = request_service_partner_correction(
+                earning=earning, amount=request.data.get("amount"),
+                reason=request.data.get("reason", ""), actor=request.user,
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return Response({"detail": getattr(exc, "messages", [str(exc)])}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerCorrectionSerializer(correction).data, status=status.HTTP_201_CREATED)
+
+    def _correction(self, pk):
+        return get_object_or_404(ServicePartnerCorrectionRequest, pk=pk)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceApprover], url_path="approve-correction")
+    def approve_correction(self, request, pk=None):
+        try:
+            correction = decide_service_partner_correction(self._correction(pk), actor=request.user, approve=True)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerCorrectionSerializer(correction).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceApprover], url_path="reject-correction")
+    def reject_correction(self, request, pk=None):
+        try:
+            correction = decide_service_partner_correction(
+                self._correction(pk), actor=request.user, approve=False,
+                reason=request.data.get("reason", ""),
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerCorrectionSerializer(correction).data)
+
+    @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceOperator])
+    def prepare(self, request):
+        try:
+            partner = get_object_or_404(
+                Organization.objects.filter(organization_type="service_partner"),
+                pk=request.data.get("service_partner"),
+            )
+            session = None
+            if request.data.get("session"):
+                session = get_object_or_404(AssessmentServiceSession, pk=request.data["session"])
+            batch = prepare_service_partner_settlement(
+                service_partner=partner,
+                assessment_date=parse_date(request.data.get("assessment_date", "")),
+                actor=request.user,
+                session=session,
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return Response({"detail": getattr(exc, "messages", [str(exc)])}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerSettlementSerializer(batch).data, status=status.HTTP_201_CREATED)
+
+    def _batch(self, pk):
+        return get_object_or_404(
+            ServicePartnerSettlementBatch.objects.select_related(
+                "service_partner", "prepared_by", "approved_by", "paid_by",
+            ).prefetch_related("items", "items__earning"), pk=pk,
+        )
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceApprover])
+    def approve(self, request, pk=None):
+        try:
+            batch = decide_service_partner_settlement(self._batch(pk), actor=request.user, approve=True)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerSettlementSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceApprover])
+    def reject(self, request, pk=None):
+        try:
+            batch = decide_service_partner_settlement(
+                self._batch(pk), actor=request.user, approve=False,
+                reason=request.data.get("reason", ""),
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerSettlementSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceOperator])
+    def cancel(self, request, pk=None):
+        try:
+            batch = cancel_service_partner_settlement(
+                self._batch(pk), actor=request.user, reason=request.data.get("reason", ""),
+            )
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerSettlementSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsInternalFinanceOperator], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        try:
+            batch = mark_service_partner_settlement_paid(
+                self._batch(pk), actor=request.user,
+                payment_date=parse_date(request.data.get("payment_date", "")),
+                external_reference=request.data.get("external_reference", ""),
+                evidence=request.FILES.get("evidence"),
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return Response({"detail": getattr(exc, "messages", [str(exc)])}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(ServicePartnerSettlementSerializer(batch).data)
+
+    @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated, IsInternalFinancePayablesViewer], url_path="payment-evidence")
+    def payment_evidence(self, request, pk=None):
+        return _evidence_response(self._batch(pk).payment_evidence)
 
 class FinanceAdminViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]

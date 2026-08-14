@@ -1,8 +1,8 @@
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from django.db import models, transaction
-from django.db.models import Q
+from django.db import IntegrityError, models, transaction
+from django.db.models import Count, Min, Q, Sum
 from django.utils import timezone
 
 from organizations.notification_service import notify_organization
@@ -16,7 +16,327 @@ from .models import (
     PricingRule,
     ServiceAllowance,
     ServiceAllowanceReservation,
+    FinanceControlAudit,
+    ServicePartnerEarning,
+    ServicePartnerAdjustment,
+    ServicePartnerCorrectionRequest,
+    ServicePartnerSettlementBatch,
+    ServicePartnerSettlementItem,
 )
+
+
+def _service_partner_report_complete(encounter):
+    report = getattr(encounter, "structured_report", None)
+    if not report or report.report_status not in {"issued", "clinic_issued"}:
+        return False
+    referral = getattr(encounter, "hospital_referral", None)
+    if referral:
+        from reports.release_control import is_report_released_to_hospital
+        return is_report_released_to_hospital(report, referral)
+    return True
+
+
+@transaction.atomic
+def recognize_service_partner_earning(financial_record, trigger_source="financial_capture"):
+    """Converge payment and report completion into one immutable partner earning."""
+    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+        "encounter", "encounter__service_session",
+    ).get(pk=financial_record.pk)
+    encounter = record.encounter
+    snapshot = encounter.service_delivery_snapshot or {}
+    if (
+        not record.financially_releasable
+        or record.captured_at is None
+        or record.status not in {
+            EncounterFinancialRecord.Status.CAPTURED,
+            EncounterFinancialRecord.Status.READY_FOR_RELEASE,
+            EncounterFinancialRecord.Status.SETTLED,
+        }
+        or not encounter.service_session_id
+        or snapshot.get("provider_type") != "service_partner"
+        or not snapshot.get("service_partner_id")
+        or not _service_partner_report_complete(encounter)
+    ):
+        return None
+    partner = encounter.service_session.service_partner
+    if (
+        not partner
+        or partner.pk != snapshot.get("service_partner_id")
+        or partner.organization_type != "service_partner"
+    ):
+        return None
+    amount = Decimal(str(snapshot.get("camera_team_rate", "0"))).quantize(Decimal("0.01"))
+    currency = str(snapshot.get("currency") or "").upper()
+    if amount <= 0 or len(currency) != 3:
+        return None
+    defaults = {
+        "service_partner": partner,
+        "encounter": encounter,
+        "service_session": encounter.service_session,
+        "assessment_date": encounter.encounter_date,
+        "session_reference": str(snapshot.get("session_reference") or encounter.service_session.session_reference),
+        "provider_type": "service_partner",
+        "amount": amount,
+        "currency": currency,
+        "rate_snapshot": {
+            "camera_team_rate": str(amount),
+            "currency": currency,
+            "provider_type": "service_partner",
+            "service_partner_id": partner.pk,
+            "configuration_version": snapshot.get("configuration_version"),
+        },
+        "trigger_source": trigger_source,
+        "earned_at": timezone.now(),
+    }
+    try:
+        earning, _ = ServicePartnerEarning.objects.get_or_create(
+            financial_record=record, defaults=defaults,
+        )
+    except IntegrityError:
+        earning = ServicePartnerEarning.objects.get(financial_record=record)
+    return earning
+
+
+def service_partner_payable_summary(queryset=None):
+    qs = queryset if queryset is not None else ServicePartnerEarning.objects.all()
+    rows = list(qs.values("service_partner_id", "service_partner__name", "currency").annotate(
+        total_earned=Sum("amount"),
+        unpaid_assessments=Count("id", filter=Q(status__in=[
+            ServicePartnerEarning.Status.AVAILABLE,
+            ServicePartnerEarning.Status.SETTLEMENT_PENDING,
+        ])),
+        oldest_outstanding_date=Min("assessment_date", filter=Q(status__in=[
+            ServicePartnerEarning.Status.AVAILABLE,
+            ServicePartnerEarning.Status.SETTLEMENT_PENDING,
+        ])),
+    ).order_by("service_partner__name", "currency"))
+    for row in rows:
+        adjustments = ServicePartnerAdjustment.objects.filter(
+            service_partner_id=row["service_partner_id"], currency=row["currency"],
+        )
+        posted = adjustments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        carried = adjustments.filter(status=ServicePartnerAdjustment.Status.AVAILABLE).aggregate(
+            total=Sum("amount")
+        )["total"] or Decimal("0.00")
+        row["total_adjustments"] = posted
+        row["carried_forward_adjustment"] = carried
+        row["total_paid"] = ServicePartnerSettlementBatch.objects.filter(
+            service_partner_id=row["service_partner_id"], currency=row["currency"],
+            status=ServicePartnerSettlementBatch.Status.PAID,
+        ).aggregate(total=Sum("final_amount"))["total"] or Decimal("0.00")
+        row["outstanding"] = row["total_earned"] + posted - row["total_paid"]
+    return rows
+
+
+def _partner_audit(action, actor, batch, before, after, metadata=None):
+    audit_metadata = {"service_partner_settlement_id": batch.pk if batch else None}
+    audit_metadata.update(metadata or {})
+    FinanceControlAudit.objects.create(
+        action=action, actor=actor, before_state=before, after_state=after,
+        metadata=audit_metadata,
+    )
+
+
+@transaction.atomic
+def prepare_service_partner_settlement(*, service_partner, assessment_date, actor, session=None):
+    earnings = ServicePartnerEarning.objects.select_for_update().filter(
+        service_partner=service_partner, assessment_date=assessment_date,
+        status=ServicePartnerEarning.Status.AVAILABLE, active_settlement__isnull=True,
+    )
+    if session is not None:
+        earnings = earnings.filter(service_session=session)
+    selected = list(earnings.order_by("id"))
+    if not selected:
+        raise ValidationError("No eligible unpaid earnings exist for this selection.")
+    currencies = {item.currency for item in selected}
+    if len(currencies) != 1:
+        raise ValidationError("A settlement cannot mix currencies.")
+    currency = next(iter(currencies))
+    adjustments = list(ServicePartnerAdjustment.objects.select_for_update().filter(
+        service_partner=service_partner, currency=currency,
+        status=ServicePartnerAdjustment.Status.AVAILABLE, active_settlement__isnull=True,
+    ).order_by("id"))
+    total = sum((item.amount for item in selected), Decimal("0.00")) + sum(
+        (item.amount for item in adjustments), Decimal("0.00")
+    )
+    if total <= 0:
+        raise ValidationError("Carried-forward adjustments equal or exceed this day's earnings; no cash settlement was created.")
+    batch = ServicePartnerSettlementBatch.objects.create(
+        service_partner=service_partner, assessment_date=assessment_date,
+        currency=currency, assessment_count=len(selected),
+        gross_amount=total, final_amount=total, prepared_by=actor,
+    )
+    ServicePartnerSettlementItem.objects.bulk_create([
+        ServicePartnerSettlementItem(batch=batch, earning=item, amount=item.amount, currency=item.currency)
+        for item in selected
+    ] + [
+        ServicePartnerSettlementItem(batch=batch, adjustment=item, amount=item.amount, currency=item.currency)
+        for item in adjustments
+    ])
+    ServicePartnerEarning.objects.filter(pk__in=[item.pk for item in selected]).update(
+        status=ServicePartnerEarning.Status.SETTLEMENT_PENDING, active_settlement=batch,
+    )
+    ServicePartnerAdjustment.objects.filter(pk__in=[item.pk for item in adjustments]).update(
+        status=ServicePartnerAdjustment.Status.SETTLEMENT_PENDING, active_settlement=batch,
+    )
+    _partner_audit("service_partner_settlement_prepared", actor, batch, {}, {"status": batch.status})
+    return batch
+
+
+@transaction.atomic
+def decide_service_partner_settlement(batch, *, actor, approve, reason=""):
+    batch = ServicePartnerSettlementBatch.objects.select_for_update().get(pk=batch.pk)
+    if batch.status != batch.Status.DRAFT:
+        raise ValidationError("Only a draft settlement may be approved or rejected.")
+    if batch.prepared_by_id == actor.pk:
+        raise ValidationError("The preparer cannot approve or reject this settlement.")
+    before = {"status": batch.status}
+    now = timezone.now()
+    if approve:
+        batch.status, batch.approved_by, batch.approved_at = batch.Status.APPROVED, actor, now
+        fields = ["status", "approved_by", "approved_at", "updated_at"]
+        action = "service_partner_settlement_approved"
+    else:
+        if not reason.strip():
+            raise ValidationError("A rejection reason is required.")
+        batch.status, batch.rejected_by, batch.rejected_at = batch.Status.REJECTED, actor, now
+        batch.rejection_reason = reason.strip()
+        fields = ["status", "rejected_by", "rejected_at", "rejection_reason", "updated_at"]
+        ServicePartnerEarning.objects.filter(active_settlement=batch).update(
+            status=ServicePartnerEarning.Status.AVAILABLE, active_settlement=None,
+        )
+        ServicePartnerAdjustment.objects.filter(active_settlement=batch).update(
+            status=ServicePartnerAdjustment.Status.AVAILABLE, active_settlement=None,
+        )
+        action = "service_partner_settlement_rejected"
+    batch.save(update_fields=fields)
+    _partner_audit(action, actor, batch, before, {"status": batch.status})
+    return batch
+
+
+@transaction.atomic
+def cancel_service_partner_settlement(batch, *, actor, reason):
+    batch = ServicePartnerSettlementBatch.objects.select_for_update().get(pk=batch.pk)
+    if batch.status != batch.Status.DRAFT:
+        raise ValidationError("Only a draft settlement may be cancelled.")
+    if not reason.strip():
+        raise ValidationError("A cancellation reason is required.")
+    before = {"status": batch.status}
+    batch.status, batch.cancelled_by, batch.cancelled_at = batch.Status.CANCELLED, actor, timezone.now()
+    batch.cancellation_reason = reason.strip()
+    batch.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"])
+    ServicePartnerEarning.objects.filter(active_settlement=batch).update(
+        status=ServicePartnerEarning.Status.AVAILABLE, active_settlement=None,
+    )
+    ServicePartnerAdjustment.objects.filter(active_settlement=batch).update(
+        status=ServicePartnerAdjustment.Status.AVAILABLE, active_settlement=None,
+    )
+    _partner_audit("service_partner_settlement_cancelled", actor, batch, before, {"status": batch.status})
+    return batch
+
+
+@transaction.atomic
+def mark_service_partner_settlement_paid(batch, *, actor, payment_date, external_reference, evidence=None):
+    batch = ServicePartnerSettlementBatch.objects.select_for_update().get(pk=batch.pk)
+    if batch.status == batch.Status.PAID:
+        if batch.external_reference == external_reference:
+            return batch
+        raise ValidationError("This settlement has already been paid.")
+    if batch.status != batch.Status.APPROVED:
+        raise ValidationError("Only an approved settlement may be marked paid.")
+    if not payment_date or not external_reference.strip():
+        raise ValidationError("Payment date and external reference are required.")
+    before = {"status": batch.status}
+    batch.status, batch.paid_by, batch.paid_at = batch.Status.PAID, actor, timezone.now()
+    batch.payment_date, batch.external_reference = payment_date, external_reference.strip()
+    if evidence is not None:
+        batch.payment_evidence = evidence
+    batch.save()
+    ServicePartnerEarning.objects.filter(active_settlement=batch).update(
+        status=ServicePartnerEarning.Status.PAID, paid_at=batch.paid_at,
+    )
+    ServicePartnerAdjustment.objects.filter(active_settlement=batch).update(
+        status=ServicePartnerAdjustment.Status.APPLIED, applied_at=batch.paid_at,
+    )
+    _partner_audit("service_partner_settlement_paid", actor, batch, before, {"status": batch.status})
+    return batch
+
+
+@transaction.atomic
+def request_service_partner_correction(*, earning, amount, reason, actor):
+    earning = ServicePartnerEarning.objects.select_for_update().get(pk=earning.pk)
+    amount = Decimal(str(amount)).quantize(Decimal("0.01"))
+    if amount <= 0 or amount > earning.amount:
+        raise ValidationError("Correction amount must be greater than zero and no more than the original earning.")
+    reserved = earning.correction_requests.filter(
+        status__in=[
+            ServicePartnerCorrectionRequest.Status.PENDING,
+            ServicePartnerCorrectionRequest.Status.APPROVED,
+        ]
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    if reserved + amount > earning.amount:
+        raise ValidationError("Pending and approved corrections cannot exceed the original earning.")
+    if not str(reason or "").strip():
+        raise ValidationError("A correction reason is required.")
+    correction = ServicePartnerCorrectionRequest.objects.create(
+        earning=earning, amount=amount, reason=str(reason).strip(), requested_by=actor,
+    )
+    _partner_audit(
+        "service_partner_correction_requested", actor,
+        earning.active_settlement, {},
+        {"status": correction.status},
+        {"service_partner_correction_id": correction.pk, "earning_id": earning.pk},
+    )
+    return correction
+
+
+@transaction.atomic
+def decide_service_partner_correction(correction, *, actor, approve, reason=""):
+    correction = ServicePartnerCorrectionRequest.objects.select_for_update().select_related(
+        "earning", "earning__financial_record", "earning__encounter", "earning__service_partner",
+    ).get(pk=correction.pk)
+    if correction.status == correction.Status.APPROVED:
+        return correction
+    if correction.status != correction.Status.PENDING:
+        raise ValidationError("Only a pending correction may be decided.")
+    if correction.requested_by_id == actor.pk:
+        raise ValidationError("The requesting operator cannot decide this correction.")
+    if not approve and not str(reason or "").strip():
+        raise ValidationError("A rejection reason is required.")
+    now = timezone.now()
+    correction.status = correction.Status.APPROVED if approve else correction.Status.REJECTED
+    correction.decided_by = actor
+    correction.decided_at = now
+    correction.decision_reason = str(reason or "").strip()
+    correction.save(update_fields=["status", "decided_by", "decided_at", "decision_reason", "updated_at"])
+    if approve:
+        earning = correction.earning
+        adjustment_status = ServicePartnerAdjustment.Status.AVAILABLE
+        if earning.status == ServicePartnerEarning.Status.AVAILABLE and correction.amount == earning.amount:
+            earning.status = ServicePartnerEarning.Status.REVERSED
+            earning.save(update_fields=["status", "updated_at"])
+            adjustment_status = ServicePartnerAdjustment.Status.OFFSET_WITHOUT_PAYMENT
+        adjustment, _ = ServicePartnerAdjustment.objects.get_or_create(
+            correction_request=correction,
+            defaults={
+                "original_earning": earning, "service_partner": earning.service_partner,
+                "encounter": earning.encounter, "financial_record": earning.financial_record,
+                "amount": -correction.amount, "currency": earning.currency,
+                "reason": correction.reason, "status": adjustment_status, "posted_at": now,
+                "applied_at": now if adjustment_status == ServicePartnerAdjustment.Status.OFFSET_WITHOUT_PAYMENT else None,
+            },
+        )
+    _partner_audit(
+        "service_partner_correction_approved" if approve else "service_partner_correction_rejected",
+        actor, correction.earning.active_settlement,
+        {"status": "pending"}, {"status": correction.status},
+        {
+            "service_partner_correction_id": correction.pk,
+            "earning_id": correction.earning_id,
+            "service_partner_adjustment_id": adjustment.pk if approve else None,
+        },
+    )
+    return correction
 
 
 def infer_financial_identity(encounter):
@@ -778,6 +1098,9 @@ def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, a
     if idempotency_key:
         existing = WalletLedgerEntry.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
+            recognize_service_partner_earning(
+                reservation.financial_record, trigger_source="wallet_capture_retry"
+            )
             return reservation
     amount = _money(amount if amount is not None else reservation.remaining_amount)
     if amount > reservation.remaining_amount:
@@ -826,6 +1149,8 @@ def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, a
         previous_status=previous_status,
         details={"reservation_id": reservation.id, "amount": str(amount)},
     )
+    if record.financially_releasable:
+        recognize_service_partner_earning(record, trigger_source="wallet_capture")
     return reservation
 
 
@@ -1109,6 +1434,7 @@ def earn_financial_record_allocations(financial_record, actor=None):
         status=EncounterAllocation.Status.PENDING_SERVICE
     )
     if not pending.exists():
+        recognize_service_partner_earning(record, trigger_source="allocation_earning")
         return record
     earned_at = timezone.now()
     count = pending.update(status=EncounterAllocation.Status.EARNED, earned_at=earned_at)
@@ -1119,6 +1445,7 @@ def earn_financial_record_allocations(financial_record, actor=None):
         previous_status=record.status,
         details={"allocation_count": count, "earned_at": earned_at.isoformat()},
     )
+    recognize_service_partner_earning(record, trigger_source="allocation_earning")
     return record
 
 

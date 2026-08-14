@@ -945,6 +945,273 @@ class SettlementItem(TimeStampedModel):
         return f"Settlement item {self.id or 'new'} - {self.amount} {self.currency}"
 
 
+def service_partner_earning_reference():
+    return f"SPE-{uuid.uuid4().hex[:16].upper()}"
+
+
+def service_partner_payment_evidence_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/service-partner-evidence/{instance.pk or uuid.uuid4().hex}/{uuid.uuid4().hex}.{suffix}"
+
+
+class ServicePartnerSettlementBatch(TimeStampedModel):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        PAID = "paid", "Paid"
+        CANCELLED = "cancelled", "Cancelled"
+
+    service_partner = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="service_partner_settlement_batches",
+    )
+    assessment_date = models.DateField()
+    currency = models.CharField(max_length=3)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    assessment_count = models.PositiveIntegerField()
+    gross_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    final_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    prepared_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="prepared_service_partner_settlements",
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="approved_service_partner_settlements",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="rejected_service_partner_settlements",
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True, default="")
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="cancelled_service_partner_settlements",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="paid_service_partner_settlements",
+    )
+    paid_at = models.DateTimeField(null=True, blank=True)
+    payment_date = models.DateField(null=True, blank=True)
+    external_reference = models.CharField(max_length=120, blank=True, default="")
+    payment_evidence = models.FileField(
+        upload_to=service_partner_payment_evidence_path, null=True, blank=True,
+    )
+
+    class Meta:
+        ordering = ["-assessment_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_reference"], condition=~Q(external_reference=""),
+                name="fin_unique_partner_payment_ref",
+            ),
+            models.CheckConstraint(
+                condition=Q(gross_amount__gt=0) & Q(final_amount__gt=0),
+                name="fin_partner_settlement_positive",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = ServicePartnerSettlementBatch.objects.get(pk=self.pk)
+            if previous.status == self.Status.PAID:
+                protected = (
+                    "service_partner_id", "assessment_date", "currency", "assessment_count",
+                    "gross_amount", "final_amount", "status", "paid_by_id", "paid_at",
+                    "payment_date", "external_reference", "payment_evidence",
+                )
+                if any(getattr(previous, field) != getattr(self, field) for field in protected):
+                    raise ValidationError("Paid service-partner settlements are immutable.")
+        return super().save(*args, **kwargs)
+
+
+class ServicePartnerEarning(TimeStampedModel):
+    class Status(models.TextChoices):
+        AVAILABLE = "available", "Available"
+        SETTLEMENT_PENDING = "settlement_pending", "Settlement pending"
+        PAID = "paid", "Paid"
+        REVERSED = "reversed", "Reversed"
+
+    earning_reference = models.CharField(
+        max_length=24, unique=True, default=service_partner_earning_reference, editable=False,
+    )
+    service_partner = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="service_partner_earnings",
+    )
+    encounter = models.OneToOneField(
+        "encounters.ScreeningEncounter", on_delete=models.PROTECT,
+        related_name="service_partner_earning",
+    )
+    financial_record = models.OneToOneField(
+        EncounterFinancialRecord, on_delete=models.PROTECT,
+        related_name="service_partner_earning",
+    )
+    service_session = models.ForeignKey(
+        "encounters.AssessmentServiceSession", on_delete=models.PROTECT,
+        related_name="service_partner_earnings",
+    )
+    assessment_date = models.DateField()
+    session_reference = models.CharField(max_length=40)
+    provider_type = models.CharField(max_length=30)
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3)
+    rate_snapshot = models.JSONField(default=dict)
+    trigger_source = models.CharField(max_length=40)
+    earned_at = models.DateTimeField()
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.AVAILABLE)
+    active_settlement = models.ForeignKey(
+        ServicePartnerSettlementBatch, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="active_earnings",
+    )
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-assessment_date", "earning_reference"]
+        indexes = [
+            models.Index(fields=["service_partner", "status", "assessment_date"], name="fin_partner_earn_status_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__gt=0), name="fin_partner_earning_positive"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = ServicePartnerEarning.objects.get(pk=self.pk)
+            immutable = (
+                "earning_reference", "service_partner_id", "encounter_id", "financial_record_id",
+                "service_session_id", "assessment_date", "session_reference", "provider_type",
+                "amount", "currency", "rate_snapshot", "trigger_source", "earned_at",
+            )
+            if any(getattr(previous, field) != getattr(self, field) for field in immutable):
+                raise ValidationError("Service-partner earning source fields are immutable.")
+        return super().save(*args, **kwargs)
+
+
+class ServicePartnerCorrectionRequest(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    earning = models.ForeignKey(
+        ServicePartnerEarning, on_delete=models.PROTECT, related_name="correction_requests",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    reason = models.TextField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="requested_service_partner_corrections",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="decided_service_partner_corrections",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__gt=0), name="fin_partner_correction_positive"),
+        ]
+
+
+class ServicePartnerAdjustment(TimeStampedModel):
+    class Status(models.TextChoices):
+        AVAILABLE = "available", "Carried forward"
+        SETTLEMENT_PENDING = "settlement_pending", "Settlement pending"
+        APPLIED = "applied", "Applied"
+        OFFSET_WITHOUT_PAYMENT = "offset_without_payment", "Offset without payment"
+
+    correction_request = models.OneToOneField(
+        ServicePartnerCorrectionRequest, on_delete=models.PROTECT, related_name="adjustment",
+    )
+    original_earning = models.ForeignKey(
+        ServicePartnerEarning, on_delete=models.PROTECT, related_name="adjustments",
+    )
+    service_partner = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="service_partner_adjustments",
+    )
+    encounter = models.ForeignKey(
+        "encounters.ScreeningEncounter", on_delete=models.PROTECT,
+        related_name="service_partner_adjustments",
+    )
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.PROTECT,
+        related_name="service_partner_adjustments",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3)
+    reason = models.TextField()
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.AVAILABLE)
+    active_settlement = models.ForeignKey(
+        ServicePartnerSettlementBatch, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="active_adjustments",
+    )
+    posted_at = models.DateTimeField()
+    applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__lt=0), name="fin_partner_adjustment_negative"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Service-partner adjustments are append-only.")
+        return super().save(*args, **kwargs)
+
+
+class ServicePartnerSettlementItem(TimeStampedModel):
+    batch = models.ForeignKey(
+        ServicePartnerSettlementBatch, on_delete=models.PROTECT, related_name="items",
+    )
+    earning = models.ForeignKey(
+        ServicePartnerEarning, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="settlement_items",
+    )
+    adjustment = models.ForeignKey(
+        ServicePartnerAdjustment, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="settlement_items",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(fields=["batch", "earning"], name="fin_unique_partner_settlement_item"),
+            models.UniqueConstraint(fields=["batch", "adjustment"], name="fin_unique_partner_adjustment_item"),
+            models.CheckConstraint(
+                condition=(Q(earning__isnull=False, adjustment__isnull=True) |
+                           Q(earning__isnull=True, adjustment__isnull=False)),
+                name="fin_partner_item_one_source",
+            ),
+        ]
+
+    def clean(self):
+        if self.amount == 0:
+            raise ValidationError({"amount": "Settlement item amount cannot be zero."})
+        if bool(self.earning_id) == bool(self.adjustment_id):
+            raise ValidationError("A settlement item requires exactly one source.")
+        if self.earning_id and self.amount <= 0:
+            raise ValidationError({"amount": "Earning settlement items must be positive."})
+        if self.adjustment_id and self.amount >= 0:
+            raise ValidationError({"amount": "Adjustment settlement items must be negative."})
+        if self.batch_id and self.currency != self.batch.currency:
+            raise ValidationError({"currency": "Settlement item currency must match its batch."})
+
+
 def finance_action_evidence_path(instance, filename):
     suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
     return f"finance/action-evidence/{instance.idempotency_key}/{uuid.uuid4().hex}.{suffix}"

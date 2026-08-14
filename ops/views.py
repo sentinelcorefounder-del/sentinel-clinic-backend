@@ -1253,6 +1253,9 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
             "report", "report_ready", "referral_status", "updated_at",
         ])
 
+        from finance.services import recognize_service_partner_earning
+        recognize_service_partner_earning(financial_record, trigger_source="hospital_report_release")
+
         ReportStatusEvent.objects.create(
             report=report,
             event_type="released_to_hospital",

@@ -104,6 +104,8 @@ def post_verified_payment(payment, verify_payload):
                 "amount": str(received_amount),
             },
         )
+        from finance.services import recognize_service_partner_earning
+        recognize_service_partner_earning(record, trigger_source="paystack_capture")
     else:
         raise ValidationError("Unsupported payment purpose.")
 

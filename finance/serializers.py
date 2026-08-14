@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from django.db.models import Q
+from django.db.models import Count, Q
 from organizations.models import Organization
 from encounters.models import AssessmentServiceSession
 
@@ -20,7 +20,95 @@ from .models import (
     FinanceActionRequest,
     FinanceControlAudit,
     BillingProfile,
+    ServicePartnerEarning,
+    ServicePartnerSettlementBatch,
+    ServicePartnerAdjustment,
+    ServicePartnerCorrectionRequest,
 )
+
+
+class ServicePartnerEarningSerializer(serializers.ModelSerializer):
+    service_partner_name = serializers.CharField(source="service_partner.name", read_only=True)
+    encounter_reference = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    settlement_id = serializers.IntegerField(source="active_settlement_id", read_only=True)
+
+    class Meta:
+        model = ServicePartnerEarning
+        fields = (
+            "id", "earning_reference", "service_partner", "service_partner_name",
+            "encounter_reference", "service_session", "session_reference",
+            "assessment_date", "provider_type", "amount", "currency", "rate_snapshot",
+            "trigger_source", "earned_at", "status", "settlement_id",
+        )
+        read_only_fields = fields
+
+
+class ServicePartnerSettlementSerializer(serializers.ModelSerializer):
+    service_partner_name = serializers.CharField(source="service_partner.name", read_only=True)
+    prepared_by_name = serializers.CharField(source="prepared_by.username", read_only=True)
+    approved_by_name = serializers.CharField(source="approved_by.username", read_only=True)
+    paid_by_name = serializers.CharField(source="paid_by.username", read_only=True)
+    included_sessions = serializers.SerializerMethodField()
+    rate_breakdown = serializers.SerializerMethodField()
+    has_payment_evidence = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ServicePartnerSettlementBatch
+        fields = (
+            "id", "service_partner", "service_partner_name", "assessment_date", "currency",
+            "status", "assessment_count", "gross_amount", "final_amount", "included_sessions",
+            "rate_breakdown", "prepared_by_name", "approved_by_name", "approved_at",
+            "rejected_at", "rejection_reason", "cancelled_at", "cancellation_reason",
+            "paid_by_name", "paid_at", "payment_date", "external_reference",
+            "has_payment_evidence", "created_at",
+        )
+        read_only_fields = fields
+
+    def get_included_sessions(self, obj):
+        return sorted(set(obj.items.filter(earning__isnull=False).values_list("earning__session_reference", flat=True)))
+
+    def get_rate_breakdown(self, obj):
+        rows = obj.items.values("amount", "currency").annotate(count=Count("id")).order_by("amount", "currency")
+        return [{"rate": str(row["amount"]), "currency": row["currency"], "count": row["count"]} for row in rows]
+
+    def get_has_payment_evidence(self, obj):
+        return bool(obj.payment_evidence)
+
+
+class ServicePartnerAdjustmentSerializer(serializers.ModelSerializer):
+    earning_reference = serializers.CharField(source="original_earning.earning_reference", read_only=True)
+    service_partner_name = serializers.CharField(source="service_partner.name", read_only=True)
+
+    class Meta:
+        model = ServicePartnerAdjustment
+        fields = (
+            "id", "earning_reference", "service_partner", "service_partner_name", "amount",
+            "currency", "reason", "status", "active_settlement", "posted_at", "applied_at",
+        )
+        read_only_fields = fields
+
+
+class ServicePartnerCorrectionSerializer(serializers.ModelSerializer):
+    earning_reference = serializers.CharField(source="earning.earning_reference", read_only=True)
+    requested_by_name = serializers.CharField(source="requested_by.username", read_only=True)
+    decided_by_name = serializers.CharField(source="decided_by.username", read_only=True)
+    adjustment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ServicePartnerCorrectionRequest
+        fields = (
+            "id", "earning", "earning_reference", "amount", "reason", "status",
+            "requested_by_name", "decided_by_name", "decided_at", "decision_reason",
+            "adjustment", "created_at",
+        )
+        read_only_fields = fields
+
+    def get_adjustment(self, obj):
+        try:
+            adjustment = obj.adjustment
+        except ServicePartnerAdjustment.DoesNotExist:
+            return None
+        return ServicePartnerAdjustmentSerializer(adjustment).data
 
 
 class AllocationRuleSerializer(serializers.ModelSerializer):

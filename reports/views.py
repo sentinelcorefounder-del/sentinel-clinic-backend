@@ -617,6 +617,11 @@ def clinic_issue_report(request, pk):
         referral.save(update_fields=[
             "report", "report_ready", "referral_status", "updated_at",
         ])
+    else:
+        from finance.services import recognize_service_partner_earning
+        financial_record = getattr(report.encounter, "financial_record", None)
+        if financial_record:
+            recognize_service_partner_earning(financial_record, trigger_source="clinic_report_issue")
 
     ReportStatusEvent.objects.create(
         report=report,
