@@ -26,6 +26,7 @@ class UserSecurityProfile(models.Model):
         related_name="security_profile",
     )
     must_change_password = models.BooleanField(default=False)
+    is_internal_sentinel_staff = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.user.username} security profile"

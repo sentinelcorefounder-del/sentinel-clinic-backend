@@ -63,7 +63,7 @@ class OrganizationListView(generics.ListAPIView):
     serializer_class = OrganizationSerializer
 
     def get_queryset(self):
-        queryset = Organization.objects.all()
+        queryset = Organization.objects.exclude(organization_type="service_partner")
 
         user = self.request.user
         if user.is_superuser:
@@ -80,7 +80,7 @@ class OrganizationDetailView(generics.RetrieveUpdateAPIView):
     serializer_class = OrganizationWithProfileSerializer
 
     def get_queryset(self):
-        queryset = Organization.objects.all()
+        queryset = Organization.objects.exclude(organization_type="service_partner")
 
         user = self.request.user
         if user.is_superuser or user.groups.filter(name="ops_admin").exists():
@@ -200,7 +200,9 @@ class OrganizationBranchListCreateView(generics.ListCreateAPIView):
     def _organization(self):
         organization_id = self.kwargs["organization_id"]
         user = self.request.user
-        queryset = Organization.objects.filter(pk=organization_id)
+        queryset = Organization.objects.filter(
+            pk=organization_id, organization_type__in={"clinic", "hospital"}
+        )
         if user.is_superuser or user.groups.filter(name="ops_admin").exists():
             return queryset.first()
         organization = get_user_organization(user)
@@ -233,7 +235,8 @@ class OrganizationBranchDetailView(generics.RetrieveUpdateAPIView):
     def get_queryset(self):
         user = self.request.user
         queryset = OrganizationBranch.objects.filter(
-            organization_id=self.kwargs["organization_id"]
+            organization_id=self.kwargs["organization_id"],
+            organization__organization_type__in={"clinic", "hospital"},
         )
         if user.is_superuser or user.groups.filter(name="ops_admin").exists():
             return queryset

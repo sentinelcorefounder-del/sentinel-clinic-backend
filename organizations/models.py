@@ -7,6 +7,7 @@ class Organization(models.Model):
         ("clinic", "Clinic"),
         ("hospital", "Hospital"),
         ("sentinel", "Sentinel"),
+        ("service_partner", "Service Partner"),
     ]
 
     clinic_id = models.CharField(max_length=50, unique=True)

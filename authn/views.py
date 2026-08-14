@@ -22,13 +22,14 @@ def get_user_role_names(user):
     return list(user.groups.values_list("name", flat=True))
 
 
-def get_must_change_password(user):
+def get_security_profile(user):
     profile, _ = UserSecurityProfile.objects.get_or_create(user=user)
-    return profile.must_change_password
+    return profile
 
 
 def serialize_user(user):
     org = get_user_organization(user)
+    profile = get_security_profile(user)
 
     return {
         "id": user.id,
@@ -36,7 +37,8 @@ def serialize_user(user):
         "email": user.email,
         "is_staff": user.is_staff,
         "is_superuser": user.is_superuser,
-        "must_change_password": get_must_change_password(user),
+        "must_change_password": profile.must_change_password,
+        "is_internal_sentinel_staff": profile.is_internal_sentinel_staff,
         "roles": get_user_role_names(user),
         "can_access_ops": user.is_superuser or "ops_admin" in get_user_role_names(user) or "sentinel_ops" in get_user_role_names(user),
         "organization": {

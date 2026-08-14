@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from django.db.models import Q
+from organizations.models import Organization
+from encounters.models import AssessmentServiceSession
 
 from .models import (
     AllocationRule,
@@ -93,6 +95,10 @@ class PartnerContractSerializer(serializers.ModelSerializer):
         organization = attrs.get(
             "organization", getattr(self.instance, "organization", None)
         )
+        if organization and organization.organization_type == "service_partner":
+            raise serializers.ValidationError({
+                "organization": "Service partners cannot receive clinical pricing contracts."
+            })
         programme = attrs.get(
             "programme", getattr(self.instance, "programme", "diabetic_screening")
         )
@@ -186,6 +192,11 @@ class OrganizationWalletSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ("created_at", "updated_at")
 
+    def validate_organization(self, organization):
+        if organization.organization_type == "service_partner":
+            raise serializers.ValidationError("Service partners cannot have organization wallets.")
+        return organization
+
 
 class WalletLedgerEntrySerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
@@ -223,31 +234,44 @@ class SettlementItemSerializer(serializers.ModelSerializer):
 class SettlementBatchSerializer(serializers.ModelSerializer):
     beneficiary_organization_name = serializers.CharField(source="beneficiary_organization.name", read_only=True)
     items = SettlementItemSerializer(many=True, read_only=True)
+    payment_evidence_available = serializers.SerializerMethodField()
 
     class Meta:
         model = SettlementBatch
-        fields = "__all__"
+        exclude = ("payment_evidence",)
         read_only_fields = (
-            "status", "total_amount", "external_reference", "payment_evidence",
+            "status", "total_amount", "external_reference",
             "prepared_by", "approved_by", "approved_at", "paid_by", "paid_at", "cancelled_by",
             "cancelled_at", "cancellation_reason",
             "created_at", "updated_at",
         )
 
+    def get_payment_evidence_available(self, obj):
+        return bool(obj.payment_evidence)
+
+    def validate(self, attrs):
+        if self.instance and self.instance.status != SettlementBatch.Status.DRAFT:
+            raise serializers.ValidationError("Only draft settlement batches can be edited.")
+        return attrs
+
 
 class BankTransferFundingRequestSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+    proof_available = serializers.SerializerMethodField()
 
     class Meta:
         model = BankTransferFundingRequest
-        fields = "__all__"
+        exclude = ("proof",)
         read_only_fields = (
-            "request_reference", "status", "received_amount", "currency", "proof", "proof_submitted_at",
+            "request_reference", "status", "received_amount", "currency", "proof_submitted_at",
             "bank_transaction_reference", "value_date", "requester", "verified_by",
             "verified_at", "approved_by", "approved_at", "ledger_entry",
             "rejection_reason", "created_at", "updated_at",
             "billing_snapshot", "customer_snapshot", "receipt_reference",
         )
+
+    def get_proof_available(self, obj):
+        return bool(obj.proof)
 
     def validate_requested_amount(self, value):
         if value <= 0:
@@ -337,14 +361,18 @@ class FinanceActionRequestSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source="wallet.organization.name", read_only=True)
     requested_by_username = serializers.CharField(source="requested_by.username", read_only=True)
     decided_by_username = serializers.CharField(source="decided_by.username", read_only=True)
+    evidence_available = serializers.SerializerMethodField()
 
     class Meta:
         model = FinanceActionRequest
-        fields = "__all__"
+        exclude = ("evidence",)
         read_only_fields = (
             "currency", "status", "requested_by", "decided_by", "decided_at",
             "decision_reason", "posted_entry", "created_at", "updated_at",
         )
+
+    def get_evidence_available(self, obj):
+        return bool(obj.evidence)
 
 
 class FinanceControlAuditSerializer(serializers.ModelSerializer):
@@ -354,3 +382,59 @@ class FinanceControlAuditSerializer(serializers.ModelSerializer):
         model = FinanceControlAudit
         fields = "__all__"
         read_only_fields = tuple(field.name for field in FinanceControlAudit._meta.fields)
+
+
+class ServicePartnerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Organization
+        fields = (
+            "id", "clinic_id", "name", "contact_email", "address", "phone",
+            "currency", "is_active", "created_at",
+        )
+        read_only_fields = ("created_at",)
+
+    def create(self, validated_data):
+        return Organization.objects.create(
+            organization_type="service_partner", **validated_data
+        )
+
+    def update(self, instance, validated_data):
+        if instance.organization_type != "service_partner":
+            raise serializers.ValidationError("Only service partners may be managed here.")
+        return super().update(instance, validated_data)
+
+
+class AssessmentServiceSessionSerializer(serializers.ModelSerializer):
+    participating_organization_name = serializers.CharField(
+        source="participating_organization.name", read_only=True
+    )
+    service_branch_name = serializers.CharField(source="service_branch.name", read_only=True)
+    service_partner_name = serializers.CharField(source="service_partner.name", read_only=True)
+    linked_encounter_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = AssessmentServiceSession
+        fields = "__all__"
+        read_only_fields = (
+            "session_reference", "status", "configuration_version", "created_by",
+            "activated_by", "activated_at", "completed_by", "completed_at",
+            "cancelled_by", "cancelled_at", "cancellation_reason",
+            "created_at", "updated_at", "linked_encounter_count",
+        )
+
+    def validate(self, attrs):
+        instance = self.instance
+        if instance and instance.status != AssessmentServiceSession.Status.DRAFT:
+            material = set(AssessmentServiceSession.IMMUTABLE_TERMS) & set(attrs)
+            if material:
+                raise serializers.ValidationError("Material session terms are frozen after activation.")
+        return attrs
+
+    def create(self, validated_data):
+        session = AssessmentServiceSession(
+            created_by=self.context["request"].user,
+            status=AssessmentServiceSession.Status.DRAFT,
+            **validated_data,
+        )
+        session.save()
+        return session
