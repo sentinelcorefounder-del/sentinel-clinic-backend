@@ -12,6 +12,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.platypus import (
     Image,
+    KeepTogether,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -29,6 +30,13 @@ LIGHT_BLUE = colors.HexColor("#EEF4FB")
 LIGHT_GREY = colors.HexColor("#F4F6F8")
 BORDER = colors.HexColor("#CAD2DC")
 TEXT = colors.HexColor("#172033")
+
+ROUTINE_EYE_EXAMINATION_DISCLAIMER = (
+    "This retinal assessment does not replace a routine comprehensive eye examination. "
+    "It may not identify every eye condition. Please continue to attend regular eye "
+    "examinations and seek appropriate eye-care advice if you experience symptoms or "
+    "changes in your vision."
+)
 
 
 def normalise_report_format(value: str | None) -> str:
@@ -223,6 +231,28 @@ class ReportPDFRenderer:
                 alignment=TA_CENTER,
             )
         )
+
+    def _important_information(self):
+        box = Table(
+            [[[
+                Paragraph("Important information", self.styles["SectionHeading"]),
+                Paragraph(ROUTINE_EYE_EXAMINATION_DISCLAIMER, self.styles["Body"]),
+            ]]],
+            colWidths=[172 * mm],
+        )
+        box.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
+                    ("BOX", (0, 0), (-1, -1), 0.7, PRIMARY),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 9),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                    ("TOPPADDING", (0, 0), (-1, -1), 7),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+                ]
+            )
+        )
+        return [Spacer(1, 10), KeepTogether([box])]
 
     def build(self) -> bytes:
         buffer = BytesIO()
@@ -527,6 +557,12 @@ class ReportPDFRenderer:
         )
         return table
 
+    def _signature_section(self):
+        return KeepTogether([
+            self._section_title("Clinical sign-off"),
+            self._signature_block(),
+        ])
+
     def _organisation_footer(self):
         organization = self.branding.primary_organization
         note = _display(getattr(organization, "report_footer_note", None), "")
@@ -568,9 +604,9 @@ class ReportPDFRenderer:
             self._section_title("Clinical notes"),
             Paragraph(_display(self.report.notes), self.styles["Body"]),
             Spacer(1, 10),
-            self._section_title("Clinical sign-off"),
-            self._signature_block(),
+            self._signature_section(),
         ]
+        story += self._important_information()
         story += self._organisation_footer()
         return story
 
@@ -616,9 +652,9 @@ class ReportPDFRenderer:
                 self.styles["Body"],
             ),
             Spacer(1, 10),
-            self._section_title("Clinical sign-off"),
-            self._signature_block(),
+            self._signature_section(),
         ]
+        story += self._important_information()
         story += self._organisation_footer()
         return story
 
@@ -669,9 +705,9 @@ class ReportPDFRenderer:
             self._section_title("Recommended action"),
             Paragraph(_display(self.report.recommendation), self.styles["Body"]),
             Spacer(1, 10),
-            self._section_title("Clinical sign-off"),
-            self._signature_block(),
+            self._signature_section(),
         ]
+        story += self._important_information()
         story += self._organisation_footer()
         return story
 
@@ -765,9 +801,9 @@ class ReportPDFRenderer:
         )
         story += [
             Spacer(1, 9),
-            self._section_title("Clinical sign-off"),
-            self._signature_block(),
+            self._signature_section(),
         ]
+        story += self._important_information()
         return story
 
     def _image_page(self):
