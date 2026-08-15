@@ -73,6 +73,27 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL")
 
+BULK_STAGING_R2_ACCOUNT_ID = os.environ.get("BULK_STAGING_R2_ACCOUNT_ID")
+BULK_STAGING_R2_ACCESS_KEY_ID = os.environ.get("BULK_STAGING_R2_ACCESS_KEY_ID")
+BULK_STAGING_R2_SECRET_ACCESS_KEY = os.environ.get("BULK_STAGING_R2_SECRET_ACCESS_KEY")
+BULK_STAGING_R2_BUCKET_NAME = os.environ.get("BULK_STAGING_R2_BUCKET_NAME")
+BULK_STAGING_USE_PRIVATE_OBJECT_STORAGE = True
+BULK_STAGING_REQUIRED_SETTINGS = (
+    "BULK_STAGING_R2_ACCOUNT_ID",
+    "BULK_STAGING_R2_ACCESS_KEY_ID",
+    "BULK_STAGING_R2_SECRET_ACCESS_KEY",
+    "BULK_STAGING_R2_BUCKET_NAME",
+)
+CLINICAL_ASSETS_R2_ACCOUNT_ID = os.environ.get("CLINICAL_ASSETS_R2_ACCOUNT_ID")
+CLINICAL_ASSETS_R2_ACCESS_KEY_ID = os.environ.get("CLINICAL_ASSETS_R2_ACCESS_KEY_ID")
+CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY = os.environ.get("CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY")
+CLINICAL_ASSETS_R2_BUCKET_NAME = os.environ.get("CLINICAL_ASSETS_R2_BUCKET_NAME")
+CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE = True
+CLINICAL_ASSETS_REQUIRED_SETTINGS = (
+    "CLINICAL_ASSETS_R2_ACCOUNT_ID", "CLINICAL_ASSETS_R2_ACCESS_KEY_ID",
+    "CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY", "CLINICAL_ASSETS_R2_BUCKET_NAME",
+)
+
 STORAGES = {
     "default": {
         "BACKEND": "storages.backends.s3.S3Storage",
@@ -89,5 +110,32 @@ STORAGES = {
     },
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+    "bulk_staging": {
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "access_key": BULK_STAGING_R2_ACCESS_KEY_ID,
+            "secret_key": BULK_STAGING_R2_SECRET_ACCESS_KEY,
+            "bucket_name": BULK_STAGING_R2_BUCKET_NAME,
+            "endpoint_url": (
+                f"https://{BULK_STAGING_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            ),
+            "region_name": "auto",
+            "default_acl": "private",
+            "querystring_auth": True,
+            "custom_domain": None,
+            "file_overwrite": False,
+        },
+    },
+    "private_clinical_assets": {
+        "BACKEND": "storages.backends.s3.S3Storage",
+        "OPTIONS": {
+            "access_key": CLINICAL_ASSETS_R2_ACCESS_KEY_ID,
+            "secret_key": CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY,
+            "bucket_name": CLINICAL_ASSETS_R2_BUCKET_NAME,
+            "endpoint_url": f"https://{CLINICAL_ASSETS_R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            "region_name": "auto", "default_acl": "private",
+            "querystring_auth": True, "custom_domain": None, "file_overwrite": False,
+        },
     },
 }

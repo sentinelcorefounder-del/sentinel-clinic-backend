@@ -4,10 +4,13 @@ from django.conf import settings
 from django.core.validators import FileExtensionValidator
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
+from organizations.models import Organization, OrganizationBranch
 import uuid
 
 
 class ImageUpload(models.Model):
+    STORAGE_KIND_CHOICES = [("public_media", "Public media"), ("private_clinical", "Private clinical")]
+    DATASET_ELIGIBILITY_CHOICES = [("legacy_policy", "Legacy consent policy"), ("excluded", "Excluded"), ("approved", "Approved")]
     LATERALITY_CHOICES = [
         ("left", "Left"),
         ("right", "Right"),
@@ -40,6 +43,19 @@ class ImageUpload(models.Model):
     eye_laterality = models.CharField(max_length=10, choices=LATERALITY_CHOICES)
     image_type = models.CharField(max_length=20, choices=IMAGE_TYPE_CHOICES, default="fundus")
     image_file = models.ImageField(upload_to="encounter_uploads/")
+    storage_kind = models.CharField(max_length=24, choices=STORAGE_KIND_CHOICES, default="public_media")
+    private_object_key = models.CharField(max_length=255, blank=True, default="")
+    content_sha256 = models.CharField(max_length=64, blank=True, default="")
+    source_format = models.CharField(max_length=10, blank=True, default="")
+    pixel_width = models.PositiveIntegerField(null=True, blank=True)
+    pixel_height = models.PositiveIntegerField(null=True, blank=True)
+    import_source = models.CharField(max_length=30, blank=True, default="")
+    asset_organization = models.ForeignKey(Organization, null=True, blank=True, on_delete=models.PROTECT, related_name="clinical_image_assets")
+    asset_branch = models.ForeignKey(OrganizationBranch, null=True, blank=True, on_delete=models.PROTECT, related_name="clinical_image_assets")
+    assessment_date = models.DateField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="confirmed_clinical_image_assets")
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    dataset_eligibility = models.CharField(max_length=20, choices=DATASET_ELIGIBILITY_CHOICES, default="legacy_policy")
     image_quality = models.CharField(max_length=20, choices=IMAGE_QUALITY_CHOICES, default="good")
     gradable = models.BooleanField(default=True)
     retake_required = models.BooleanField(default=False)
@@ -47,6 +63,10 @@ class ImageUpload(models.Model):
 
     class Meta:
         ordering = ["-uploaded_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["asset_organization", "content_sha256"], condition=models.Q(storage_kind="private_clinical"), name="private_image_unique_org_checksum"),
+            models.CheckConstraint(condition=models.Q(storage_kind="public_media") | (models.Q(private_object_key__gt="") & models.Q(content_sha256__gt="") & models.Q(asset_organization__isnull=False) & models.Q(asset_branch__isnull=False)), name="private_image_requires_metadata"),
+        ]
 
     def __str__(self):
         return f"{self.image_upload_id} - {self.encounter.encounter_id}"
@@ -153,6 +173,171 @@ class PendingMobileImage(models.Model):
 
     def __str__(self):
         return f"{self.original_filename} - {self.session.session_id}"
+
+
+class BulkImageImport(models.Model):
+    STATUS_CHOICES = [
+        ("processing", "Processing"),
+        ("preview", "Ready for review"),
+        ("confirming", "Confirmation in progress"),
+        ("confirmed", "Confirmed"),
+        ("cancelled", "Cancelled"),
+        ("failed", "Failed"),
+        ("expired", "Expired"),
+    ]
+
+    import_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.PROTECT, related_name="bulk_image_imports"
+    )
+    branch = models.ForeignKey(
+        OrganizationBranch, on_delete=models.PROTECT, related_name="bulk_image_imports"
+    )
+    service_session = models.ForeignKey(
+        "encounters.AssessmentServiceSession",
+        on_delete=models.PROTECT,
+        related_name="bulk_image_imports",
+    )
+    archive_checksum_sha256 = models.CharField(max_length=64)
+    idempotency_key = models.CharField(max_length=80)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="processing")
+    image_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    safe_error_code = models.CharField(max_length=80, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_bulk_image_imports"
+    )
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="confirmed_bulk_image_imports",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField()
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    cleanup_pending = models.BooleanField(default=False)
+    confirmation_token = models.UUIDField(null=True, blank=True, editable=False)
+    confirmation_started_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "idempotency_key"],
+                name="bulk_import_unique_org_idempotency",
+            ),
+            models.UniqueConstraint(
+                fields=["organization", "service_session", "archive_checksum_sha256"],
+                condition=models.Q(status__in=["processing", "preview", "confirmed"]),
+                name="bulk_import_unique_session_archive",
+            ),
+        ]
+
+
+class BulkImageImportGroup(models.Model):
+    STATUS_CHOICES = [
+        ("unresolved", "Unresolved"),
+        ("proposed", "Encounter proposed"),
+        ("resolved", "Resolved"),
+        ("invalid", "Invalid"),
+    ]
+
+    group_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    bulk_import = models.ForeignKey(
+        BulkImageImport, on_delete=models.CASCADE, related_name="groups"
+    )
+    source_index = models.PositiveIntegerField()
+    mrn = models.CharField(max_length=120, blank=True, default="")
+    assessment_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="unresolved")
+    proposed_encounter = models.ForeignKey(
+        ScreeningEncounter, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="proposed_bulk_image_groups",
+    )
+    resolved_encounter = models.ForeignKey(
+        ScreeningEncounter, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="resolved_bulk_image_groups",
+    )
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="resolved_bulk_image_groups",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    safe_issue_code = models.CharField(max_length=80, blank=True, default="")
+
+    class Meta:
+        ordering = ["source_index"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bulk_import", "source_index"], name="bulk_import_unique_group_index"
+            )
+        ]
+
+
+class BulkImageImportItem(models.Model):
+    DECISION_CHOICES = [
+        ("unresolved", "Unresolved"),
+        ("left", "Left"),
+        ("right", "Right"),
+        ("rejected", "Rejected"),
+        ("invalid", "Invalid"),
+        ("skipped", "Skipped non-image"),
+    ]
+
+    item_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    group = models.ForeignKey(
+        BulkImageImportGroup, on_delete=models.CASCADE, related_name="items"
+    )
+    source_index = models.PositiveIntegerField()
+    staged_object_key = models.CharField(max_length=255, blank=True, default="")
+    permanent_object_key = models.CharField(max_length=255, blank=True, default="")
+    permanent_copy_status = models.CharField(max_length=20, default="none")
+    permanent_cleanup_pending = models.BooleanField(default=False)
+    checksum_sha256 = models.CharField(max_length=64, blank=True, default="")
+    detected_format = models.CharField(max_length=10, blank=True, default="")
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    decision = models.CharField(max_length=20, choices=DECISION_CHOICES, default="unresolved")
+    safe_issue_code = models.CharField(max_length=80, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["group__source_index", "source_index"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["group", "source_index"], name="bulk_import_unique_item_index"
+            ),
+            models.UniqueConstraint(
+                fields=["group", "checksum_sha256"],
+                condition=~models.Q(checksum_sha256=""),
+                name="bulk_import_unique_group_checksum",
+            ),
+        ]
+
+
+class BulkImageAttachment(models.Model):
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, related_name="bulk_image_attachments")
+    item = models.OneToOneField(
+        BulkImageImportItem, on_delete=models.PROTECT, related_name="attachment"
+    )
+    image_upload = models.OneToOneField(
+        ImageUpload, on_delete=models.PROTECT, related_name="bulk_import_attachment"
+    )
+    encounter = models.ForeignKey(
+        ScreeningEncounter, on_delete=models.PROTECT, related_name="bulk_image_attachments"
+    )
+    eye_laterality = models.CharField(max_length=10, choices=ImageUpload.LATERALITY_CHOICES)
+    checksum_sha256 = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["organization", "checksum_sha256"], name="bulk_attachment_unique_org_checksum"),
+            models.UniqueConstraint(
+                fields=["encounter", "eye_laterality"],
+                name="bulk_attachment_unique_encounter_eye",
+            )
+        ]
 
 
 class AIAnalysis(models.Model):

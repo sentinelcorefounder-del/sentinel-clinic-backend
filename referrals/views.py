@@ -193,7 +193,11 @@ class HospitalIssuedReportDetailView(APIView):
                     "image_upload_id": upload.image_upload_id,
                     "eye_laterality": upload.eye_laterality,
                     "image_quality": upload.image_quality,
-                    "url": request.build_absolute_uri(image_file.url) if image_file else "",
+                    "url": (
+                        request.build_absolute_uri(f"/api/uploads/{upload.pk}/content/")
+                        if upload.storage_kind == "private_clinical"
+                        else request.build_absolute_uri(image_file.url) if image_file else ""
+                    ),
                 }
             )
 
@@ -458,9 +462,9 @@ class HospitalPatientDetailView(APIView):
                             "image_quality": upload.image_quality,
                             "uploaded_at": upload.uploaded_at,
                             "image_file": (
-                                request.build_absolute_uri(image_file.url)
-                                if image_file
-                                else ""
+                                request.build_absolute_uri(f"/api/uploads/{upload.pk}/content/")
+                                if upload.storage_kind == "private_clinical"
+                                else request.build_absolute_uri(image_file.url) if image_file else ""
                             ),
                             "ai_analysis": (
                                 {

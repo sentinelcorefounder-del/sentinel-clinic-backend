@@ -144,7 +144,11 @@ def build_ocular_report_pdf(assessment):
             story.extend([PageBreak(), Paragraph("Selected Clinical Investigations", styles["Title"])])
         captions = assessment.attachment_captions or {}
         for kind, item in items:
-            file_obj = item.image_file if kind == "fundus" else item.file
+            if kind == "fundus":
+                from uploads.clinical_assets import open_image_upload
+                file_obj = open_image_upload(item)
+            else:
+                file_obj = item.file
             if kind == "fundus":
                 title = f"Fundus photograph — {item.get_eye_laterality_display()}"
                 caption_key = f"fundus:{item.id}"

@@ -24,7 +24,7 @@ INSTALLED_APPS = [
     "referrals",
     "appointments",
     "encounters",
-    "uploads",
+    "uploads.apps.UploadsConfig",
     "reports",
     "consents",
     "dashboard",
@@ -83,6 +83,21 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+BULK_STAGING_ROOT = BASE_DIR / ".bulk_staging"
+BULK_STAGING_USE_PRIVATE_OBJECT_STORAGE = False
+PRIVATE_CLINICAL_ASSETS_ROOT = BASE_DIR / ".clinical_assets"
+CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE = False
+
+# Conservative, configurable limits for synchronous Remidio archive inspection.
+BULK_IMPORT_MAX_COMPRESSED_BYTES = 50 * 1024 * 1024
+BULK_IMPORT_MAX_IMAGES = 100
+BULK_IMPORT_MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
+BULK_IMPORT_MAX_IMAGE_BYTES = 15 * 1024 * 1024
+BULK_IMPORT_MAX_COMPRESSION_RATIO = 20
+BULK_IMPORT_MAX_IMAGE_PIXELS = 60_000_000
+BULK_IMPORT_MAX_IMAGE_WIDTH = 12_000
+BULK_IMPORT_MAX_IMAGE_HEIGHT = 12_000
+BULK_IMPORT_EXPIRY_HOURS = 24
 
 # -------------------------------
 # COOKIES / CROSS-SUBDOMAIN AUTH

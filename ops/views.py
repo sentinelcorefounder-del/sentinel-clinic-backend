@@ -1715,7 +1715,7 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
         report_status = (request.query_params.get("report_status") or "").strip()
         payment_status = (request.query_params.get("payment_status") or "").strip()
 
-        patients = Patient.objects.select_related("assigned_clinic").all().order_by("-created_at")
+        patients = Patient.objects.select_related("assigned_clinic", "master_patient").all().order_by("-created_at")
 
         if search:
             patients = patients.filter(
@@ -1730,6 +1730,10 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                 | models.Q(hospital_referrals__source_hospital__clinic_id__icontains=search)
                 | models.Q(assigned_clinic__name__icontains=search)
                 | models.Q(assigned_clinic__clinic_id__icontains=search)
+                | models.Q(master_patient__sentinel_patient_id__icontains=search)
+                | models.Q(master_patient__organization_identities__local_identifier__icontains=search)
+                | models.Q(hospital_referrals__hospital_mrn__icontains=search)
+                | models.Q(encounters__encounter_id__icontains=search)
             )
 
         if clinic:
@@ -1799,6 +1803,7 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                     "id": p.id,
                     "record_type": "patient",
                     "patient_id": p.patient_id,
+                    "sentinel_patient_id": p.master_patient.sentinel_patient_id if p.master_patient_id else "",
                     "name": f"{p.first_name} {p.last_name}".strip(),
                     "dob": p.date_of_birth,
                     "sex": p.sex,
@@ -1938,13 +1943,22 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
         if denied:
             return denied
 
-        patient = Patient.objects.select_related("assigned_clinic").filter(pk=pk).first()
+        patient = Patient.objects.select_related("assigned_clinic", "master_patient").filter(pk=pk).first()
         if not patient:
             return Response({"detail": "Patient not found."}, status=status.HTTP_404_NOT_FOUND)
 
         referrals = HospitalReferral.objects.select_related("source_hospital", "matched_clinic", "report").filter(patient=patient)
         payments = OpsPayment.objects.select_related("referral").filter(referral__patient=patient)
         reports = StructuredReport.objects.select_related("encounter").filter(patient=patient)
+        encounters = patient.encounters.select_related("originating_organization", "service_branch").order_by("-encounter_date", "-created_at")
+        organization_identities = []
+        if patient.master_patient_id:
+            organization_identities = list(
+                patient.master_patient.organization_identities.select_related("organization").values(
+                    "identity_type", "local_identifier", "is_verified",
+                    organization_name=models.F("organization__name"),
+                )
+            )
 
         uploads = []
         if ImageUpload:
@@ -1967,7 +1981,11 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
                         "image_quality": getattr(img, "image_quality", ""),
                         "gradable": getattr(img, "gradable", ""),
                         "retake_required": getattr(img, "retake_required", False),
-                        "url": request.build_absolute_uri(image_file.url) if image_file else "",
+                        "url": (
+                            request.build_absolute_uri(f"/api/uploads/{img.pk}/content/")
+                            if getattr(img, "storage_kind", "public_media") == "private_clinical"
+                            else request.build_absolute_uri(image_file.url) if image_file else ""
+                        ),
                     }
                 )
 
@@ -1976,6 +1994,7 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
                 "patient": {
                     "id": patient.id,
                     "patient_id": patient.patient_id,
+                    "sentinel_patient_id": patient.master_patient.sentinel_patient_id if patient.master_patient_id else "",
                     "first_name": patient.first_name,
                     "last_name": patient.last_name,
                     "name": f"{patient.first_name} {patient.last_name}".strip(),
@@ -1994,6 +2013,27 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
                     "appointment_date": patient.appointment_date,
                 },
                 "referrals": OpsReferralSerializer(referrals, many=True).data,
+                "identities": {
+                    "sentinel_patient_id": patient.master_patient.sentinel_patient_id if patient.master_patient_id else "",
+                    "organization_identities": organization_identities,
+                    "referrals": [
+                        {
+                            "referral_id": row.referral_id,
+                            "hospital_mrn": row.hospital_mrn,
+                            "issuing_organization": row.source_hospital.name if row.source_hospital else "",
+                        }
+                        for row in referrals
+                    ],
+                    "encounters": [
+                        {
+                            "encounter_id": row.encounter_id,
+                            "encounter_date": row.encounter_date,
+                            "organization": row.originating_organization.name if row.originating_organization else "",
+                            "branch": row.service_branch.name if row.service_branch else "",
+                        }
+                        for row in encounters
+                    ],
+                },
                 "payments": OpsPaymentSerializer(payments, many=True).data,
                 "reports": OpsReportSerializer(reports, many=True, context={"request": request}).data,
                 "uploads": uploads,

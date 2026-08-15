@@ -175,7 +175,12 @@ def run_ocular_ai_review(
             })
 
     for item in fundus_images:
-        _mime_type, data_url = _safe_image_data_url(item.image_file)
+        from uploads.clinical_assets import open_image_upload
+        file_obj = open_image_upload(item)
+        try:
+            _mime_type, data_url = _safe_image_data_url(file_obj)
+        finally:
+            file_obj.close()
         content.append({
             "type": "input_image",
             "image_url": data_url,

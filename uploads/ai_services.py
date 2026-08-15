@@ -11,6 +11,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from .models import AIAnalysis, ImageUpload
+from .clinical_assets import image_upload_name, open_image_upload
 
 GLOBAL_AI_DISCLAIMER = (
     "Sentinel AI evaluates retinal images only for diabetic retinopathy referral risk. "
@@ -54,10 +55,10 @@ def call_sentinel_ai(image_upload: ImageUpload):
         f"{settings.SENTINEL_AI_ANALYZE_PATH}"
     )
 
-    with image_upload.image_file.open("rb") as image_file:
+    with open_image_upload(image_upload, "rb") as image_file:
         files = {
             "image": (
-                os.path.basename(image_upload.image_file.name),
+                os.path.basename(image_upload_name(image_upload)),
                 image_file,
                 "application/octet-stream",
             )
@@ -139,12 +140,12 @@ def should_use_openai_as_primary(sentinel_normalized):
 
 
 def image_file_to_data_url(image_upload: ImageUpload):
-    mime_type, _ = mimetypes.guess_type(image_upload.image_file.name)
+    mime_type, _ = mimetypes.guess_type(image_upload_name(image_upload))
 
     if not mime_type:
         mime_type = "image/jpeg"
 
-    with image_upload.image_file.open("rb") as image_file:
+    with open_image_upload(image_upload, "rb") as image_file:
         encoded = base64.b64encode(image_file.read()).decode("utf-8")
 
     return f"data:{mime_type};base64,{encoded}"

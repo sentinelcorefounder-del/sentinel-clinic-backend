@@ -484,7 +484,11 @@ class DatasetTrainingExportView(APIView):
             writer.writerow([
                 label.label_id,
                 label.image_upload.image_upload_id,
-                label.image_upload.image_file.url if label.image_upload.image_file else "",
+                (
+                    request.build_absolute_uri(f"/api/uploads/{label.image_upload_id}/content/")
+                    if label.image_upload.storage_kind == "private_clinical"
+                    else label.image_upload.image_file.url if label.image_upload.image_file else ""
+                ),
                 label.encounter.encounter_id,
                 label.patient.patient_id,
                 clinic.name if clinic else "",

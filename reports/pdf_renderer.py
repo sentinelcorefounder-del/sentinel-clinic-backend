@@ -835,7 +835,11 @@ class ReportPDFRenderer:
 
         captions = self.report.attachment_captions or {}
         for index, (kind, item) in enumerate(selected_items):
-            file_obj = getattr(item, "image_file", None) if kind == "fundus" else getattr(item, "file", None)
+            if kind == "fundus":
+                from uploads.clinical_assets import open_image_upload
+                file_obj = open_image_upload(item)
+            else:
+                file_obj = getattr(item, "file", None)
             image_flowable = None
             filename = (getattr(file_obj, "name", "") or "").lower()
             if file_obj and not filename.endswith(".pdf"):

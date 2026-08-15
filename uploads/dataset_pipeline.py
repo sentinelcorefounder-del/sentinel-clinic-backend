@@ -238,6 +238,9 @@ def sync_dataset_from_report(report):
         return
 
     for image_upload in uploads:
+        if image_upload.dataset_eligibility == "excluded":
+            DatasetLabel.objects.filter(image_upload=image_upload).delete()
+            continue
         ai = getattr(image_upload, "ai_analysis", None)
         eye_values = get_eye_report_values(report, image_upload.eye_laterality)
 
