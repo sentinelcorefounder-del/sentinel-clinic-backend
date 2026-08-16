@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     "payments",
     "ops",
     "finance.apps.FinanceConfig",
+    "onward_referrals.apps.OnwardReferralsConfig",
 ]
 
 MIDDLEWARE = [

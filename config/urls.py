@@ -30,6 +30,7 @@ urlpatterns = [
     path("api/ops/", include("ops.urls")),
     path("api/audit/", include("audit.urls")),
     path("api/finance/", include("finance.urls")),
+    path("api/onward-referrals/", include("onward_referrals.urls")),
     re_path(r"^media/finance/(?P<path>.*)$", deny_public_finance_media),
     re_path(r"^media/(?P<path>.*)$", serve, {"document_root": settings.MEDIA_ROOT}),
 ]
