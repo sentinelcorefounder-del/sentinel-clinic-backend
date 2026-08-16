@@ -2,6 +2,7 @@ from io import BytesIO
 import os
 
 from django.http import Http404, HttpResponse
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -16,7 +17,19 @@ from rest_framework.views import APIView
 from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
-from .models import StructuredReport, ReportStatusEvent
+from .models import ReportClinicalResponsibility, StructuredReport, ReportStatusEvent
+from .clinical_integrity import (
+    CLINICAL_FIELDS,
+    accept_responsibility,
+    assert_expected,
+    bind_issued_pdf,
+    create_version_if_changed,
+    delete_bound_pdf,
+    event_once,
+    expected_version,
+    latest_version,
+    require_responsible_clinician,
+)
 from .clinical_wording import apply_generated_wording
 from .recall_services import apply_recall_schedule
 from .permissions import (
@@ -33,6 +46,26 @@ from .release_control import is_report_released_to_hospital
 
 
 class StructuredReportRulesMixin:
+    @staticmethod
+    def _clinical_metadata(data):
+        return {
+            "clinician_name": data.get("clinician_name"),
+            "professional_role": data.get("professional_role"),
+            "registration_number": data.get("registration_number"),
+            "reason": data.get("takeover_reason", ""),
+        }
+
+    @staticmethod
+    def _serializer_data(data):
+        cleaned = data.copy()
+        for key in (
+            "expected_version", "clinician_name", "professional_role",
+            "registration_number", "takeover_reason", "correction_note",
+            "resubmission_note", "idempotency_key", "submitted_version",
+        ):
+            cleaned.pop(key, None)
+        return cleaned
+
     def _has_any_uploaded_image(self, encounter) -> bool:
         return ImageUpload.objects.filter(encounter=encounter).exists()
 
@@ -54,11 +87,15 @@ class StructuredReportRulesMixin:
         has_uploaded_image = self._has_any_uploaded_image(encounter)
 
         report_marked_ungradable = bool(
-            serializer.validated_data.get("ungradable", False)
+            serializer.validated_data.get(
+                "ungradable", getattr(serializer.instance, "ungradable", False)
+            )
         )
 
         urgency_outcome = (
-            serializer.validated_data.get("urgency_outcome") or ""
+            serializer.validated_data.get(
+                "urgency_outcome", getattr(serializer.instance, "urgency_outcome", "")
+            ) or ""
         ).strip().lower()
 
         report_marked_retake = urgency_outcome == "image_retake"
@@ -95,17 +132,9 @@ class StructuredReportRulesMixin:
             data["right_corrected_va"] = getattr(encounter, "right_corrected_pinhole_va", "")
 
     def _validate_report_editable(self, report, user):
-        if user.is_superuser:
-            return
-
-        user_groups = set(user.groups.values_list("name", flat=True))
-        if "ops_admin" in user_groups:
-            return
-
         editable_statuses = {
             "draft",
             "under_review",
-            "signed_off",
             "returned_to_clinic",
             "ops_rejected",
         }
@@ -190,7 +219,9 @@ class StructuredReportListCreateView(
 
         return queryset.filter(patient__assigned_clinic=org)
 
-    def perform_create(self, serializer):
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=self._serializer_data(request.data))
+        serializer.is_valid(raise_exception=True)
         user = self.request.user
         patient = serializer.validated_data.get("patient")
         encounter = serializer.validated_data.get("encounter")
@@ -204,56 +235,57 @@ class StructuredReportListCreateView(
         self._validate_report_prerequisites(serializer, patient, encounter)
         self._apply_encounter_va_defaults(serializer, encounter)
 
-        if StructuredReport.objects.filter(encounter=encounter).exists():
-            raise PermissionDenied(
-                "A structured report already exists for this encounter. Open and edit the existing report."
+        existing = StructuredReport.objects.filter(encounter=encounter).first()
+        if existing:
+            return Response(
+                {
+                    "detail": "A structured report already exists for this encounter. Edit the existing report.",
+                    "existing_report": {"id": existing.pk, "report_id": existing.report_id},
+                },
+                status=status.HTTP_409_CONFLICT,
             )
-
-        if not user.is_superuser:
-            user_groups = set(user.groups.values_list("name", flat=True))
-            if "ops_admin" not in user_groups:
-                org = get_user_organization(user)
-                if not org:
-                    raise PermissionDenied("You are not linked to a clinic organization.")
-
-                if patient.assigned_clinic_id != org.id:
-                    raise PermissionDenied(
-                        "You cannot create reports for another clinic's patient."
-                    )
-
-        report = serializer.save(
-            report_owner=(
-                "clinic"
-                if getattr(encounter, "workflow_route", "") == "clinic_managed"
-                else "sentinel"
-            )
-        )
-        apply_generated_wording(report)
-        apply_recall_schedule(report)
-        report.save(
-            update_fields=[
-                "generated_clinical_summary",
-                "final_clinical_summary",
-                "recall_due_date",
-                "recall_status",
-                "updated_at",
-            ]
-        )
-
-        ReportStatusEvent.objects.get_or_create(
-            report=report,
-            event_type="created",
-            defaults={
-                "from_status": "",
-                "to_status": report.report_status,
-                "note": "Structured report created by clinic.",
-                "actor": user,
-            },
-        )
+        try:
+            with transaction.atomic():
+                report = serializer.save(
+                    report_owner=("clinic" if encounter.workflow_route == "clinic_managed" else "sentinel")
+                )
+                responsibility, authority, _ = accept_responsibility(
+                    user=user, report=report, **self._clinical_metadata(request.data)
+                )
+                apply_generated_wording(report)
+                apply_recall_schedule(report)
+                report.save(update_fields=[
+                    "generated_clinical_summary", "final_clinical_summary",
+                    "recall_due_date", "recall_status", "updated_at",
+                ])
+                version, _ = create_version_if_changed(
+                    report=report, editor=user, responsibility=responsibility, purpose="initial"
+                )
+                report.lock_version = 1
+                report.save(update_fields=["lock_version", "updated_at"])
+                event_once(
+                    report=report, event_type="created", actor=user,
+                    from_status="", to_status=report.report_status,
+                    target_version=version, authority_used=authority,
+                    note="Structured report created by clinic.",
+                    idempotency_key=f"created:{report.pk}",
+                )
+        except IntegrityError:
+            existing = StructuredReport.objects.filter(encounter=encounter).first()
+            if existing:
+                return Response(
+                    {
+                        "detail": "A structured report already exists for this encounter. Edit the existing report.",
+                        "existing_report": {"id": existing.pk, "report_id": existing.report_id},
+                    }, status=status.HTTP_409_CONFLICT,
+                )
+            raise
+        output = self.get_serializer(report)
+        return Response(output.data, status=status.HTTP_201_CREATED)
 
 
 class StructuredReportDetailView(
-    StructuredReportRulesMixin, generics.RetrieveUpdateDestroyAPIView
+    StructuredReportRulesMixin, generics.RetrieveUpdateAPIView
 ):
     serializer_class = StructuredReportSerializer
     permission_classes = [CanManageReports]
@@ -282,70 +314,65 @@ class StructuredReportDetailView(
 
         return queryset.filter(patient__assigned_clinic=org)
 
-    def perform_update(self, serializer):
-        user = self.request.user
-        self._validate_report_editable(serializer.instance, user)
-
-        patient = serializer.validated_data.get("patient", serializer.instance.patient)
-        encounter = serializer.validated_data.get(
-            "encounter", serializer.instance.encounter
-        )
-
-        self._validate_report_prerequisites(serializer, patient, encounter)
-        self._apply_encounter_va_defaults(serializer, encounter)
-
-        if user.is_superuser:
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        with transaction.atomic():
+            report = self.get_queryset().select_for_update().get(pk=kwargs["pk"])
+            assert_expected(report, expected_version(request.data))
+            self._validate_report_editable(report, request.user)
+            serializer = self.get_serializer(
+                report, data=self._serializer_data(request.data), partial=partial
+            )
+            serializer.is_valid(raise_exception=True)
+            self._validate_report_prerequisites(serializer, report.patient, report.encounter)
+            self._apply_encounter_va_defaults(serializer, report.encounter)
+            responsibility = ReportClinicalResponsibility.objects.filter(report=report).first()
+            responsibility_changed = False
+            if responsibility and responsibility.current_clinician_id == request.user.pk:
+                responsibility, authority = require_responsible_clinician(request.user, report)
+            else:
+                had_responsibility = responsibility is not None
+                responsibility, authority, responsibility_changed = accept_responsibility(
+                    user=request.user, report=report, **self._clinical_metadata(request.data)
+                )
+                if responsibility_changed:
+                    event_once(
+                        report=report,
+                        event_type="responsibility_taken_over" if had_responsibility else "responsibility_accepted",
+                        actor=request.user,
+                        from_status=report.report_status, to_status=report.report_status,
+                        source_version=latest_version(report), authority_used=authority,
+                        note=("Clinical responsibility taken over; reason recorded."
+                              if had_responsibility else "Clinical responsibility explicitly accepted."),
+                        correction_note=responsibility.takeover_reason,
+                        idempotency_key=f"takeover:{report.lock_version}:{request.user.pk}",
+                    )
+            meaningful_change = any(
+                field in serializer.validated_data
+                and getattr(report, field) != serializer.validated_data[field]
+                for field in CLINICAL_FIELDS
+            )
+            if not meaningful_change:
+                if responsibility_changed:
+                    report.lock_version += 1
+                    report.save(update_fields=["lock_version", "updated_at"])
+                return Response(self.get_serializer(report).data)
             report = serializer.save()
             apply_generated_wording(report)
             apply_recall_schedule(report)
-            report.save(
-                update_fields=[
-                    "generated_clinical_summary",
-                    "final_clinical_summary",
-                    "recall_due_date",
-                    "recall_status",
-                    "updated_at",
-                ]
+            report.save(update_fields=[
+                "generated_clinical_summary", "final_clinical_summary",
+                "recall_due_date", "recall_status", "updated_at",
+            ])
+            purpose = "returned_correction" if report.report_status in {"returned_to_clinic", "ops_rejected"} else "clinical_edit"
+            version, created = create_version_if_changed(
+                report=report, editor=request.user, responsibility=responsibility,
+                purpose=purpose, correction_note=request.data.get("correction_note", ""),
             )
-            return
-
-        user_groups = set(user.groups.values_list("name", flat=True))
-        if "ops_admin" in user_groups:
-            report = serializer.save()
-            apply_generated_wording(report)
-            apply_recall_schedule(report)
-            report.save(
-                update_fields=[
-                    "generated_clinical_summary",
-                    "final_clinical_summary",
-                    "recall_due_date",
-                    "recall_status",
-                    "updated_at",
-                ]
-            )
-            return
-
-        org = get_user_organization(user)
-        if not org:
-            raise PermissionDenied("You are not linked to a clinic organization.")
-
-        if patient.assigned_clinic_id != org.id:
-            raise PermissionDenied(
-                "You cannot update reports for another clinic's patient."
-            )
-
-        report = serializer.save()
-        apply_generated_wording(report)
-        apply_recall_schedule(report)
-        report.save(
-            update_fields=[
-                "generated_clinical_summary",
-                "final_clinical_summary",
-                "recall_due_date",
-                "recall_status",
-                "updated_at",
-            ]
-        )
+            if created:
+                report.lock_version += 1
+                report.save(update_fields=["lock_version", "updated_at"])
+        return Response(self.get_serializer(report).data)
 
 
 class ClinicReportListView(generics.ListAPIView):
@@ -451,70 +478,52 @@ class PatientReportListView(generics.ListAPIView):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, CanSubmitReportToOps])
 def submit_report_to_ops(request, pk):
-    try:
-        report = StructuredReport.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-            "encounter",
-        ).get(pk=pk)
-    except StructuredReport.DoesNotExist:
-        raise Http404("Report not found.")
-
-    user = request.user
-
-    if not user.is_superuser:
-        user_groups = set(user.groups.values_list("name", flat=True))
-        if "ops_admin" not in user_groups:
-            org = get_user_organization(user)
-            if not org or report.patient.assigned_clinic_id != org.id:
-                raise PermissionDenied("You cannot submit this report to Ops.")
-
-    if getattr(report.encounter, "workflow_route", "sentinel_managed") != "sentinel_managed":
-        return Response({"detail": "This is a Clinic Managed assessment. Use Sign and Issue Report instead of submitting to Sentinel Ops."}, status=status.HTTP_400_BAD_REQUEST)
-
-    if report.report_status not in {"draft", "under_review", "signed_off", "ops_rejected", "returned_to_clinic"}:
-        return Response(
-            {
-                "detail": f"Only draft, under_review, signed_off, ops_rejected, or returned_to_clinic reports can be submitted to Ops. Current status: {report.report_status}"
-            },
-            status=status.HTTP_400_BAD_REQUEST,
+    with transaction.atomic():
+        report = StructuredReport.objects.select_for_update().select_related(
+            "patient", "patient__assigned_clinic", "encounter",
+        ).filter(pk=pk).first()
+        if not report:
+            raise Http404("Report not found.")
+        assert_expected(report, expected_version(request.data))
+        responsibility, authority = require_responsible_clinician(request.user, report)
+        if report.encounter.workflow_route != "sentinel_managed":
+            return Response({"detail": "This is a Clinic Managed assessment. Use Sign and Issue Report instead."}, status=status.HTTP_400_BAD_REQUEST)
+        if report.report_status not in {"draft", "under_review", "ops_rejected", "returned_to_clinic"}:
+            return Response({"detail": f"This report cannot be submitted from {report.report_status}."}, status=status.HTTP_400_BAD_REQUEST)
+        previous_status = report.report_status
+        is_resubmission = previous_status in {"ops_rejected", "returned_to_clinic"}
+        resubmission_note = (request.data.get("resubmission_note") or "").strip()
+        if is_resubmission and not resubmission_note:
+            return Response({"detail": "A resubmission note is required."}, status=status.HTTP_400_BAD_REQUEST)
+        StructuredReportRulesMixin()._validate_report_can_be_submitted_to_ops(report)
+        version = latest_version(report)
+        if not version:
+            version, _ = create_version_if_changed(
+                report=report, editor=request.user, responsibility=responsibility, purpose="initial"
+            )
+        key = (request.data.get("idempotency_key") or f"submit:{report.lock_version}").strip()[:120]
+        prior = ReportStatusEvent.objects.filter(report=report, idempotency_key=key).first()
+        if prior:
+            return Response(StructuredReportSerializer(report, context={"request": request}).data)
+        report.report_status = "submitted_to_ops"
+        report.submitted_to_ops_at = timezone.now()
+        report.submitted_to_ops_by = request.user
+        report.submitted_version = version
+        if is_resubmission:
+            report.resubmission_count += 1
+        report.lock_version += 1
+        report.save(update_fields=[
+            "report_status", "submitted_to_ops_at", "submitted_to_ops_by",
+            "submitted_version", "resubmission_count", "lock_version", "updated_at",
+        ])
+        event_once(
+            report=report, event_type="resubmitted" if is_resubmission else "submitted_to_ops",
+            actor=request.user, from_status=previous_status, to_status="submitted_to_ops",
+            source_version=version, target_version=version, authority_used=authority,
+            note="Report resubmitted to Sentinel Ops." if is_resubmission else "Report submitted to Sentinel Ops.",
+            correction_note=resubmission_note, idempotency_key=key,
         )
-
-    mixin = StructuredReportRulesMixin()
-    mixin._validate_report_can_be_submitted_to_ops(report)
-
-    # Clinic submission should enter the Sentinel Ops review queue.
-    # Ops will later approve/issue or reject the report.
-    previous_status = report.report_status
-    is_resubmission = previous_status in {"ops_rejected", "returned_to_clinic"}
-
-    report.report_status = "submitted_to_ops"
-    report.submitted_to_ops_at = timezone.now()
-    report.return_reason = ""
-    if is_resubmission:
-        report.resubmission_count += 1
-    report.submitted_to_ops_by = user
-    report.save(
-        update_fields=[
-            "report_status",
-            "submitted_to_ops_at",
-            "submitted_to_ops_by",
-            "return_reason",
-            "resubmission_count",
-            "updated_at",
-        ]
-    )
-
-    ReportStatusEvent.objects.create(
-        report=report,
-        event_type="resubmitted" if is_resubmission else "submitted_to_ops",
-        from_status=previous_status,
-        to_status="submitted_to_ops",
-        note="Report resubmitted to Sentinel Ops." if is_resubmission else "Report submitted to Sentinel Ops.",
-        actor=user,
-    )
-
-    local_referral = sync_report_to_local_hospital_referral(report)
+        local_referral = sync_report_to_local_hospital_referral(report)
 
     return Response(
         {
@@ -522,6 +531,8 @@ def submit_report_to_ops(request, pk):
             "report_id": report.report_id,
             "report_pk": report.pk,
             "report_status": report.report_status,
+            "lock_version": report.lock_version,
+            "submitted_version": report.submitted_version_id,
             "submitted_to_ops_at": report.submitted_to_ops_at,
             "local_hospital_referral_id": local_referral.referral_id if local_referral else "",
         },
@@ -533,107 +544,93 @@ def submit_report_to_ops(request, pk):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, CanSubmitReportToOps])
 def clinic_issue_report(request, pk):
+    created_pdf = False
+    issued_version = None
     try:
-        report = StructuredReport.objects.select_related("patient", "patient__assigned_clinic", "encounter").get(pk=pk)
-    except StructuredReport.DoesNotExist:
-        raise Http404("Report not found.")
+        with transaction.atomic():
+            report = StructuredReport.objects.select_for_update().select_related(
+                "patient", "patient__assigned_clinic", "encounter"
+            ).filter(pk=pk).first()
+            if not report:
+                raise Http404("Report not found.")
+            assert_expected(report, expected_version(request.data))
+            responsibility, authority = require_responsible_clinician(request.user, report)
+            clinic = report.patient.assigned_clinic
+            if report.encounter.workflow_route != "clinic_managed":
+                return Response({"detail": "Only Clinic Managed assessments can be issued directly by the clinic."}, status=status.HTTP_400_BAD_REQUEST)
+            profile, _ = OrganizationProfile.objects.get_or_create(organization=clinic)
+            if not profile.can_issue_reports_directly:
+                raise PermissionDenied("This clinic is not permitted to issue reports directly.")
+            if report.report_status not in {"draft", "under_review", "returned_to_clinic", "ops_rejected"}:
+                return Response({"detail": f"Only an editable report can be issued. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+            signer_name = (request.data.get("signer_name") or responsibility.clinician_name).strip()
+            signer_role = (request.data.get("signer_role") or responsibility.professional_role).strip()
+            signer_registration_number = (request.data.get("signer_registration_number") or responsibility.registration_number).strip()
+            if not signer_name or not signer_role or not signer_registration_number:
+                return Response({"detail": "Complete clinician name, role and registration number are required."}, status=status.HTTP_400_BAD_REQUEST)
+            StructuredReportRulesMixin()._validate_report_can_be_clinic_issued(report)
+            issued_version = latest_version(report)
+            if not issued_version:
+                issued_version, _ = create_version_if_changed(
+                    report=report, editor=request.user, responsibility=responsibility, purpose="initial"
+                )
+            previous_status = report.report_status
+            now = timezone.now()
+            report.report_owner = "clinic"
+            report.signed_by = request.user
+            report.signed_at = now
+            report.signer_name = signer_name
+            report.signer_role = signer_role
+            report.signer_registration_number = signer_registration_number
+            report.issued_by = request.user
+            report.issued_at = now
+            report.sentinel_archive_received_at = now
+            report.report_status = "issued"
+            report.distribution_status = "awaiting_distribution"
+            report.issued_version = issued_version
+            report.lock_version += 1
+            apply_generated_wording(report)
+            apply_recall_schedule(report)
+            created_pdf = bind_issued_pdf(report, issued_version, request)
+            report.save(update_fields=[
+                "report_owner", "signed_by", "signed_at", "signer_name", "signer_role",
+                "signer_registration_number", "issued_by", "issued_at",
+                "sentinel_archive_received_at", "report_status", "distribution_status",
+                "issued_version", "lock_version", "generated_clinical_summary",
+                "final_clinical_summary", "recall_due_date", "recall_status", "updated_at",
+            ])
 
-    user = request.user
-    clinic = report.patient.assigned_clinic
-    if getattr(report.encounter, "workflow_route", "") != "clinic_managed":
-        return Response({"detail": "Only Clinic Managed assessments can be issued directly by the clinic."}, status=status.HTTP_400_BAD_REQUEST)
-    if not clinic:
-        raise PermissionDenied("This report is not linked to an assigned clinic.")
-    if not user.is_superuser:
-        groups=set(user.groups.values_list("name", flat=True))
-        if "ops_admin" in groups:
-            raise PermissionDenied("Sentinel Ops has read-only access to Clinic Managed reports.")
-        org=get_user_organization(user)
-        if not org or org.id != clinic.id:
-            raise PermissionDenied("You cannot sign or issue another clinic's report.")
-
-    profile,_=OrganizationProfile.objects.get_or_create(organization=clinic)
-    if not profile.can_issue_reports_directly:
-        raise PermissionDenied("This clinic is not permitted to issue reports directly.")
-    if report.report_status not in {"draft","under_review","signed_off","returned_to_clinic","ops_rejected"}:
-        return Response({"detail": f"Only an editable report can be signed and issued. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
-
-    signer_name = (
-        request.data.get("signer_name")
-        or report.signer_name
-        or ""
-    ).strip()
-
-    signer_role = (
-        request.data.get("signer_role")
-        or report.signer_role
-        or ""
-    ).strip()
-
-    signer_registration_number = (
-        request.data.get("signer_registration_number")
-        or report.signer_registration_number
-        or ""
-    ).strip()
-
-    if profile.electronic_signature_required and not signer_registration_number:
-        return Response({"detail": "Electronic signature is incomplete. Registration number is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-    StructuredReportRulesMixin()._validate_report_can_be_clinic_issued(report)
-    previous_status=report.report_status
-    now=timezone.now()
-    report.report_owner="clinic"
-    report.signed_by=user
-    report.signed_at=now
-    report.signer_name=signer_name
-    report.signer_role=signer_role
-    report.signer_registration_number=signer_registration_number
-    report.issued_by=user
-    report.issued_at=now
-    report.sentinel_archive_received_at=now
-    report.report_status="issued"
-    report.return_reason = ""
-    report.distribution_status = "awaiting_distribution"
-    apply_generated_wording(report)
-    apply_recall_schedule(report)
-    report.save(update_fields=[
-        "report_owner", "signed_by", "signed_at", "signer_name",
-        "signer_role", "signer_registration_number", "issued_by",
-        "issued_at", "sentinel_archive_received_at", "report_status",
-        "return_reason",
-        "distribution_status",
-        "generated_clinical_summary",
-        "final_clinical_summary",
-        "recall_due_date",
-        "recall_status",
-        "updated_at",
-    ])
-
-    referral = getattr(report.encounter, "hospital_referral", None)
-    if referral:
-        referral.report = report
-        referral.report_ready = False
-        referral.referral_status = "report_issued"
-        referral.save(update_fields=[
-            "report", "report_ready", "referral_status", "updated_at",
-        ])
-    else:
-        from finance.services import recognize_service_partner_earning
-        financial_record = getattr(report.encounter, "financial_record", None)
-        if financial_record:
-            recognize_service_partner_earning(financial_record, trigger_source="clinic_report_issue")
-
-    ReportStatusEvent.objects.create(
-        report=report,
-        event_type="queued_for_distribution",
-        from_status="issued",
-        to_status="issued",
-        note="Issued report queued for Sentinel distribution.",
-        actor=user,
-    )
-    ReportStatusEvent.objects.create(report=report,event_type="clinic_signed",from_status=previous_status,to_status="issued",note=f"Report electronically signed by {signer_name}.",actor=user)
-    ReportStatusEvent.objects.create(report=report,event_type="clinic_issued",from_status=previous_status,to_status="issued",note="Clinic Managed report issued directly by the clinic. Sentinel retained a read-only audit copy.",actor=user)
-    return Response({"message":"Report signed and issued successfully.","report":StructuredReportSerializer(report,context={"request":request}).data,"report_status":report.report_status,"issued_at":report.issued_at,"report_pdf_url":build_report_pdf_url(request,report)},status=status.HTTP_200_OK)
+            referral = getattr(report.encounter, "hospital_referral", None)
+            if referral:
+                referral.report = report
+                referral.report_ready = False
+                referral.referral_status = "report_issued"
+                referral.save(update_fields=[
+                    "report", "report_ready", "referral_status", "updated_at",
+                ])
+            else:
+                from finance.services import recognize_service_partner_earning
+                financial_record = getattr(report.encounter, "financial_record", None)
+                if financial_record:
+                    recognize_service_partner_earning(financial_record, trigger_source="clinic_report_issue")
+            event_once(report=report, event_type="clinic_signed", actor=request.user,
+                       from_status=previous_status, to_status="issued", source_version=issued_version,
+                       target_version=issued_version, authority_used=authority,
+                       note=f"Report electronically signed by {signer_name}.",
+                       idempotency_key=f"clinic-issue:{report.lock_version}")
+            event_once(report=report, event_type="clinic_issued", actor=request.user,
+                       from_status=previous_status, to_status="issued", source_version=issued_version,
+                       target_version=issued_version, authority_used=authority,
+                       note="Clinic Managed report issued directly by the clinic. Sentinel retained a read-only audit copy.")
+            event_once(report=report, event_type="queued_for_distribution", actor=request.user,
+                       from_status="issued", to_status="issued", source_version=issued_version,
+                       target_version=issued_version, authority_used=authority,
+                       note="Issued report queued for Sentinel distribution.")
+    except Exception:
+        if created_pdf:
+            delete_bound_pdf(issued_version)
+        raise
+    return Response({"message": "Report signed and issued successfully.", "report": StructuredReportSerializer(report, context={"request": request}).data, "report_status": report.report_status, "issued_at": report.issued_at, "report_pdf_url": build_report_pdf_url(request, report)}, status=status.HTTP_200_OK)
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, CanReviewOpsReports])
@@ -733,6 +730,15 @@ class StructuredReportPDFView(APIView):
                 "patient",
             }:
                 report_format = "hospital"
+
+        issued_version = report.issued_version
+        if report.report_status == "issued" and issued_version and issued_version.pdf_object_key:
+            from uploads.storage import get_private_clinical_storage
+            with get_private_clinical_storage().open(issued_version.pdf_object_key, "rb") as source:
+                pdf_bytes = source.read()
+            response = HttpResponse(pdf_bytes, content_type="application/pdf")
+            response["Content-Disposition"] = f'inline; filename="{report.report_id}-issued.pdf"'
+            return response
 
         pdf_bytes = ReportPDFRenderer(
             report=report,

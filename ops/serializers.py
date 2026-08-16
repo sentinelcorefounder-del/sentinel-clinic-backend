@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from referrals.models import HospitalReferral
 from reports.models import StructuredReport
+from reports.serializers import StructuredReportVersionSerializer
 from organizations.models import OrganizationProfile
 from organizations.serializers import OrganizationProfileSerializer
 from .models import OpsAuditLog, OpsNotification, OpsPayment
@@ -127,6 +128,8 @@ class OpsReferralSerializer(serializers.ModelSerializer):
 
 
 class OpsReportSerializer(serializers.ModelSerializer):
+    versions = StructuredReportVersionSerializer(many=True, read_only=True)
+    clinical_responsibility = serializers.SerializerMethodField()
     patient_name = serializers.SerializerMethodField()
     clinic_name = serializers.SerializerMethodField()
     source_hospital_name = serializers.SerializerMethodField()
@@ -169,6 +172,11 @@ class OpsReportSerializer(serializers.ModelSerializer):
             "ops_review_note",
             "return_reason",
             "resubmission_count",
+            "lock_version",
+            "submitted_version",
+            "issued_version",
+            "versions",
+            "clinical_responsibility",
             "signer_name",
             "signer_role",
             "signer_registration_number",
@@ -191,6 +199,20 @@ class OpsReportSerializer(serializers.ModelSerializer):
         if not obj.patient:
             return ""
         return f"{obj.patient.first_name} {obj.patient.last_name}".strip()
+
+    def get_clinical_responsibility(self, obj):
+        item = getattr(obj, "clinical_responsibility", None)
+        if not item:
+            return None
+        return {
+            "clinician_name": item.clinician_name,
+            "professional_role": item.professional_role,
+            "registration_number": item.registration_number,
+            "authority_used": item.authority_used,
+            "accepted_at": item.accepted_at,
+            "clinic_name": item.clinic.name,
+            "branch_name": item.branch.name,
+        }
 
     def get_clinic_name(self, obj):
         clinic = getattr(obj.patient, "assigned_clinic", None) if obj.patient else None
@@ -268,6 +290,10 @@ class OpsReportSerializer(serializers.ModelSerializer):
                 "from_status": event.from_status,
                 "to_status": event.to_status,
                 "note": event.note,
+                "source_version": event.source_version_id,
+                "target_version": event.target_version_id,
+                "authority_used": event.authority_used,
+                "correction_note": event.correction_note,
                 "actor_display": (
                     event.actor.get_full_name()
                     or event.actor.username

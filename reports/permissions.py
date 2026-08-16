@@ -1,74 +1,44 @@
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
-ALLOWED_REPORT_WRITE_ROLES = {"reviewer", "clinic_admin", "super_admin"}
-OPS_REVIEW_ROLES = {"ops_admin", "super_admin"}
+CLINICAL_REPORT_ROLES = {"optometrist", "reviewer"}
+OPS_REVIEW_ROLES = {"ops_admin", "sentinel_ops"}
 
 
-def _get_user_group_names(user):
+def _roles(user):
     if not user or not user.is_authenticated:
         return set()
     return set(user.groups.values_list("name", flat=True))
 
 
+def _is_internal(user):
+    return bool(
+        getattr(getattr(user, "security_profile", None), "is_internal_sentinel_staff", False)
+    )
+
+
 class CanManageReports(BasePermission):
-    """
-    Authenticated users can read reports.
-    Reviewer, clinic_admin, or superuser can create/update/delete reports.
-    This supports:
-    - small clinics where one user has clinic_admin and can do everything clinic-side
-    - larger clinics where reviewer/other roles can be separated
-    """
+    """Read access is queryset-scoped; writes require an exact clinical role."""
 
     def has_permission(self, request, view):
         user = request.user
-
         if not user or not user.is_authenticated:
             return False
-
         if request.method in SAFE_METHODS:
             return True
-
-        if user.is_superuser:
-            return True
-
-        user_roles = _get_user_group_names(user)
-        return bool(user_roles.intersection(ALLOWED_REPORT_WRITE_ROLES))
+        return bool(_roles(user) & CLINICAL_REPORT_ROLES)
 
 
 class CanSubmitReportToOps(BasePermission):
-    """
-    Clinic-side submission permission.
-    Small clinics can use clinic_admin for this.
-    Larger clinics can use reviewer or clinic_admin.
-    """
-
     def has_permission(self, request, view):
         user = request.user
-
-        if not user or not user.is_authenticated:
-            return False
-
-        if user.is_superuser:
-            return True
-
-        user_roles = _get_user_group_names(user)
-        return bool(user_roles.intersection({"reviewer", "clinic_admin", "super_admin"}))
+        return bool(user and user.is_authenticated and _roles(user) & CLINICAL_REPORT_ROLES)
 
 
 class CanReviewOpsReports(BasePermission):
-    """
-    Only Ops or superuser can approve/reject submitted reports.
-    """
-
     def has_permission(self, request, view):
         user = request.user
-
-        if not user or not user.is_authenticated:
-            return False
-
-        if user.is_superuser:
-            return True
-
-        user_roles = _get_user_group_names(user)
-        return bool(user_roles.intersection(OPS_REVIEW_ROLES))
+        return bool(
+            user and user.is_authenticated and _is_internal(user)
+            and _roles(user) & OPS_REVIEW_ROLES
+        )

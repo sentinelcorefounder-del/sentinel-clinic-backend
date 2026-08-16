@@ -31,6 +31,14 @@ from payments.services.paystack import initialize_transaction, verify_transactio
 from finance.services import capture_finance_for_hospital_publication
 from referrals.models import HospitalReferral
 from reports.models import StructuredReport, ReportStatusEvent
+from reports.clinical_integrity import (
+    assert_expected,
+    bind_issued_pdf,
+    delete_bound_pdf,
+    event_once,
+    expected_version,
+    ops_report_authority,
+)
 from reports.release_control import is_report_released_to_hospital
 from users.models import UserSecurityProfile
 
@@ -738,62 +746,41 @@ class OpsReportDetailView(OpsOnlyMixin, APIView):
 
 class OpsReportReturnView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
-
-        report = StructuredReport.objects.filter(pk=pk).first()
-        if not report:
-            return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        if report.report_status != "submitted_to_ops":
-            return Response(
-                {"detail": f"Only submitted_to_ops reports can be returned. Current status: {report.report_status}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        authority = ops_report_authority(request.user)
         reason = (request.data.get("reason") or request.data.get("note") or "").strip()
         if not reason:
-            return Response(
-                {"detail": "A return reason is required."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return Response({"detail": "A return reason is required."}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            report = StructuredReport.objects.select_for_update().filter(pk=pk).first()
+            if not report:
+                return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
+            assert_expected(report, expected_version(request.data))
+            submitted_version_id = request.data.get("submitted_version")
+            if str(submitted_version_id) != str(report.submitted_version_id):
+                return Response({"detail": "The submitted report version changed. Reload before review."}, status=status.HTTP_409_CONFLICT)
+            if report.report_status != "submitted_to_ops":
+                return Response({"detail": f"Only submitted_to_ops reports can be returned. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+            previous_status = report.report_status
+            report.report_status = "returned_to_clinic"
+            report.return_reason = reason
+            report.ops_review_note = reason
+            report.ops_reviewed_at = timezone.now()
+            report.ops_reviewed_by = request.user
+            report.lock_version += 1
+            report.save(update_fields=["report_status", "return_reason", "ops_review_note", "ops_reviewed_at", "ops_reviewed_by", "lock_version", "updated_at"])
+            event_once(
+                report=report, event_type="returned_to_clinic", actor=request.user,
+                from_status=previous_status, to_status="returned_to_clinic",
+                source_version=report.submitted_version, target_version=report.submitted_version,
+                authority_used=authority, note=reason,
+                idempotency_key=(request.data.get("idempotency_key") or f"return:{report.lock_version}")[:120],
             )
-
-        previous_status = report.report_status
-        report.report_status = "returned_to_clinic"
-        report.return_reason = reason
-        report.ops_review_note = reason
-        report.ops_reviewed_at = timezone.now()
-        report.ops_reviewed_by = request.user
-        report.save(
-            update_fields=[
-                "report_status",
-                "return_reason",
-                "ops_review_note",
-                "ops_reviewed_at",
-                "ops_reviewed_by",
-                "updated_at",
-            ]
-        )
-
-        ReportStatusEvent.objects.create(
-            report=report,
-            event_type="returned_to_clinic",
-            from_status=previous_status,
-            to_status="returned_to_clinic",
-            note=reason,
-            actor=request.user,
-        )
-
-        create_audit_log(
-            actor=request.user,
-            action="report_returned",
-            entity_type="report",
-            entity_id=report.id,
-            entity_label=report.report_id,
-            message=f"Report {report.report_id} returned to clinic.",
-            metadata={"reason": reason},
-        )
+            create_audit_log(
+                actor=request.user, action="report_returned", entity_type="report",
+                entity_id=report.id, entity_label=report.report_id,
+                message=f"Report {report.report_id} returned to clinic.",
+                metadata={"reason": reason, "submitted_version": report.submitted_version_id},
+            )
 
         create_ops_notification(
             title="Report returned to clinic",
@@ -815,179 +802,82 @@ class OpsReportReturnView(OpsOnlyMixin, APIView):
 
 class OpsReportApproveView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
-
-        report = StructuredReport.objects.filter(pk=pk).first()
-
-        if not report:
-            return Response(
-                {"detail": "Report not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if report.report_status not in {
-            "submitted_to_ops",
-            "ops_rejected",
-        }:
-            return Response(
-                {
-                    "detail": (
-                        "Only submitted_to_ops or ops_rejected "
-                        "reports can be approved and issued. "
-                        f"Current status: {report.report_status}"
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        signer_name = (
-            request.data.get("signer_name") or ""
-        ).strip()
-
-        signer_role = (
-            request.data.get("signer_role") or ""
-        ).strip()
-
-        signer_registration_number = (
-            request.data.get(
-                "signer_registration_number"
-            )
-            or ""
-        ).strip()
-
-        missing_signature_fields = []
-
-        if not signer_name:
-            missing_signature_fields.append(
-                "clinician name"
-            )
-
-        if not signer_role:
-            missing_signature_fields.append(
-                "professional role"
-            )
-
-        if not signer_registration_number:
-            missing_signature_fields.append(
-                "registration number"
-            )
-
-        if missing_signature_fields:
-            return Response(
-                {
-                    "detail": (
-                        "Clinical sign-off is incomplete. Missing: "
-                        + ", ".join(missing_signature_fields)
-                        + "."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        previous_status = report.report_status
-        issued_time = timezone.now()
-
-        report.report_status = "issued"
-
-        report.ops_reviewed_at = issued_time
-        report.ops_reviewed_by = request.user
-        report.ops_review_note = (
-            request.data.get("note") or ""
-        ).strip()
-
-        report.signed_by = request.user
-        report.signed_at = issued_time
-        report.signer_name = signer_name
-        report.signer_role = signer_role
-        report.signer_registration_number = (
-            signer_registration_number
-        )
-
-        report.issued_by = request.user
-        report.issued_at = issued_time
-
-        report.save(
-            update_fields=[
-                "report_status",
-                "ops_reviewed_at",
-                "ops_reviewed_by",
-                "ops_review_note",
-                "signed_by",
-                "signed_at",
-                "signer_name",
-                "signer_role",
-                "signer_registration_number",
-                "issued_by",
-                "issued_at",
-                "updated_at",
-            ]
-        )
-
-        ReportStatusEvent.objects.create(
-            report=report,
-            event_type="issued",
-            from_status=previous_status,
-            to_status="issued",
-            note=(
-                report.ops_review_note
-                or (
-                    "Report reviewed, electronically "
-                    "signed and issued by Sentinel Ops."
+        authority = ops_report_authority(request.user)
+        signer_name = (request.data.get("signer_name") or "").strip()
+        signer_role = (request.data.get("signer_role") or "").strip()
+        signer_registration_number = (request.data.get("signer_registration_number") or "").strip()
+        missing = [label for label, value in (("clinician name", signer_name), ("professional role", signer_role), ("registration number", signer_registration_number)) if not value]
+        if missing:
+            return Response({"detail": "Clinical sign-off is incomplete. Missing: " + ", ".join(missing) + "."}, status=status.HTTP_400_BAD_REQUEST)
+        created_pdf = False
+        version = None
+        try:
+            with transaction.atomic():
+                report = StructuredReport.objects.select_for_update().select_related("encounter").filter(pk=pk).first()
+                if not report:
+                    return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
+                assert_expected(report, expected_version(request.data))
+                if str(request.data.get("submitted_version")) != str(report.submitted_version_id):
+                    return Response({"detail": "The submitted report version changed. Reload before review."}, status=status.HTTP_409_CONFLICT)
+                if report.report_status != "submitted_to_ops" or not report.submitted_version_id:
+                    return Response({"detail": f"Only a valid submitted_to_ops report can be approved. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+                version = report.submitted_version
+                previous_status = report.report_status
+                issued_time = timezone.now()
+                report.report_status = "issued"
+                report.ops_reviewed_at = issued_time
+                report.ops_reviewed_by = request.user
+                report.ops_review_note = (request.data.get("note") or "").strip()
+                report.signed_by = request.user
+                report.signed_at = issued_time
+                report.signer_name = signer_name
+                report.signer_role = signer_role
+                report.signer_registration_number = signer_registration_number
+                report.issued_by = request.user
+                report.issued_at = issued_time
+                report.issued_version = version
+                report.distribution_status = "awaiting_distribution"
+                report.lock_version += 1
+                created_pdf = bind_issued_pdf(report, version, request)
+                report.save(update_fields=[
+                    "report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+                    "signed_by", "signed_at", "signer_name", "signer_role",
+                    "signer_registration_number", "issued_by", "issued_at", "issued_version",
+                    "distribution_status", "lock_version", "updated_at",
+                ])
+                event_once(
+                    report=report, event_type="issued", actor=request.user,
+                    from_status=previous_status, to_status="issued", source_version=version,
+                    target_version=version, authority_used=authority,
+                    note=report.ops_review_note or "Report reviewed, electronically signed and issued by Sentinel Ops.",
+                    idempotency_key=(request.data.get("idempotency_key") or f"issue:{report.lock_version}")[:120],
                 )
-            ),
-            actor=request.user,
-        )
-
-        report.distribution_status = "awaiting_distribution"
-        report.save(update_fields=["distribution_status", "updated_at"])
-
-        encounter_referral = getattr(report.encounter, "hospital_referral", None)
-        if encounter_referral:
-            encounter_referral.report = report
-            encounter_referral.report_ready = False
-            encounter_referral.referral_status = "report_issued"
-            encounter_referral.save(update_fields=[
-                "report", "report_ready", "referral_status", "updated_at",
-            ])
-
-        for referral in report.hospital_referrals.exclude(
-            pk=getattr(encounter_referral, "pk", None)
-        ):
-            referral.report_ready = False
-            referral.referral_status = "report_issued"
-            referral.save(update_fields=[
-                "report_ready", "referral_status", "updated_at",
-            ])
-
-        ReportStatusEvent.objects.create(
-            report=report,
-            event_type="queued_for_distribution",
-            from_status="issued",
-            to_status="issued",
-            note="Issued report queued for Sentinel distribution.",
-            actor=request.user,
-        )
-
-        create_audit_log(
-            actor=request.user,
-            action="report_issued",
-            entity_type="report",
-            entity_id=report.id,
-            entity_label=report.report_id,
-            message=(
-                f"Report {report.report_id} reviewed, "
-                "signed and issued by Sentinel Ops."
-            ),
-            metadata={
-                "signer_name": signer_name,
-                "signer_role": signer_role,
-                "signer_registration_number": (
-                    signer_registration_number
-                ),
-            },
-        )
+                encounter_referral = getattr(report.encounter, "hospital_referral", None)
+                if encounter_referral:
+                    encounter_referral.report = report
+                    encounter_referral.report_ready = False
+                    encounter_referral.referral_status = "report_issued"
+                    encounter_referral.save(update_fields=["report", "report_ready", "referral_status", "updated_at"])
+                for referral in report.hospital_referrals.exclude(pk=getattr(encounter_referral, "pk", None)):
+                    referral.report_ready = False
+                    referral.referral_status = "report_issued"
+                    referral.save(update_fields=["report_ready", "referral_status", "updated_at"])
+                event_once(report=report, event_type="queued_for_distribution", actor=request.user,
+                           from_status="issued", to_status="issued", source_version=version,
+                           target_version=version, authority_used=authority,
+                           note="Issued report queued for Sentinel distribution.")
+                create_audit_log(
+                    actor=request.user, action="report_issued", entity_type="report",
+                    entity_id=report.id, entity_label=report.report_id,
+                    message=f"Report {report.report_id} reviewed, signed and issued by Sentinel Ops.",
+                    metadata={"signer_name": signer_name, "signer_role": signer_role,
+                              "signer_registration_number": signer_registration_number,
+                              "issued_version": version.pk},
+                )
+        except Exception:
+            if created_pdf:
+                delete_bound_pdf(version)
+            raise
 
         create_ops_notification(
             title="Report issued",
@@ -1017,51 +907,39 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
 
 class OpsReportRejectView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
-
-        report = StructuredReport.objects.filter(pk=pk).first()
-        if not report:
-            return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        if report.report_status != "submitted_to_ops":
-            return Response(
-                {"detail": f"Only submitted_to_ops reports can be rejected. Current status: {report.report_status}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        authority = ops_report_authority(request.user)
         rejection_note = (request.data.get("note") or "").strip()
         if not rejection_note:
-            return Response(
-                {"detail": "A rejection reason is required."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return Response({"detail": "A rejection reason is required."}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            report = StructuredReport.objects.select_for_update().filter(pk=pk).first()
+            if not report:
+                return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
+            assert_expected(report, expected_version(request.data))
+            if str(request.data.get("submitted_version")) != str(report.submitted_version_id):
+                return Response({"detail": "The submitted report version changed. Reload before review."}, status=status.HTTP_409_CONFLICT)
+            if report.report_status != "submitted_to_ops":
+                return Response({"detail": f"Only submitted_to_ops reports can be rejected. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+            report.report_status = "ops_rejected"
+            report.return_reason = rejection_note
+            report.ops_reviewed_at = timezone.now()
+            report.ops_reviewed_by = request.user
+            report.ops_review_note = rejection_note
+            report.lock_version += 1
+            report.save(update_fields=["report_status", "return_reason", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note", "lock_version", "updated_at"])
+            event_once(
+                report=report, event_type="rejected", actor=request.user,
+                from_status="submitted_to_ops", to_status="ops_rejected",
+                source_version=report.submitted_version, target_version=report.submitted_version,
+                authority_used=authority, note=rejection_note,
+                idempotency_key=(request.data.get("idempotency_key") or f"reject:{report.lock_version}")[:120],
             )
-
-        report.report_status = "ops_rejected"
-        report.ops_reviewed_at = timezone.now()
-        report.ops_reviewed_by = request.user
-        report.ops_review_note = rejection_note
-        report.save(update_fields=["report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note", "updated_at"])
-
-        ReportStatusEvent.objects.create(
-            report=report,
-            event_type="rejected",
-            from_status="submitted_to_ops",
-            to_status="ops_rejected",
-            note=report.ops_review_note,
-            actor=request.user,
-        )
-
-        create_audit_log(
-            actor=request.user,
-            action="report_rejected",
-            entity_type="report",
-            entity_id=report.id,
-            entity_label=report.report_id,
-            message=f"Report {report.report_id} rejected by Ops.",
-            metadata={"note": report.ops_review_note},
-        )
+            create_audit_log(
+                actor=request.user, action="report_rejected", entity_type="report",
+                entity_id=report.id, entity_label=report.report_id,
+                message=f"Report {report.report_id} rejected by Ops.",
+                metadata={"note": report.ops_review_note, "submitted_version": report.submitted_version_id},
+            )
 
         create_ops_notification(
             title="Report rejected",
@@ -1149,6 +1027,7 @@ class OpsDistributionQueueView(OpsOnlyMixin, APIView):
                     referral and referral.source_hospital
                 ),
                 "report_status": report.report_status,
+                "lock_version": report.lock_version,
                 "distribution_status": report.distribution_status,
                 "patient_delivery_required": report.patient_delivery_required,
                 "issued_at": report.issued_at,
@@ -1164,9 +1043,7 @@ class OpsDistributionQueueView(OpsOnlyMixin, APIView):
 class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
     @transaction.atomic
     def post(self, request, pk):
-        denied = self.check_ops_permission(request)
-        if denied:
-            return denied
+        authority = ops_report_authority(request.user)
 
         report = (
             StructuredReport.objects.select_for_update().select_related(
@@ -1219,6 +1096,8 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
                 "hospital_name": referral.source_hospital.name,
             })
 
+        assert_expected(report, expected_version(request.data))
+
         try:
             financial_record = capture_finance_for_hospital_publication(
                 report.encounter,
@@ -1239,10 +1118,12 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
         report.distribution_status = "released_to_hospital"
         report.hospital_released_at = now
         report.hospital_released_by = request.user
+        report.lock_version += 1
         report.save(update_fields=[
             "distribution_status",
             "hospital_released_at",
             "hospital_released_by",
+            "lock_version",
             "updated_at",
         ])
 
@@ -1256,13 +1137,12 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
         from finance.services import recognize_service_partner_earning
         recognize_service_partner_earning(financial_record, trigger_source="hospital_report_release")
 
-        ReportStatusEvent.objects.create(
-            report=report,
-            event_type="released_to_hospital",
-            from_status="issued",
-            to_status="issued",
+        event_once(
+            report=report, event_type="released_to_hospital", actor=request.user,
+            from_status="issued", to_status="issued", source_version=report.issued_version,
+            target_version=report.issued_version, authority_used=authority,
             note=f"Report released by Sentinel to {referral.source_hospital.name}.",
-            actor=request.user,
+            idempotency_key=(request.data.get("idempotency_key") or f"release:{report.pk}")[:120],
         )
 
         create_audit_log(

@@ -1,11 +1,12 @@
 from datetime import date
 from decimal import Decimal
 from unittest.mock import patch
+import tempfile
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
@@ -17,16 +18,23 @@ from finance.services import (
     top_up_wallet,
 )
 from ops.models import OpsAuditLog
-from organizations.models import Organization, OrganizationProfile, PartnerNotification
+from organizations.models import Organization, OrganizationBranch, OrganizationProfile, PartnerNotification
 from patients.models import Patient
 from referrals.models import HospitalReferral
 from referrals.serializers import HospitalReferralSerializer
+from reports.clinical_integrity import accept_responsibility, create_version_if_changed
 from reports.models import ReportStatusEvent, StructuredReport
-from users.models import UserOrganization
+from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 
 
 class ReleaseControlTestCase(TestCase):
     def setUp(self):
+        self.private_storage = tempfile.TemporaryDirectory()
+        self.storage_settings = override_settings(
+            CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE=False,
+            PRIVATE_CLINICAL_ASSETS_ROOT=self.private_storage.name,
+        )
+        self.storage_settings.enable()
         self.client = APIClient()
         self.clinic = Organization.objects.create(
             clinic_id="CLINIC-RC", name="Release Clinic", organization_type="clinic"
@@ -37,12 +45,18 @@ class ReleaseControlTestCase(TestCase):
         self.other_hospital = Organization.objects.create(
             clinic_id="HOSP-OTHER", name="Other Hospital", organization_type="hospital"
         )
+        self.branch = OrganizationBranch.objects.create(
+            organization=self.clinic, branch_code="RC-MAIN", name="Main", is_head_office=True
+        )
         self.clinic_user = self.make_user("clinic-rc", "clinic_admin", self.clinic)
+        self.clinic_user.groups.add(Group.objects.get_or_create(name="optometrist")[0])
+        UserBranchAccess.objects.create(user=self.clinic_user, branch=self.branch, is_default=True)
         self.hospital_user = self.make_user("hospital-rc", "hospital_admin", self.hospital)
         self.other_hospital_user = self.make_user(
             "hospital-other", "hospital_admin", self.other_hospital
         )
         self.ops_user = self.make_user("ops-rc", "ops_admin", None)
+        UserSecurityProfile.objects.create(user=self.ops_user, is_internal_sentinel_staff=True)
         self.patient = Patient.objects.create(
             patient_id="PAT-RC",
             first_name="Release",
@@ -51,6 +65,7 @@ class ReleaseControlTestCase(TestCase):
             sex="female",
             consent_status="completed",
             assigned_clinic=self.clinic,
+            assigned_branch=self.branch,
             referral_id="REF-RC",
         )
         self.referral = HospitalReferral.objects.create(
@@ -71,6 +86,7 @@ class ReleaseControlTestCase(TestCase):
             originating_organization=self.hospital,
             hospital_referral=self.referral,
             workflow_route="sentinel_managed",
+            service_branch=self.branch,
         )
         self.contract = PartnerContract.objects.create(
             organization=self.hospital,
@@ -101,6 +117,11 @@ class ReleaseControlTestCase(TestCase):
         self.financial_record = price_encounter(self.encounter, force=True)
         reserve_financial_record_from_originating_wallet(self.financial_record)
 
+    def tearDown(self):
+        self.storage_settings.disable()
+        self.private_storage.cleanup()
+        super().tearDown()
+
     def make_user(self, username, role, organization):
         user = get_user_model().objects.create_user(username=username, password="test-pass")
         group, _ = Group.objects.get_or_create(name=role)
@@ -118,6 +139,9 @@ class ReleaseControlTestCase(TestCase):
             "ungradable": True,
             "urgency_outcome": "image_retake",
             "recommendation": "Retake images",
+            "clinician_name": "Dr Clinic",
+            "professional_role": "Optometrist",
+            "registration_number": "OD-RC-1",
         }
 
     def create_report(self):
@@ -129,13 +153,30 @@ class ReleaseControlTestCase(TestCase):
             ungradable=True,
             urgency_outcome="image_retake",
         )
+        with transaction.atomic():
+            responsibility, _, _ = accept_responsibility(
+                user=self.clinic_user, report=report, clinician_name="Dr Clinic",
+                professional_role="Optometrist", registration_number="OD-RC-1",
+            )
+            create_version_if_changed(
+                report=report, editor=self.clinic_user,
+                responsibility=responsibility, purpose="initial",
+            )
+            report.lock_version = 1
+            report.save(update_fields=["lock_version", "updated_at"])
         return report
 
     def submit(self, report):
+        report.refresh_from_db()
         self.client.force_authenticate(self.clinic_user)
-        return self.client.post(f"/api/reports/{report.id}/submit-to-ops/", {}, format="json")
+        return self.client.post(
+            f"/api/reports/{report.id}/submit-to-ops/",
+            {"expected_version": report.lock_version, "resubmission_note": "Corrected as requested"},
+            format="json",
+        )
 
     def issue(self, report):
+        report.refresh_from_db()
         self.client.force_authenticate(self.ops_user)
         return self.client.post(
             f"/api/ops/reports/{report.id}/approve/",
@@ -143,14 +184,18 @@ class ReleaseControlTestCase(TestCase):
                 "signer_name": "Dr Ops",
                 "signer_role": "Ophthalmologist",
                 "signer_registration_number": "REG-1",
+                "expected_version": report.lock_version,
+                "submitted_version": report.submitted_version_id,
             },
             format="json",
         )
 
     def release(self, report):
+        report.refresh_from_db()
         self.client.force_authenticate(self.ops_user)
         return self.client.post(
-            f"/api/ops/distribution/{report.id}/release-hospital/", {}, format="json"
+            f"/api/ops/distribution/{report.id}/release-hospital/",
+            {"expected_version": report.lock_version}, format="json"
         )
 
     def test_create_update_and_duplicate_protection(self):
@@ -164,6 +209,7 @@ class ReleaseControlTestCase(TestCase):
                 "ungradable": True,
                 "urgency_outcome": "image_retake",
                 "recommendation": "Corrected",
+                "expected_version": created.data["lock_version"],
             },
             format="json",
         )
@@ -174,7 +220,7 @@ class ReleaseControlTestCase(TestCase):
         duplicate = self.client.post(
             "/api/reports/", self.report_payload(report_id="RPT-RC-2"), format="json"
         )
-        self.assertEqual(duplicate.status_code, 400)
+        self.assertEqual(duplicate.status_code, 409)
         with self.assertRaises(IntegrityError), transaction.atomic():
             StructuredReport.objects.create(
                 report_id="RPT-RC-DB",
@@ -346,20 +392,24 @@ class ReleaseControlTestCase(TestCase):
     def test_return_allows_correction_and_resubmission_of_same_report(self):
         report = self.create_report()
         self.submit(report)
+        report.refresh_from_db()
         self.client.force_authenticate(self.ops_user)
         returned = self.client.post(
             f"/api/ops/reports/{report.id}/return/",
-            {"reason": "Please correct the grade"},
+            {"reason": "Please correct the grade", "expected_version": report.lock_version, "submitted_version": report.submitted_version_id},
             format="json",
         )
         self.assertEqual(returned.status_code, 200, returned.data)
         self.client.force_authenticate(self.clinic_user)
+        report.refresh_from_db()
         corrected = self.client.patch(
             f"/api/reports/{report.id}/",
             {
                 "ungradable": True,
                 "urgency_outcome": "image_retake",
                 "recommendation": "Corrected after Ops return",
+                "expected_version": report.lock_version,
+                "correction_note": "Corrected grade after Ops return",
             },
             format="json",
         )
@@ -387,6 +437,7 @@ class ReleaseControlTestCase(TestCase):
                 "signer_name": "Clinic Signer",
                 "signer_role": "Optometrist",
                 "signer_registration_number": "OD-1",
+                "expected_version": report.lock_version,
             },
             format="json",
         )
@@ -399,6 +450,7 @@ class ReleaseControlTestCase(TestCase):
                 "signer_name": "Clinic Signer",
                 "signer_role": "Optometrist",
                 "signer_registration_number": "OD-1",
+                "expected_version": report.lock_version,
             },
             format="json",
         )
@@ -413,10 +465,11 @@ class ReleaseControlTestCase(TestCase):
     def test_legacy_ops_routes_delegate_to_canonical_transitions(self):
         report = self.create_report()
         self.submit(report)
+        report.refresh_from_db()
         self.client.force_authenticate(self.ops_user)
         rejected = self.client.post(
             f"/api/reports/{report.id}/ops-reject/",
-            {"note": "Correction required"},
+            {"note": "Correction required", "expected_version": report.lock_version, "submitted_version": report.submitted_version_id},
             format="json",
         )
         self.assertEqual(rejected.status_code, 200, rejected.data)
@@ -426,12 +479,15 @@ class ReleaseControlTestCase(TestCase):
             ReportStatusEvent.objects.filter(report=report, event_type="rejected").exists()
         )
         self.client.force_authenticate(self.clinic_user)
+        report.refresh_from_db()
         corrected = self.client.patch(
             f"/api/reports/{report.id}/",
             {
                 "ungradable": True,
                 "urgency_outcome": "image_retake",
                 "recommendation": "Corrected after rejection",
+                "expected_version": report.lock_version,
+                "correction_note": "Corrected after rejection",
             },
             format="json",
         )

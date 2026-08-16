@@ -1,5 +1,28 @@
 from rest_framework import serializers
-from .models import StructuredReport, ReportStatusEvent, PatientReportDelivery
+from .models import (
+    PatientReportDelivery,
+    ReportStatusEvent,
+    StructuredReport,
+    StructuredReportVersion,
+)
+
+
+class StructuredReportVersionSerializer(serializers.ModelSerializer):
+    editor_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StructuredReportVersion
+        fields = [
+            "id", "version_number", "checksum_sha256", "editor_display",
+            "responsibility_snapshot", "purpose", "correction_note",
+            "source_version", "pdf_checksum_sha256", "pdf_size",
+            "pdf_generated_at", "legacy_pdf_unbound", "created_at",
+        ]
+
+    def get_editor_display(self, obj):
+        if not obj.editor:
+            return "Unknown historical author"
+        return obj.editor.get_full_name() or obj.editor.username or obj.editor.email
 
 
 class ReportStatusEventSerializer(serializers.ModelSerializer):
@@ -15,6 +38,10 @@ class ReportStatusEventSerializer(serializers.ModelSerializer):
             "note",
             "actor",
             "actor_display",
+            "source_version",
+            "target_version",
+            "authority_used",
+            "correction_note",
             "created_at",
         ]
 
@@ -25,6 +52,7 @@ class ReportStatusEventSerializer(serializers.ModelSerializer):
 
 
 class StructuredReportSerializer(serializers.ModelSerializer):
+    expected_version = serializers.IntegerField(write_only=True, required=False)
     patient_name = serializers.SerializerMethodField()
     sentinel_patient_id = serializers.SerializerMethodField()
     patient_id = serializers.CharField(source="patient.patient_id", read_only=True)
@@ -41,9 +69,12 @@ class StructuredReportSerializer(serializers.ModelSerializer):
         read_only=True,
     )
     status_events = ReportStatusEventSerializer(many=True, read_only=True)
+    versions = StructuredReportVersionSerializer(many=True, read_only=True)
+    clinical_responsibility = serializers.SerializerMethodField()
 
     class Meta:
         model = StructuredReport
+        extra_kwargs = {"encounter": {"validators": []}}
         fields = [
             "id",
             "report_id",
@@ -112,6 +143,12 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "hospital_released_by",
             "patient_delivery_required",
             "patient_delivered_at",
+            "lock_version",
+            "expected_version",
+            "submitted_version",
+            "issued_version",
+            "clinical_responsibility",
+            "versions",
             "status_events",
             "created_at",
             "updated_at",
@@ -143,10 +180,34 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "hospital_released_at",
             "hospital_released_by",
             "patient_delivered_at",
+            "lock_version",
+            "submitted_version",
+            "issued_version",
+            "clinical_responsibility",
+            "versions",
             "status_events",
             "created_at",
             "updated_at",
         ]
+
+    def get_clinical_responsibility(self, obj):
+        responsibility = getattr(obj, "clinical_responsibility", None)
+        if not responsibility:
+            return None
+        return {
+            "current_clinician": responsibility.current_clinician_id,
+            "original_clinician": responsibility.original_clinician_id,
+            "clinician_name": responsibility.clinician_name,
+            "professional_role": responsibility.professional_role,
+            "registration_number": responsibility.registration_number,
+            "authority_used": responsibility.authority_used,
+            "clinic": responsibility.clinic_id,
+            "clinic_name": responsibility.clinic.name,
+            "branch": responsibility.branch_id,
+            "branch_name": responsibility.branch.name,
+            "accepted_at": responsibility.accepted_at,
+            "takeover_reason": responsibility.takeover_reason,
+        }
 
 
     def get_patient_name(self, obj):
@@ -159,6 +220,7 @@ class StructuredReportSerializer(serializers.ModelSerializer):
         return getattr(master_patient, "sentinel_patient_id", "") or getattr(patient, "sentinel_patient_id", "") or ""
 
     def validate(self, attrs):
+        attrs.pop("expected_version", None)
         encounter = attrs.get("encounter") or getattr(self.instance, "encounter", None)
         patient = attrs.get("patient") or getattr(self.instance, "patient", None)
 
@@ -167,10 +229,23 @@ class StructuredReportSerializer(serializers.ModelSerializer):
                 {"encounter": "The selected encounter does not belong to this patient."}
             )
 
-        if encounter:
+        if self.instance:
+            immutable = {
+                "report_id": self.instance.report_id,
+                "encounter": self.instance.encounter_id,
+                "patient": self.instance.patient_id,
+            }
+            for field, original in immutable.items():
+                if field in attrs:
+                    incoming = getattr(attrs[field], "pk", attrs[field])
+                    if incoming != original:
+                        raise serializers.ValidationError(
+                            {field: "Report identity and ownership cannot change after creation."}
+                        )
+
+        if encounter and self.instance:
             duplicate_qs = StructuredReport.objects.filter(encounter=encounter)
-            if self.instance:
-                duplicate_qs = duplicate_qs.exclude(pk=self.instance.pk)
+            duplicate_qs = duplicate_qs.exclude(pk=self.instance.pk)
             if duplicate_qs.exists():
                 raise serializers.ValidationError(
                     {"encounter": "A structured report already exists for this encounter. Edit the existing report instead."}

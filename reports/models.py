@@ -1,4 +1,5 @@
 from django.db import models
+from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
 from patients.models import Patient
@@ -213,6 +214,16 @@ class StructuredReport(models.Model):
     patient_delivery_required = models.BooleanField(default=False)
     patient_delivered_at = models.DateTimeField(null=True, blank=True)
 
+    lock_version = models.PositiveIntegerField(default=0)
+    submitted_version = models.ForeignKey(
+        "StructuredReportVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="submitted_reports",
+    )
+    issued_version = models.ForeignKey(
+        "StructuredReportVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="issued_reports",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -306,6 +317,8 @@ class PatientReportDelivery(models.Model):
 class ReportStatusEvent(models.Model):
     EVENT_CHOICES = [
         ("created", "Created"),
+        ("responsibility_accepted", "Clinical responsibility accepted"),
+        ("responsibility_taken_over", "Clinical responsibility taken over"),
         ("submitted_to_ops", "Submitted to Ops"),
         ("returned_to_clinic", "Returned to Clinic"),
         ("resubmitted", "Resubmitted"),
@@ -335,10 +348,124 @@ class ReportStatusEvent(models.Model):
         on_delete=models.SET_NULL,
         related_name="report_status_events",
     )
+    source_version = models.ForeignKey(
+        "StructuredReportVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="source_status_events",
+    )
+    target_version = models.ForeignKey(
+        "StructuredReportVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="target_status_events",
+    )
+    authority_used = models.CharField(max_length=80, blank=True, default="")
+    correction_note = models.TextField(blank=True, default="")
+    idempotency_key = models.CharField(max_length=120, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "idempotency_key"],
+                condition=~models.Q(idempotency_key=""),
+                name="report_unique_status_event_idempotency",
+            )
+        ]
 
     def __str__(self):
         return f"{self.report.report_id} - {self.event_type}"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Report status events are append-only.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Report status events cannot be deleted.")
+
+
+class ReportClinicalResponsibility(models.Model):
+    report = models.OneToOneField(
+        StructuredReport, on_delete=models.PROTECT, related_name="clinical_responsibility"
+    )
+    current_clinician = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="responsible_retinal_reports",
+    )
+    original_clinician = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="originally_responsible_retinal_reports",
+    )
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="retinal_responsibility_acceptances",
+    )
+    accepted_at = models.DateTimeField()
+    authority_used = models.CharField(max_length=40)
+    clinician_name = models.CharField(max_length=255)
+    professional_role = models.CharField(max_length=120)
+    registration_number = models.CharField(max_length=120)
+    clinic = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT,
+        related_name="retinal_report_responsibilities",
+    )
+    branch = models.ForeignKey(
+        "organizations.OrganizationBranch", on_delete=models.PROTECT,
+        related_name="retinal_report_responsibilities",
+    )
+    previous_clinician = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="transferred_retinal_reports",
+    )
+    takeover_reason = models.TextField(blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class StructuredReportVersion(models.Model):
+    PURPOSE_CHOICES = [
+        ("legacy_baseline", "Legacy baseline"),
+        ("initial", "Initial clinical version"),
+        ("clinical_edit", "Clinical edit"),
+        ("returned_correction", "Returned correction"),
+    ]
+
+    report = models.ForeignKey(
+        StructuredReport, on_delete=models.PROTECT, related_name="versions"
+    )
+    version_number = models.PositiveIntegerField()
+    snapshot_schema_version = models.PositiveSmallIntegerField(default=1)
+    clinical_snapshot = models.JSONField(default=dict)
+    checksum_sha256 = models.CharField(max_length=64)
+    editor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="retinal_report_versions",
+    )
+    responsibility_snapshot = models.JSONField(default=dict, blank=True)
+    purpose = models.CharField(max_length=30, choices=PURPOSE_CHOICES)
+    correction_note = models.TextField(blank=True, default="")
+    source_version = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="derived_versions",
+    )
+    pdf_object_key = models.CharField(max_length=500, blank=True, default="")
+    pdf_checksum_sha256 = models.CharField(max_length=64, blank=True, default="")
+    pdf_size = models.PositiveBigIntegerField(null=True, blank=True)
+    pdf_generated_at = models.DateTimeField(null=True, blank=True)
+    legacy_pdf_unbound = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["version_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "version_number"],
+                name="report_unique_clinical_version",
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Clinical report versions are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Clinical report versions cannot be deleted.")
