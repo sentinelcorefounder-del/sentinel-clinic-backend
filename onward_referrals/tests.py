@@ -67,8 +67,13 @@ class OnwardReferralTests(TestCase):
             organization=self.clinic, branch_code="OTHER", name="Other Branch",
         )
         self.optometrist = self.user("orf-optometrist", "optometrist", self.clinic, self.branch)
+        self.optometrist.groups.add(Group.objects.get_or_create(name="clinic_admin")[0])
         self.other_optometrist = self.user("orf-optometrist-2", "optometrist", self.clinic, self.branch)
         self.wrong_branch_optometrist = self.user("orf-wrong-branch", "optometrist", self.clinic, self.other_branch)
+        self.reviewer = self.user("orf-reviewer", "reviewer", self.clinic, self.branch)
+        self.reviewer.groups.add(Group.objects.get_or_create(name="clinic_admin")[0])
+        self.wrong_branch_reviewer = self.user("orf-reviewer-branch", "reviewer", self.clinic, self.other_branch)
+        self.cross_clinic_reviewer = self.user("orf-reviewer-clinic", "reviewer", self.other_clinic)
         self.admin = self.user("orf-admin", "clinic_admin", self.clinic, self.branch)
         self.admin.groups.add(Group.objects.get_or_create(name="onward_referral_distributor")[0])
         self.hospital_user = self.user("orf-hospital", "hospital_admin", self.hospital)
@@ -225,6 +230,77 @@ class OnwardReferralTests(TestCase):
         for user in (self.admin, self.ops_user, self.finance_user, self.hospital_user, self.superuser, self.wrong_branch_optometrist):
             with self.assertRaises(PermissionDenied):
                 self.accept(user, "Unauthorized attempt")
+
+    def test_reviewer_capability_requires_credentials_and_preserves_admin_role(self):
+        self.client.force_authenticate(self.reviewer)
+        eligible = self.client.get(
+            f"/api/onward-referrals/encounters/{self.encounter.pk}/eligibility/"
+        )
+        self.assertEqual(eligible.status_code, 200)
+        self.assertTrue(eligible.data["capabilities"]["can_accept_responsibility"])
+        missing = self.client.post(
+            f"/api/onward-referrals/encounters/{self.encounter.pk}/responsibility/",
+            {"clinician_name": "Qualified Reviewer", "professional_role": "Reviewer"},
+            format="json",
+        )
+        self.assertEqual(missing.status_code, 400)
+        accepted = self.client.post(
+            f"/api/onward-referrals/encounters/{self.encounter.pk}/responsibility/",
+            {
+                "clinician_name": "Qualified Reviewer",
+                "professional_role": "Retinal Reviewer",
+                "registration_number": "REV-SYNTH-1",
+                "reason": "Reviewer accepting responsibility after assessment",
+            },
+            format="json",
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        event = PatientTimelineEvent.objects.get(
+            event_type="onward_responsibility_accepted"
+        )
+        self.assertEqual(event.metadata["authority_used"], "reviewer")
+        eligible = self.client.get(
+            f"/api/onward-referrals/encounters/{self.encounter.pk}/eligibility/"
+        )
+        self.assertTrue(eligible.data["capabilities"]["can_author"])
+
+    def test_qualified_reviewer_can_create_edit_finalize_supersede_and_take_over(self):
+        self.accept(self.optometrist)
+        responsibility = accept_responsibility(
+            user=self.reviewer, encounter=self.encounter,
+            clinician_name="Qualified Reviewer", professional_role="Retinal Reviewer",
+            registration_number="REV-SYNTH-2", reason="Covering clinical handover",
+        )
+        self.assertEqual(responsibility.optometrist, self.reviewer)
+        self.assertEqual(responsibility.previous_optometrist, self.optometrist)
+        referral = self.draft(user=self.reviewer)
+        self.client.force_authenticate(self.reviewer)
+        updated = self.client.patch(
+            f"/api/onward-referrals/{referral.referral_uuid}/",
+            {"professional_impression": "Reviewer-confirmed impression"}, format="json",
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        finalized = self.client.post(
+            f"/api/onward-referrals/{referral.referral_uuid}/finalize/", {}, format="json",
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.data)
+        corrected = self.client.post(
+            f"/api/onward-referrals/{referral.referral_uuid}/supersede/",
+            {"reason": "Reviewer correction"}, format="json",
+        )
+        self.assertEqual(corrected.status_code, 200, corrected.data)
+        self.assertEqual(corrected.data["current_version"]["status"], "draft")
+        self.assertTrue(corrected.data["capabilities"]["can_author"])
+
+    def test_reviewer_scope_and_nonclinical_roles_remain_restricted(self):
+        for user in (self.wrong_branch_reviewer, self.cross_clinic_reviewer, self.admin):
+            with self.assertRaises(PermissionDenied):
+                accept_responsibility(
+                    user=user, encounter=self.encounter,
+                    clinician_name="Synthetic Clinician", professional_role="Reviewer",
+                    registration_number="REV-SYNTH-3",
+                )
+        self.assertTrue(self.reviewer.groups.filter(name="clinic_admin").exists())
 
     def test_responsibility_audit_failure_rolls_back(self):
         with patch("onward_referrals.services.record_patient_event", side_effect=RuntimeError("audit failed")):

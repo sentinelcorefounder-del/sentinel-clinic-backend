@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
 from common.tenant import get_user_organization
 
@@ -10,6 +11,7 @@ from .models import (
     OnwardReferralVersion,
 )
 from .services import source_is_stale
+from .permissions import can_distribute, clinical_capabilities
 
 
 class ResponsibilitySerializer(serializers.ModelSerializer):
@@ -80,6 +82,7 @@ class OnwardReferralSerializer(serializers.ModelSerializer):
     clinic_name = serializers.CharField(source="originating_clinic.name", read_only=True)
     branch_name = serializers.CharField(source="branch.name", read_only=True)
     inbound_referral_reference = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
 
     class Meta:
         model = OnwardReferral
@@ -88,7 +91,7 @@ class OnwardReferralSerializer(serializers.ModelSerializer):
             "encounter_reference", "clinic_name", "branch_name",
             "inbound_referral_reference", "clinical_sources", "route",
             "lifecycle", "responsibility", "current_version", "versions",
-            "events", "created_at", "updated_at",
+            "events", "capabilities", "created_at", "updated_at",
         ]
 
     def get_responsibility(self, obj):
@@ -104,6 +107,24 @@ class OnwardReferralSerializer(serializers.ModelSerializer):
         inbound = obj.original_hospital_referral
         return inbound.referral_id if inbound else ""
 
+    def get_capabilities(self, obj):
+        request = self.context.get("request")
+        if not request:
+            return {
+                "can_accept_responsibility": False, "can_author": False,
+                "can_administer_recipient": False, "can_distribute": False,
+            }
+        responsibility = getattr(obj.encounter, "onward_responsibility", None)
+        values = clinical_capabilities(
+            request.user, clinic=obj.originating_clinic, branch=obj.branch,
+            responsibility=responsibility,
+        )
+        try:
+            values["can_distribute"] = can_distribute(request.user, obj)
+        except PermissionDenied:
+            values["can_distribute"] = False
+        return values
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get("request")
@@ -111,6 +132,10 @@ class OnwardReferralSerializer(serializers.ModelSerializer):
         if organization and organization.organization_type == "hospital":
             data.pop("events", None)
             data.pop("responsibility", None)
+            data["capabilities"] = {
+                "can_accept_responsibility": False, "can_author": False,
+                "can_administer_recipient": False, "can_distribute": False,
+            }
             available_versions = instance.versions.filter(
                 availabilities__recipient_organization=organization,
                 availabilities__state__in={"active", "superseded"},

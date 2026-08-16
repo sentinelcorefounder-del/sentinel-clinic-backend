@@ -6,6 +6,10 @@ from django.utils import timezone
 from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 
 from uploads.storage import get_private_clinical_storage
+from users.clinical_authority import (
+    exact_clinical_authority,
+    normalized_professional_credentials,
+)
 
 from .models import (
     ReportClinicalResponsibility,
@@ -51,8 +55,7 @@ def _strict_branch_access(user, branch):
 def clinical_authority(user, report):
     if not user or not user.is_authenticated:
         raise PermissionDenied("Exact retinal clinical authority is required.")
-    roles = _roles(user)
-    authority = "optometrist" if "optometrist" in roles else "reviewer" if "reviewer" in roles else ""
+    authority = exact_clinical_authority(user)
     if not authority:
         raise PermissionDenied("Exact optometrist or qualified retinal-reviewer authority is required.")
     clinic = report.patient.assigned_clinic
@@ -82,12 +85,16 @@ def _text(value):
 
 def accept_responsibility(*, user, report, clinician_name, professional_role, registration_number, reason=""):
     authority, clinic, branch = clinical_authority(user, report)
-    clinician_name = _text(clinician_name) or _text(user.get_full_name())
-    professional_role = _text(professional_role)
-    registration_number = _text(registration_number)
+    credentials = normalized_professional_credentials(
+        clinician_name=clinician_name,
+        professional_role=professional_role,
+        registration_number=registration_number,
+        fallback_name=user.get_full_name(),
+    )
     reason = _text(reason)
-    if not clinician_name or not professional_role or not registration_number:
+    if not credentials:
         raise ValidationError("Clinician name, professional role and registration number are required.")
+    clinician_name, professional_role, registration_number = credentials
     responsibility = ReportClinicalResponsibility.objects.select_for_update().filter(report=report).first()
     if responsibility and responsibility.current_clinician_id == user.pk:
         return responsibility, authority, False

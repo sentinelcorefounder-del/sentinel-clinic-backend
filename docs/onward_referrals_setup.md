@@ -8,9 +8,10 @@ This bounded workflow creates a professional care-escalation letter after a comp
 - At least one professional source must have a controlled onward-care outcome: ocular `refer_routine`, `refer_urgent` or `refer_emergency`; retinal `urgent_referral` or `ophthalmology_required`.
 - Combined assessments require explicit ocular/retinal source selection.
 - AI output is never an eligible clinical source.
-- An active user with the exact `optometrist` group, performing-clinic membership and branch access must explicitly accept responsibility with a name, professional role and registration number.
-- Takeover requires another exact optometrist in the same clinic/branch and a recorded reason. Clinic administrators, Ops, finance users and superusers cannot accept, author, sign or supersede clinical content.
-- Clinic administrators may view status. Distribution requires the exact `onward_referral_distributor` group in addition to `clinic_admin`; the responsible optometrist may also distribute.
+- An active user with the exact `optometrist` or exact `reviewer` group, performing-clinic membership and explicit branch access must accept responsibility with a recorded name, professional role and registration number.
+- Takeover requires another qualified clinical professional in the same clinic/branch and a recorded reason. Clinic administrators, Ops, finance users and superusers cannot accept, author, sign or supersede clinical content through those roles alone.
+- A small-clinic master account may combine `clinic_admin` with either clinical role. Administrative capability neither grants nor removes its independently qualified clinical capability.
+- Clinic administrators may view status. Distribution requires the exact `onward_referral_distributor` group in addition to `clinic_admin`; the responsible clinical professional may also distribute.
 
 No historical author is inferred or silently backfilled.
 
@@ -24,7 +25,7 @@ A hospital with the exact `hospital_admin` role sees only versions explicitly ma
 
 ## Versions, emergency handling and private documents
 
-Drafts are editable only by the responsible optometrist, except recipient selection by an authorized clinic administrator. Emergency finalization requires a structured escalation method and brief safe note plus explicit confirmation that immediate instructions or action occurred. The UI/PDF warns that the letter is not a substitute for immediate escalation and guarantees no receipt, acceptance, appointment or treatment.
+Drafts are editable only by the responsible clinical professional, except recipient selection by an authorized clinic administrator. Emergency finalization requires a structured escalation method and brief safe note plus explicit confirmation that immediate instructions or action occurred. The UI/PDF warns that the letter is not a substitute for immediate escalation and guarantees no receipt, acceptance, appointment or treatment.
 
 Finalization freezes clinical, author, patient, recipient and branding snapshots, generates the PDF once, and stores its exact bytes and SHA-256 checksum under the non-PHI prefix:
 

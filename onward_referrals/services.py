@@ -12,6 +12,7 @@ from organizations.notification_service import notify_organization
 from organizations.report_branding import resolve_report_branding
 from reports.models import StructuredReport
 from uploads.storage import get_private_clinical_storage
+from users.clinical_authority import normalized_professional_credentials
 
 from .documents import render_onward_referral
 from .models import (
@@ -21,7 +22,7 @@ from .models import (
     OnwardReferralEvent,
     OnwardReferralVersion,
 )
-from .permissions import can_distribute, require_current_author, require_optometrist
+from .permissions import can_distribute, require_clinical_author, require_current_author
 
 
 OCULAR_OUTCOMES = {"refer_routine", "refer_urgent", "refer_emergency"}
@@ -77,13 +78,17 @@ def accept_responsibility(*, user, encounter, clinician_name, professional_role,
     branch = encounter.service_branch or encounter.patient.assigned_branch
     if not clinic or not branch:
         raise ValidationError("The encounter requires a performing clinic and branch.")
-    require_optometrist(user, clinic, branch)
-    clinician_name = (clinician_name or user.get_full_name() or "").strip()
-    professional_role = (professional_role or "Optometrist").strip()
-    registration_number = (registration_number or "").strip()
+    authority = require_clinical_author(user, clinic, branch)
+    credentials = normalized_professional_credentials(
+        clinician_name=clinician_name,
+        professional_role=professional_role,
+        registration_number=registration_number,
+        fallback_name=user.get_full_name(),
+    )
     reason = (reason or "").strip()
-    if not clinician_name or not professional_role or not registration_number:
+    if not credentials:
         raise ValidationError("Name, professional role and registration number are required.")
+    clinician_name, professional_role, registration_number = credentials
     responsibility = EncounterResponsibleOptometrist.objects.select_for_update().filter(encounter=encounter).first()
     previous = None
     if responsibility:
@@ -118,11 +123,14 @@ def accept_responsibility(*, user, encounter, clinician_name, professional_role,
         event_key=f"encounter:{encounter.pk}:{event_type}:{responsibility.accepted_at.isoformat()}",
         category="referral", event_type=event_type,
         title="Onward-referral clinical responsibility recorded",
-        description="An authorized optometrist explicitly accepted clinical responsibility.",
+        description="An authorized clinical professional explicitly accepted responsibility.",
         source_type="encounter", source_id=encounter.pk,
         encounter_id=encounter.encounter_id, actor=user, organization=clinic,
         visibility="clinic_ops",
-        metadata={"previous_optometrist_id": getattr(previous, "id", None), "reason_recorded": bool(reason)},
+        metadata={
+            "previous_optometrist_id": getattr(previous, "id", None),
+            "reason_recorded": bool(reason), "authority_used": authority,
+        },
     )
     return responsibility
 
@@ -166,11 +174,11 @@ def create_referral(*, user, encounter, clinical_sources, route, recipient_organ
     if not state["encounter_completed"]:
         raise ValidationError("The encounter must be completed first.")
     if not state["responsible_optometrist"]:
-        raise ValidationError("A responsible optometrist must explicitly accept responsibility first.")
+        raise ValidationError("A responsible clinical professional must explicitly accept responsibility first.")
     branch = encounter.service_branch or encounter.patient.assigned_branch
-    require_optometrist(user, encounter.patient.assigned_clinic, branch)
+    require_clinical_author(user, encounter.patient.assigned_clinic, branch)
     if state["responsible_optometrist"].optometrist_id != user.id:
-        raise PermissionDenied("Only the responsible optometrist may create the clinical draft.")
+        raise PermissionDenied("Only the responsible clinical professional may create the clinical draft.")
     sources, ocular, retinal = _validate_sources(encounter, clinical_sources)
     recipient = _recipient(
         encounter=encounter, route=route,

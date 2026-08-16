@@ -16,8 +16,8 @@ from uploads.storage import get_private_clinical_storage
 
 from .models import OnwardReferral, OnwardReferralAccessEvent, OnwardReferralEvent
 from .permissions import (
-    clinic_can_view, clinic_can_view_encounter, hospital_can_view, is_clinic_admin,
-    require_current_author, require_optometrist, role_names,
+    clinic_can_view, clinic_can_view_encounter, clinical_capabilities,
+    hospital_can_view, is_clinic_admin, require_current_author, role_names,
 )
 from .serializers import OnwardReferralSerializer, ResponsibilitySerializer
 from .services import (
@@ -93,11 +93,17 @@ class EligibilityView(APIView):
         if not clinic_can_view_encounter(request.user, encounter):
             raise PermissionDenied("Clinic access is required.")
         result = eligibility(encounter)
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        capabilities = clinical_capabilities(
+            request.user, clinic=encounter.patient.assigned_clinic, branch=branch,
+            responsibility=result["responsible_optometrist"],
+        )
         return Response({
             "eligible": result["eligible"],
             "encounter_completed": result["encounter_completed"],
             "eligible_sources": result["eligible_sources"],
             "responsibility": ResponsibilitySerializer(result["responsible_optometrist"]).data if result["responsible_optometrist"] else None,
+            "capabilities": capabilities,
         })
 
 
@@ -106,7 +112,7 @@ class RegisteredHospitalListView(APIView):
 
     def get(self, request):
         org = get_user_organization(request.user)
-        if request.user.is_superuser or not org or org.organization_type != "clinic" or not (role_names(request.user) & {"optometrist", "clinic_admin"}):
+        if request.user.is_superuser or not org or org.organization_type != "clinic" or not (role_names(request.user) & {"optometrist", "reviewer", "clinic_admin"}):
             raise PermissionDenied("Clinic authority is required.")
         return Response(list(Organization.objects.filter(
             organization_type="hospital", is_active=True
@@ -124,7 +130,7 @@ class OnwardReferralListCreateView(APIView):
             "patient", "encounter", "originating_clinic", "branch", "current_version",
             "current_version__recipient_organization", "original_hospital_referral",
         ).prefetch_related("versions", "events", "events__actor")
-        if org.organization_type == "clinic" and role_names(request.user) & {"optometrist", "clinic_admin"}:
+        if org.organization_type == "clinic" and role_names(request.user) & {"optometrist", "reviewer", "clinic_admin"}:
             queryset = queryset.filter(originating_clinic=org)
             branch_ids = accessible_branch_ids(request.user, org)
             if branch_ids is not None:
@@ -220,7 +226,7 @@ class OnwardReferralDetailView(APIView):
                 raise ValidationError("Clinic-download referrals do not grant portal access.")
         if version.emergency_escalation_confirmed:
             if not author:
-                raise PermissionDenied("Only the responsible optometrist may confirm emergency escalation.")
+                raise PermissionDenied("Only the responsible clinical professional may confirm emergency escalation.")
             version.emergency_escalation_by = request.user
             version.emergency_escalation_at = timezone.now()
         validate_draft(version)
