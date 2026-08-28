@@ -10,6 +10,14 @@ ordinary/public media backend is never a fallback for bulk imports.
 
 ## Required production configuration
 
+Configure `CORS_ALLOWED_ORIGINS` with the exact reviewed production frontend
+origins. `CORS_ALLOWED_ORIGIN_REGEXES` defaults to no entries; if production
+genuinely requires regex origins, provide them explicitly as a comma-separated
+environment value after review. Wildcard Vercel preview access is never enabled
+automatically. Staging should leave the regex value unset or empty and rely on
+its exact staging origin in `CORS_ALLOWED_ORIGINS` and
+`CSRF_TRUSTED_ORIGINS`.
+
 - Create a separate private S3-compatible or Cloudflare R2 bucket.
 - Disable anonymous/public access at bucket level.
 - Do not attach a public custom domain.

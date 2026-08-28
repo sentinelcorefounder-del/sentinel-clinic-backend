@@ -1,6 +1,21 @@
 from .base import *
 import os
+import re
 import dj_database_url
+
+
+def _parse_origin_regexes(raw_value):
+    regexes = []
+    for value in raw_value.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            re.compile(value)
+        except re.error:
+            continue
+        regexes.append(value)
+    return regexes
 
 DEBUG = False
 
@@ -32,13 +47,9 @@ CORS_ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-CORS_ALLOWED_ORIGIN_REGEXES = [
-    r"^https://sentinel-clinic-frontend.*\.vercel\.app$",
-    r"^https://usesentinelhealth\.com$",
-    r"^https://www\.usesentinelhealth\.com$",
-    r"^https://clinic\.usesentinelhealth\.com$",
-    r"^https://ops\.usesentinelhealth\.com$",
-]
+CORS_ALLOWED_ORIGIN_REGEXES = _parse_origin_regexes(
+    os.environ.get("CORS_ALLOWED_ORIGIN_REGEXES", "")
+)
 
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
