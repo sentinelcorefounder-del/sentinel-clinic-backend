@@ -11,9 +11,17 @@ def _roles(user):
     return set(user.groups.values_list("name", flat=True))
 
 
-def _is_internal(user):
+def is_internal_sentinel_staff(user):
     return bool(
         getattr(getattr(user, "security_profile", None), "is_internal_sentinel_staff", False)
+    )
+
+
+def has_internal_ops_authority(user):
+    return bool(
+        user and user.is_authenticated
+        and is_internal_sentinel_staff(user)
+        and _roles(user) & OPS_REVIEW_ROLES
     )
 
 
@@ -37,8 +45,4 @@ class CanSubmitReportToOps(BasePermission):
 
 class CanReviewOpsReports(BasePermission):
     def has_permission(self, request, view):
-        user = request.user
-        return bool(
-            user and user.is_authenticated and _is_internal(user)
-            and _roles(user) & OPS_REVIEW_ROLES
-        )
+        return has_internal_ops_authority(request.user)

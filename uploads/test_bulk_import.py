@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 from PIL import Image
 from django.contrib.auth.models import Group, User
+from django.core.files.base import ContentFile
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from encounters.models import AssessmentServiceSession, ScreeningEncounter
@@ -17,12 +19,18 @@ from organizations.models import Organization, OrganizationBranch
 from patients.identity_services import ensure_master_identity
 from patients.models import Patient
 from referrals.models import HospitalReferral
-from users.models import UserBranchAccess, UserOrganization
+from reports.models import StructuredReport
+from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 from uploads.bulk_import import parse_remidio_root
 from uploads.bulk_import import _safe_member, _validate_archive_infos, _validate_image
 from uploads.models import BulkImageAttachment, BulkImageImport, BulkImageImportItem, ImageUpload
 from uploads.storage import BulkStagingConfigurationError, get_bulk_staging_storage
-from uploads.checks import private_bulk_staging_check
+from uploads.checks import (
+    private_bulk_staging_check,
+    private_clinical_assets_check,
+    private_storage_separation_check,
+)
+from uploads.clinical_assets import get_private_clinical_storage
 from uploads.clinical_assets import save_private_copy as real_save_private_copy
 from uploads.bulk_import import cleanup_import, cleanup_uncommitted_private_assets
 
@@ -99,6 +107,30 @@ class ArchiveSafetyUnitTests(TestCase):
 
 
 class PrivateStorageFailureTests(TestCase):
+    def private_settings(self, **overrides):
+        values = {
+            "BULK_STAGING_USE_PRIVATE_OBJECT_STORAGE": True,
+            "CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE": True,
+            "BULK_STAGING_REQUIRED_SETTINGS": ("BULK_STAGING_R2_ACCOUNT_ID", "BULK_STAGING_R2_ACCESS_KEY_ID", "BULK_STAGING_R2_SECRET_ACCESS_KEY", "BULK_STAGING_R2_BUCKET_NAME"),
+            "CLINICAL_ASSETS_REQUIRED_SETTINGS": ("CLINICAL_ASSETS_R2_ACCOUNT_ID", "CLINICAL_ASSETS_R2_ACCESS_KEY_ID", "CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY", "CLINICAL_ASSETS_R2_BUCKET_NAME"),
+            "R2_BUCKET_NAME": "ordinary-media",
+            "BULK_STAGING_R2_ACCOUNT_ID": "shared-account",
+            "BULK_STAGING_R2_ACCESS_KEY_ID": "staging-access-key",
+            "BULK_STAGING_R2_SECRET_ACCESS_KEY": "staging-secret",
+            "BULK_STAGING_R2_BUCKET_NAME": "sentinel-bulk-staging",
+            "CLINICAL_ASSETS_R2_ACCOUNT_ID": "shared-account",
+            "CLINICAL_ASSETS_R2_ACCESS_KEY_ID": "clinical-access-key",
+            "CLINICAL_ASSETS_R2_SECRET_ACCESS_KEY": "clinical-secret",
+            "CLINICAL_ASSETS_R2_BUCKET_NAME": "sentinel-clinical-assets",
+            "STORAGES": {
+                "default": {"BACKEND": "storages.backends.s3.S3Storage", "OPTIONS": {"bucket_name": "ordinary-media", "querystring_auth": False}},
+                "bulk_staging": {"BACKEND": "storages.backends.s3.S3Storage", "OPTIONS": {"access_key": "staging-access-key", "bucket_name": "sentinel-bulk-staging", "default_acl": "private", "querystring_auth": True, "custom_domain": None}},
+                "private_clinical_assets": {"BACKEND": "storages.backends.s3.S3Storage", "OPTIONS": {"access_key": "clinical-access-key", "bucket_name": "sentinel-clinical-assets", "default_acl": "private", "querystring_auth": True, "custom_domain": None}},
+            },
+        }
+        values.update(overrides)
+        return values
+
     def test_missing_production_configuration_fails_closed(self):
         with override_settings(
             BULK_STAGING_USE_PRIVATE_OBJECT_STORAGE=True,
@@ -130,6 +162,166 @@ class PrivateStorageFailureTests(TestCase):
             storage = get_bulk_staging_storage()
             self.assertTrue(storage.querystring_auth)
             self.assertIsNone(storage.custom_domain)
+
+    def test_valid_separate_private_storage_configuration_passes(self):
+        with override_settings(**self.private_settings()):
+            self.assertEqual(private_bulk_staging_check(None), [])
+            self.assertEqual(private_clinical_assets_check(None), [])
+            self.assertEqual(private_storage_separation_check(None), [])
+
+    @override_settings(
+        BULK_STAGING_USE_PRIVATE_OBJECT_STORAGE=False,
+        CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE=False,
+    )
+    def test_local_file_storage_configuration_remains_usable(self):
+        self.assertEqual(private_bulk_staging_check(None), [])
+        self.assertEqual(private_clinical_assets_check(None), [])
+        self.assertEqual(private_storage_separation_check(None), [])
+
+    def test_private_buckets_must_be_distinct(self):
+        with override_settings(**self.private_settings(
+            CLINICAL_ASSETS_R2_BUCKET_NAME="sentinel-bulk-staging",
+        )):
+            self.assertEqual(private_storage_separation_check(None)[0].id, "uploads.E005")
+
+    def test_private_buckets_cannot_reuse_default_media_bucket(self):
+        for setting_name, error_id in (
+            ("BULK_STAGING_R2_BUCKET_NAME", "uploads.E006"),
+            ("CLINICAL_ASSETS_R2_BUCKET_NAME", "uploads.E007"),
+        ):
+            with self.subTest(setting_name=setting_name), override_settings(
+                **self.private_settings(**{setting_name: "ordinary-media"})
+            ):
+                self.assertEqual(private_storage_separation_check(None)[0].id, error_id)
+
+    def test_private_storages_must_use_separate_access_keys(self):
+        with override_settings(**self.private_settings(
+            CLINICAL_ASSETS_R2_ACCESS_KEY_ID="staging-access-key",
+        )):
+            self.assertEqual(private_storage_separation_check(None)[0].id, "uploads.E008")
+
+    def test_unsigned_or_custom_domain_private_aliases_fail_closed(self):
+        for alias, check in (
+            ("bulk_staging", private_bulk_staging_check),
+            ("private_clinical_assets", private_clinical_assets_check),
+        ):
+            for unsafe_options in (
+                {"default_acl": "private", "querystring_auth": False, "custom_domain": None},
+                {"default_acl": "private", "querystring_auth": True, "custom_domain": "public.invalid"},
+                {"default_acl": None, "querystring_auth": True, "custom_domain": None},
+            ):
+                settings_values = self.private_settings()
+                settings_values["STORAGES"] = dict(settings_values["STORAGES"])
+                settings_values["STORAGES"][alias] = {
+                    "BACKEND": "storages.backends.s3.S3Storage",
+                    "OPTIONS": unsafe_options,
+                }
+                with self.subTest(alias=alias, options=unsafe_options), override_settings(**settings_values):
+                    self.assertTrue(check(None))
+
+
+class PrivateClinicalAssetAuthorizationTests(TestCase):
+    def setUp(self):
+        self.clinical_temp = tempfile.TemporaryDirectory()
+        self.settings_override = override_settings(
+            CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE=False,
+            PRIVATE_CLINICAL_ASSETS_ROOT=self.clinical_temp.name,
+        )
+        self.settings_override.enable()
+        self.clinic = Organization.objects.create(clinic_id="AUTH-CLINIC", name="Authorized Clinic", organization_type="clinic")
+        self.other_clinic = Organization.objects.create(clinic_id="OTHER-CLINIC", name="Other Clinic", organization_type="clinic")
+        self.hospital = Organization.objects.create(clinic_id="AUTH-HOSP", name="Authorized Hospital", organization_type="hospital")
+        self.other_hospital = Organization.objects.create(clinic_id="OTHER-HOSP", name="Other Hospital", organization_type="hospital")
+        self.branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="MAIN", name="Main")
+        self.other_branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="OTHER", name="Other")
+        self.patient = Patient.objects.create(patient_id="AUTH-PAT", first_name="Synthetic", last_name="Patient", date_of_birth=date(1980, 1, 1), sex="female", assigned_clinic=self.clinic, assigned_branch=self.branch)
+        self.referral = HospitalReferral.objects.create(source_hospital=self.hospital, patient=self.patient, first_name="Synthetic", last_name="Patient", hospital_mrn="AUTH-001", reason_for_referral="Synthetic", matched_clinic=self.clinic, matched_branch=self.branch)
+        self.encounter = ScreeningEncounter.objects.create(encounter_id="AUTH-ENC", patient=self.patient, encounter_date=date(2026, 8, 15), originating_organization=self.clinic, service_branch=self.branch, hospital_referral=self.referral)
+        self.object_key = "clinical-assets/synthetic/authorization-image.jpg"
+        get_private_clinical_storage().save(self.object_key, ContentFile(image_bytes()))
+        self.upload = ImageUpload.objects.create(
+            image_upload_id="AUTH-UPLOAD", encounter=self.encounter, patient=self.patient,
+            eye_laterality="left", image_file="", storage_kind="private_clinical",
+            private_object_key=self.object_key, content_sha256="a" * 64,
+            source_format="JPEG", asset_organization=self.clinic, asset_branch=self.branch,
+        )
+        self.url = reverse("image-upload-content", args=[self.upload.pk])
+        self.client = APIClient()
+
+    def tearDown(self):
+        self.settings_override.disable()
+        self.clinical_temp.cleanup()
+
+    def user(self, username, roles=(), organization=None, branch=None, internal=False, superuser=False):
+        user = User.objects.create_user(username, is_superuser=superuser, is_staff=superuser)
+        for role in roles:
+            user.groups.add(Group.objects.get_or_create(name=role)[0])
+        if organization:
+            UserOrganization.objects.create(user=user, organization=organization)
+        if branch:
+            UserBranchAccess.objects.create(user=user, branch=branch)
+        if internal:
+            UserSecurityProfile.objects.create(user=user, is_internal_sentinel_staff=True)
+        return user
+
+    def status_for(self, user=None):
+        self.client.force_authenticate(user=user)
+        response = self.client.get(self.url)
+        if response.status_code == 200:
+            response.close()
+        return response.status_code
+
+    def test_unauthenticated_access_is_denied(self):
+        self.assertIn(self.status_for(), (401, 403))
+
+    def test_same_clinic_clinician_with_correct_branch_is_allowed(self):
+        user = self.user("clinic-optometrist", ("optometrist",), self.clinic, self.branch)
+        self.client.force_authenticate(user)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(self.object_key, " ".join(response.headers.values()))
+        response.close()
+
+    def test_same_clinic_clinician_with_wrong_branch_is_denied(self):
+        user = self.user("wrong-branch", ("optometrist", "ops_admin"), self.clinic, self.other_branch)
+        self.assertEqual(self.status_for(user), 403)
+
+    def test_other_clinic_clinical_roles_are_denied(self):
+        other_branch = OrganizationBranch.objects.create(organization=self.other_clinic, branch_code="MAIN", name="Main")
+        for role in ("optometrist", "reviewer"):
+            with self.subTest(role=role):
+                user = self.user(f"other-{role}", (role,), self.other_clinic, other_branch)
+                self.assertEqual(self.status_for(user), 403)
+
+    def test_non_clinical_clinic_role_is_denied(self):
+        user = self.user("clinic-admin", ("clinic_admin",), self.clinic, self.branch)
+        self.assertEqual(self.status_for(user), 403)
+
+    def test_internal_access_requires_marker_and_exact_role(self):
+        role_only = self.user("role-only", ("ops_admin",))
+        marker_only = self.user("marker-only", internal=True)
+        authorized = self.user("authorized-ops", ("sentinel_ops",), internal=True)
+        self.assertEqual(self.status_for(role_only), 403)
+        self.assertEqual(self.status_for(marker_only), 403)
+        self.assertEqual(self.status_for(authorized), 200)
+
+    def test_superuser_status_alone_is_denied(self):
+        self.assertEqual(self.status_for(self.user("super-only", superuser=True)), 403)
+
+    def test_hospital_access_requires_exact_hospital_and_canonical_release(self):
+        hospital_user = self.user("hospital-user", ("hospital_admin",), self.hospital)
+        other_hospital_user = self.user("other-hospital-user", ("hospital_admin",), self.other_hospital)
+        self.assertEqual(self.status_for(hospital_user), 403)
+        report = StructuredReport.objects.create(
+            report_id="AUTH-REPORT", encounter=self.encounter, patient=self.patient,
+            review_date=date(2026, 8, 15), report_status="issued",
+            distribution_status="released_to_hospital", hospital_released_at=timezone.now(),
+        )
+        self.referral.report = report
+        self.referral.report_ready = True
+        self.referral.save(update_fields=["report", "report_ready"])
+        self.assertEqual(self.status_for(hospital_user), 200)
+        self.assertEqual(self.status_for(other_hospital_user), 403)
 
 
 class BulkImportWorkflowTests(TestCase):
@@ -224,6 +416,7 @@ class BulkImportWorkflowTests(TestCase):
         self.assertEqual(upload.image_file.name, "")
         self.assertEqual(upload.dataset_eligibility, "excluded")
         self.assertTrue(os.path.exists(os.path.join(self.clinical_temp.name, upload.private_object_key)))
+        self.user.groups.add(Group.objects.get_or_create(name="optometrist")[0])
         content = self.client.get(reverse("image-upload-content", args=[upload.pk]))
         self.assertEqual(content.status_code, 200)
         self.assertEqual(content["Cache-Control"], "private, no-store, max-age=0")
