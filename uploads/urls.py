@@ -10,6 +10,8 @@ from .views import (
     MobileTransferPublicView,
     MobileTransferReviewView,
     MobileTransferImageReviewView,
+    MobileTransferPublicImageView,
+    MobileTransferReviewImageView,
 )
 from .bulk_views import (
     BulkImageImportConfirmView,
@@ -33,8 +35,10 @@ urlpatterns = [
     path("bulk-imports/<uuid:import_id>/confirm/", BulkImageImportConfirmView.as_view(), name="bulk-import-confirm"),
     path("mobile-transfer/encounter/<int:encounter_id>/", MobileTransferCreateView.as_view(), name="mobile-transfer-create"),
     path("mobile-transfer/public/<str:token>/", MobileTransferPublicView.as_view(), name="mobile-transfer-public"),
+    path("mobile-transfer/public/<str:token>/images/<int:image_id>/content/", MobileTransferPublicImageView.as_view(), name="mobile-transfer-public-image"),
     path("mobile-transfer/<uuid:session_id>/", MobileTransferReviewView.as_view(), name="mobile-transfer-review"),
     path("mobile-transfer/<uuid:session_id>/images/<int:image_id>/review/", MobileTransferImageReviewView.as_view(), name="mobile-transfer-image-review"),
+    path("mobile-transfer/<uuid:session_id>/images/<int:image_id>/content/", MobileTransferReviewImageView.as_view(), name="mobile-transfer-review-image"),
     path("", ImageUploadListCreateView.as_view(), name="image-upload-list-create"),
     path("<int:pk>/", ImageUploadDetailView.as_view(), name="image-upload-detail"),
     path("encounter/<int:encounter_id>/", EncounterImageUploadListView.as_view(), name="encounter-image-uploads"),

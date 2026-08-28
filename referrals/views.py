@@ -195,8 +195,7 @@ class HospitalIssuedReportDetailView(APIView):
                     "image_quality": upload.image_quality,
                     "url": (
                         request.build_absolute_uri(f"/api/uploads/{upload.pk}/content/")
-                        if upload.storage_kind == "private_clinical"
-                        else request.build_absolute_uri(image_file.url) if image_file else ""
+                        if image_file or upload.private_object_key else ""
                     ),
                 }
             )
@@ -463,8 +462,7 @@ class HospitalPatientDetailView(APIView):
                             "uploaded_at": upload.uploaded_at,
                             "image_file": (
                                 request.build_absolute_uri(f"/api/uploads/{upload.pk}/content/")
-                                if upload.storage_kind == "private_clinical"
-                                else request.build_absolute_uri(image_file.url) if image_file else ""
+                                if image_file or upload.private_object_key else ""
                             ),
                             "ai_analysis": (
                                 {

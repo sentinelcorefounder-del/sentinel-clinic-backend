@@ -1,5 +1,7 @@
 import os
 
+from django.http import FileResponse, Http404
+from django.shortcuts import get_object_or_404
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import generics, status
 from rest_framework.response import Response
@@ -27,6 +29,36 @@ class MyPartnerNotificationListView(generics.ListAPIView):
         if self.request.query_params.get("unread", "").lower() == "true":
             queryset = queryset.filter(is_read=False)
         return queryset
+
+
+class OrganizationLogoContentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        organization = get_object_or_404(Organization, pk=pk)
+        linked = getattr(request.user, "organization_link", None)
+        roles = set(request.user.groups.values_list("name", flat=True))
+        if not (
+            linked and linked.organization_id == organization.id
+            or request.user.is_superuser
+            or roles & {"ops_admin", "sentinel_ops", "super_admin"}
+        ):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You do not have access to this organization logo.")
+        if not organization.logo:
+            raise Http404("Logo not found.")
+        try:
+            stream = organization.logo.open("rb")
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise Http404("Logo not found.") from exc
+        content_type = (
+            "image/png" if organization.logo.name.lower().endswith(".png")
+            else "image/jpeg"
+        )
+        response = FileResponse(stream, content_type=content_type)
+        response["Cache-Control"] = "private, max-age=300"
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
 
 
 class MyPartnerNotificationMarkReadView(APIView):

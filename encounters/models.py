@@ -439,6 +439,21 @@ class OcularInvestigation(models.Model):
         upload_to="ocular_investigations/",
         validators=[FileExtensionValidator(["pdf", "jpg", "jpeg", "png"])],
     )
+    storage_kind = models.CharField(
+        max_length=24,
+        choices=[("default_media", "Default media"), ("private_clinical", "Private clinical")],
+        default="default_media",
+    )
+    private_object_key = models.CharField(max_length=255, blank=True, default="")
+    content_sha256 = models.CharField(max_length=64, blank=True, default="")
+    asset_organization = models.ForeignKey(
+        "organizations.Organization", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="ocular_investigation_assets",
+    )
+    asset_branch = models.ForeignKey(
+        "organizations.OrganizationBranch", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="ocular_investigation_assets",
+    )
     original_filename = models.CharField(max_length=255, blank=True, default="")
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -451,6 +466,20 @@ class OcularInvestigation(models.Model):
 
     class Meta:
         ordering = ["-performed_at", "-uploaded_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(storage_kind="default_media")
+                    | (
+                        models.Q(private_object_key__gt="")
+                        & models.Q(content_sha256__gt="")
+                        & models.Q(asset_organization__isnull=False)
+                        & models.Q(asset_branch__isnull=False)
+                    )
+                ),
+                name="private_investigation_requires_metadata",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.investigation_id} - {self.encounter.encounter_id}"

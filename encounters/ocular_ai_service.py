@@ -159,7 +159,12 @@ def run_ocular_ai_review(
         },
     ]
     for index, item in enumerate(investigations):
-        mime_type, data_url = _data_url(item.file)
+        from encounters.clinical_assets import open_ocular_investigation
+        file_obj = open_ocular_investigation(item)
+        try:
+            mime_type, data_url = _data_url(file_obj)
+        finally:
+            file_obj.close()
         if mime_type == "application/pdf":
             content.append({
                 "type": "input_file",

@@ -99,10 +99,9 @@ class ImageUploadSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        if instance.storage_kind == "private_clinical":
-            path = f"/api/uploads/{instance.pk}/content/"
-            request = self.context.get("request")
-            data["image_file"] = request.build_absolute_uri(path) if request else path
+        path = f"/api/uploads/{instance.pk}/content/"
+        request = self.context.get("request")
+        data["image_file"] = request.build_absolute_uri(path) if request else path
         return data
 
     def validate(self, attrs):

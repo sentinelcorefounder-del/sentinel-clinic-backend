@@ -35,6 +35,14 @@ class OrganizationSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.logo:
+            path = f"/api/organizations/{instance.pk}/logo/"
+            request = self.context.get("request")
+            data["logo"] = request.build_absolute_uri(path) if request else path
+        return data
+
     def validate_logo(self, logo):
         if logo.size > 2 * 1024 * 1024:
             raise serializers.ValidationError("Logo must be 2 MB or smaller.")

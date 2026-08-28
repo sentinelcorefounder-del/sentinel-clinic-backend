@@ -1,16 +1,17 @@
 from datetime import date
 from decimal import Decimal
+import tempfile
 
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from unittest.mock import patch
 
-from organizations.models import Organization, OrganizationProfile
+from organizations.models import Organization, OrganizationBranch, OrganizationProfile
 from patients.models import Patient
-from users.models import UserOrganization
+from users.models import UserBranchAccess, UserOrganization
 from finance.models import (
     OrganizationWallet,
     PartnerContract,
@@ -30,6 +31,12 @@ from .models import (
 
 class OcularDiagnosticWorkflowTests(TestCase):
     def setUp(self):
+        self.clinical_temp = tempfile.TemporaryDirectory()
+        self.storage_override = override_settings(
+            CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE=False,
+            PRIVATE_CLINICAL_ASSETS_ROOT=self.clinical_temp.name,
+        )
+        self.storage_override.enable()
         self.clinic = Organization.objects.create(
             clinic_id="CLINIC-OCULAR",
             name="Ocular Test Clinic",
@@ -42,10 +49,16 @@ class OcularDiagnosticWorkflowTests(TestCase):
             workflow_mode="clinic_managed",
             default_payment_responsibility="patient",
         )
+        self.branch = OrganizationBranch.objects.create(
+            organization=self.clinic, branch_code="MAIN", name="Main",
+            is_head_office=True,
+        )
         self.user = User.objects.create_user("ocular-clinician", password="test")
+        self.user.groups.add(Group.objects.create(name="optometrist"))
         UserOrganization.objects.create(
             user=self.user, organization=self.clinic
         )
+        UserBranchAccess.objects.create(user=self.user, branch=self.branch, is_default=True)
         self.patient = Patient.objects.create(
             patient_id="PAT-OCULAR-1",
             first_name="Test",
@@ -73,6 +86,10 @@ class OcularDiagnosticWorkflowTests(TestCase):
             consent_date=date(2026, 7, 26),
             captured_by="Test clinician",
         )
+
+    def tearDown(self):
+        self.storage_override.disable()
+        self.clinical_temp.cleanup()
 
     def payload(self, programme):
         return {
@@ -164,6 +181,31 @@ class OcularDiagnosticWorkflowTests(TestCase):
         self.assertEqual(investigation.encounter, encounter)
         self.assertEqual(investigation.investigation_type, "visual_field")
         self.assertEqual(investigation.original_filename, "right-field.pdf")
+        self.assertEqual(investigation.storage_kind, "private_clinical")
+        self.assertEqual(investigation.file.name, "")
+        self.assertNotIn("right-field", investigation.private_object_key)
+        self.assertIn(
+            f"/api/encounters/ocular-investigations/{investigation.pk}/content/",
+            response.data["file"],
+        )
+        content = self.client.get(
+            f"/api/encounters/ocular-investigations/{investigation.pk}/content/"
+        )
+        self.assertEqual(content.status_code, 200)
+        self.assertNotIn(investigation.private_object_key, str(content.headers))
+        content.close()
+
+        unauthorized = User.objects.create_user("ocular-wrong-branch")
+        unauthorized.groups.add(Group.objects.get(name="optometrist"))
+        UserOrganization.objects.create(user=unauthorized, organization=self.clinic)
+        self.client.force_authenticate(unauthorized)
+        self.assertEqual(
+            self.client.get(
+                f"/api/encounters/ocular-investigations/{investigation.pk}/content/"
+            ).status_code,
+            403,
+        )
+        self.client.force_authenticate(self.user)
 
     def test_ai_review_requires_locked_clinician_assessment(self):
         encounter = self.create_ocular_encounter()

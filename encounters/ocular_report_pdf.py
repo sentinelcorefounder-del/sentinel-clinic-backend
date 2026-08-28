@@ -148,7 +148,8 @@ def build_ocular_report_pdf(assessment):
                 from uploads.clinical_assets import open_image_upload
                 file_obj = open_image_upload(item)
             else:
-                file_obj = item.file
+                from encounters.clinical_assets import open_ocular_investigation
+                file_obj = open_ocular_investigation(item)
             if kind == "fundus":
                 title = f"Fundus photograph — {item.get_eye_laterality_display()}"
                 caption_key = f"fundus:{item.id}"

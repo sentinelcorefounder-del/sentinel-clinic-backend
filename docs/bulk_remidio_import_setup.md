@@ -36,6 +36,21 @@ ordinary/public media backend is never a fallback for bulk imports.
 Development and tests use isolated `.bulk_staging` and `.clinical_assets`
 filesystem directories, not ordinary media storage.
 
+The same private-storage boundary now applies to all newly uploaded clinical
+images. Normal clinic/laptop uploads and confirmed QR/mobile images are written
+to the permanent clinical-assets alias with generated, non-identifying keys.
+QR/mobile images awaiting confirmation use generated keys under
+`bulk-staging/mobile/`; expiry, cancellation, rejection, or the
+`cleanup_mobile_transfers` management command removes unconfirmed objects.
+Legacy default-storage database names remain on the default media alias and are
+served through authenticated application endpoints; they are not rewritten or
+migrated by this rollout.
+
+New ocular-investigation files and finalized clinical PDFs also use permanent
+private clinical storage. Organization logos and existing finance evidence keep
+their historical default-storage identity, but application pages and protected
+download actions read them server-side without requiring a public bucket URL.
+
 Confirmation uses generated keys with no patient data. Selected files are
 copied to permanent storage before one atomic database commit. Failed copies
 create no clinical attachments; successfully prepared objects are recorded and

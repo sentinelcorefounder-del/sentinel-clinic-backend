@@ -243,14 +243,10 @@ class OpsReportSerializer(serializers.ModelSerializer):
         images = []
         for upload in obj.encounter.image_uploads.all().order_by("eye_laterality"):
             file_obj = getattr(upload, "image_file", None)
-            url = ""
-            if file_obj:
-                try:
-                    url = file_obj.url
-                    if request:
-                        url = request.build_absolute_uri(url)
-                except Exception:
-                    url = ""
+            path = f"/api/uploads/{upload.pk}/content/"
+            url = (
+                request.build_absolute_uri(path) if request else path
+            ) if file_obj or upload.private_object_key else ""
             analysis = getattr(upload, "ai_analysis", None)
             images.append(
                 {

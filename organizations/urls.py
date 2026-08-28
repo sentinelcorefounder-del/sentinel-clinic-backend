@@ -11,6 +11,7 @@ from .views import (
     MyPartnerNotificationListView,
     MyPartnerNotificationMarkReadView,
     MyPartnerNotificationMarkAllReadView,
+    OrganizationLogoContentView,
 )
 
 urlpatterns = [
@@ -22,6 +23,7 @@ urlpatterns = [
     path("provision/", ClinicProvisionView.as_view(), name="clinic-provision"),
     path("hospital/provision/", HospitalProvisionView.as_view(), name="hospital-provision"),
     path("<int:pk>/", OrganizationDetailView.as_view(), name="organization-detail"),
+    path("<int:pk>/logo/", OrganizationLogoContentView.as_view(), name="organization-logo-content"),
     path("<int:organization_id>/branches/", OrganizationBranchListCreateView.as_view(), name="organization-branches"),
     path("<int:organization_id>/branches/<int:pk>/", OrganizationBranchDetailView.as_view(), name="organization-branch-detail"),
 ]

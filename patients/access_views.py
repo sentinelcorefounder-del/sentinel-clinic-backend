@@ -252,8 +252,8 @@ class ClinicHistoricalRecordView(APIView):
                         "image_quality": upload.image_quality,
                         "uploaded_at": upload.uploaded_at,
                         "image_file": (
-                            request.build_absolute_uri(file_obj.url)
-                            if file_obj
+                            request.build_absolute_uri(f"/api/uploads/{upload.pk}/content/")
+                            if file_obj or upload.private_object_key
                             else ""
                         ),
                     }

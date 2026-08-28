@@ -1863,8 +1863,7 @@ class OpsPatientDetailView(OpsOnlyMixin, APIView):
                         "retake_required": getattr(img, "retake_required", False),
                         "url": (
                             request.build_absolute_uri(f"/api/uploads/{img.pk}/content/")
-                            if getattr(img, "storage_kind", "public_media") == "private_clinical"
-                            else request.build_absolute_uri(image_file.url) if image_file else ""
+                            if image_file or getattr(img, "private_object_key", "") else ""
                         ),
                     }
                 )
@@ -1971,7 +1970,7 @@ class OpsHospitalDetailView(OpsOnlyMixin, APIView):
                     "screening_fee_amount": hospital.screening_fee_amount,
                     "hospital_commission_amount": hospital.hospital_commission_amount,
                     "currency": hospital.currency,
-                    "logo": request.build_absolute_uri(hospital.logo.url) if hospital.logo else "",
+                    "logo": request.build_absolute_uri(f"/api/organizations/{hospital.pk}/logo/") if hospital.logo else "",
                     "report_footer_note": hospital.report_footer_note,
                 },
                 "referrals": OpsReferralSerializer(referrals, many=True).data,
@@ -2109,7 +2108,7 @@ class OpsClinicDetailView(OpsOnlyMixin, APIView):
                     "phone": clinic.phone,
                     "address": clinic.address,
                     "is_active": clinic.is_active,
-                    "logo": request.build_absolute_uri(clinic.logo.url) if clinic.logo else "",
+                    "logo": request.build_absolute_uri(f"/api/organizations/{clinic.pk}/logo/") if clinic.logo else "",
                     "report_footer_note": clinic.report_footer_note,
                     "capability_profile": capability_profile_data(clinic),
                 },

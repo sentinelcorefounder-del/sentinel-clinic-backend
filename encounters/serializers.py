@@ -27,6 +27,13 @@ class OcularInvestigationSerializer(serializers.ModelSerializer):
         user = obj.uploaded_by
         return (user.get_full_name() or user.username) if user else ""
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        path = f"/api/encounters/ocular-investigations/{instance.pk}/content/"
+        request = self.context.get("request")
+        data["file"] = request.build_absolute_uri(path) if request else path
+        return data
+
     def validate_file(self, value):
         if value.size > 25 * 1024 * 1024:
             raise serializers.ValidationError("Maximum file size is 25 MB.")

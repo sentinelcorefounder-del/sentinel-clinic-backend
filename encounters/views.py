@@ -4,11 +4,13 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
-from django.http import HttpResponse
+from django.http import FileResponse, HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 import uuid
@@ -644,6 +646,14 @@ class OcularInvestigationListCreateView(generics.ListCreateAPIView):
             raise PermissionDenied(
                 "This encounter does not include ocular diagnostics."
             )
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not branch or not (
+            self.request.user.branch_access.filter(branch=branch).exists()
+            or self.request.user.branch_access.filter(
+                branch__organization=org, has_all_branch_access=True,
+            ).exists()
+        ):
+            raise PermissionDenied("You do not have access to this encounter branch.")
         return encounter
 
     def get_queryset(self):
@@ -652,14 +662,26 @@ class OcularInvestigationListCreateView(generics.ListCreateAPIView):
         ).select_related("uploaded_by")
 
     def perform_create(self, serializer):
+        from uploads.private_uploads import delete_private_object, save_private_upload
+
         encounter = self._encounter()
         uploaded_file = serializer.validated_data["file"]
-        serializer.save(
-            encounter=encounter,
-            investigation_id=f"INV-{uuid.uuid4().hex[:10].upper()}",
-            original_filename=uploaded_file.name,
-            uploaded_by=self.request.user,
-        )
+        organization = encounter.originating_organization or encounter.patient.assigned_clinic
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        private = save_private_upload(uploaded_file, category="investigations")
+        serializer.validated_data.pop("file")
+        try:
+            serializer.save(
+                encounter=encounter, file="", storage_kind="private_clinical",
+                private_object_key=private["key"], content_sha256=private["sha256"],
+                asset_organization=organization, asset_branch=branch,
+                investigation_id=f"INV-{uuid.uuid4().hex[:10].upper()}",
+                original_filename=uploaded_file.name,
+                uploaded_by=self.request.user,
+            )
+        except Exception:
+            delete_private_object(private["key"])
+            raise
 
 
 class OcularInvestigationDetailView(generics.RetrieveDestroyAPIView):
@@ -682,7 +704,56 @@ class OcularInvestigationDetailView(generics.RetrieveDestroyAPIView):
                 "This investigation is part of an AI review audit record "
                 "and cannot be deleted."
             )
+        key = instance.private_object_key if instance.storage_kind == "private_clinical" else ""
         instance.delete()
+        if key:
+            from uploads.private_uploads import delete_private_object
+            delete_private_object(key)
+
+
+class OcularInvestigationContentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from encounters.clinical_assets import open_ocular_investigation
+        from uploads.access import can_access_clinical_asset
+
+        investigation = get_object_or_404(
+            OcularInvestigation.objects.select_related(
+                "asset_organization", "asset_branch", "encounter__patient__assigned_clinic",
+                "encounter__patient__assigned_branch", "encounter__hospital_referral__report",
+            ), pk=pk,
+        )
+        organization = (
+            investigation.asset_organization
+            or investigation.encounter.originating_organization
+            or investigation.encounter.patient.assigned_clinic
+        )
+        branch = (
+            investigation.asset_branch
+            or investigation.encounter.service_branch
+            or investigation.encounter.patient.assigned_branch
+        )
+        if not can_access_clinical_asset(
+            request.user, encounter=investigation.encounter,
+            organization=organization, branch=branch,
+        ):
+            raise PermissionDenied("You do not have access to this investigation.")
+        name = investigation.private_object_key or investigation.file.name
+        content_type = (
+            "application/pdf" if name.lower().endswith(".pdf")
+            else "image/png" if name.lower().endswith(".png")
+            else "image/jpeg"
+        )
+        response = FileResponse(
+            open_ocular_investigation(investigation),
+            content_type=content_type,
+        )
+        response["Cache-Control"] = "private, no-store, max-age=0"
+        response["Pragma"] = "no-cache"
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Content-Disposition"] = "inline"
+        return response
 
 
 class OcularAIReviewListCreateView(APIView):

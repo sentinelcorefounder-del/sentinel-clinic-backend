@@ -142,6 +142,8 @@ class PendingMobileImage(models.Model):
         upload_to="mobile_transfer_pending/",
         validators=[FileExtensionValidator(["jpg", "jpeg", "png"])],
     )
+    staged_object_key = models.CharField(max_length=255, blank=True, default="")
+    permanent_object_key = models.CharField(max_length=255, blank=True, default="")
     original_filename = models.CharField(max_length=255)
     checksum_sha256 = models.CharField(max_length=64)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
@@ -168,7 +170,15 @@ class PendingMobileImage(models.Model):
             models.UniqueConstraint(
                 fields=["session", "checksum_sha256"],
                 name="unique_mobile_image_per_session",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(image_file="")
+                    | models.Q(staged_object_key__gt="")
+                    | models.Q(permanent_object_key__gt="")
+                ),
+                name="pending_mobile_image_has_storage_identity",
+            ),
         ]
 
     def __str__(self):
