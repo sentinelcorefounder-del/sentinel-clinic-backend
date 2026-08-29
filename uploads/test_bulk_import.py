@@ -223,16 +223,18 @@ class PrivateStorageFailureTests(TestCase):
 class PrivateClinicalAssetAuthorizationTests(TestCase):
     def setUp(self):
         self.clinical_temp = tempfile.TemporaryDirectory()
+        self.media_temp = tempfile.TemporaryDirectory()
         self.settings_override = override_settings(
             CLINICAL_ASSETS_USE_PRIVATE_OBJECT_STORAGE=False,
             PRIVATE_CLINICAL_ASSETS_ROOT=self.clinical_temp.name,
+            MEDIA_ROOT=self.media_temp.name,
         )
         self.settings_override.enable()
         self.clinic = Organization.objects.create(clinic_id="AUTH-CLINIC", name="Authorized Clinic", organization_type="clinic")
         self.other_clinic = Organization.objects.create(clinic_id="OTHER-CLINIC", name="Other Clinic", organization_type="clinic")
         self.hospital = Organization.objects.create(clinic_id="AUTH-HOSP", name="Authorized Hospital", organization_type="hospital")
         self.other_hospital = Organization.objects.create(clinic_id="OTHER-HOSP", name="Other Hospital", organization_type="hospital")
-        self.branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="MAIN", name="Main")
+        self.branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="MAIN", name="Main", is_head_office=True)
         self.other_branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="OTHER", name="Other")
         self.patient = Patient.objects.create(patient_id="AUTH-PAT", first_name="Synthetic", last_name="Patient", date_of_birth=date(1980, 1, 1), sex="female", assigned_clinic=self.clinic, assigned_branch=self.branch)
         self.referral = HospitalReferral.objects.create(source_hospital=self.hospital, patient=self.patient, first_name="Synthetic", last_name="Patient", hospital_mrn="AUTH-001", reason_for_referral="Synthetic", matched_clinic=self.clinic, matched_branch=self.branch)
@@ -251,6 +253,7 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
     def tearDown(self):
         self.settings_override.disable()
         self.clinical_temp.cleanup()
+        self.media_temp.cleanup()
 
     def user(self, username, roles=(), organization=None, branch=None, internal=False, superuser=False):
         user = User.objects.create_user(username, is_superuser=superuser, is_staff=superuser)
@@ -282,6 +285,33 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
         self.assertNotIn(self.object_key, " ".join(response.headers.values()))
         response.close()
 
+    def test_same_clinic_operational_roles_with_correct_branch_are_allowed(self):
+        for role in ("clinic_admin", "clinic_screener"):
+            with self.subTest(role=role):
+                user = self.user(f"clinic-{role}", (role,), self.clinic, self.branch)
+                self.assertEqual(self.status_for(user), 200)
+
+    def test_legacy_default_storage_image_and_main_branch_user_are_allowed(self):
+        legacy_upload = ImageUpload.objects.create(
+            image_upload_id="AUTH-LEGACY-UPLOAD",
+            encounter=self.encounter,
+            patient=self.patient,
+            eye_laterality="right",
+            image_file=SimpleUploadedFile(
+                "legacy.jpg", image_bytes(), content_type="image/jpeg"
+            ),
+            storage_kind="public_media",
+            asset_organization=None,
+            asset_branch=None,
+        )
+        user = self.user("legacy-clinic-admin", ("clinic_admin",), self.clinic)
+        self.client.force_authenticate(user)
+        response = self.client.get(
+            reverse("image-upload-content", args=[legacy_upload.pk])
+        )
+        self.assertEqual(response.status_code, 200)
+        response.close()
+
     def test_same_clinic_clinician_with_wrong_branch_is_denied(self):
         user = self.user("wrong-branch", ("optometrist", "ops_admin"), self.clinic, self.other_branch)
         self.assertEqual(self.status_for(user), 403)
@@ -293,8 +323,8 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
                 user = self.user(f"other-{role}", (role,), self.other_clinic, other_branch)
                 self.assertEqual(self.status_for(user), 403)
 
-    def test_non_clinical_clinic_role_is_denied(self):
-        user = self.user("clinic-admin", ("clinic_admin",), self.clinic, self.branch)
+    def test_clinic_member_without_operational_or_clinical_role_is_denied(self):
+        user = self.user("clinic-member", (), self.clinic, self.branch)
         self.assertEqual(self.status_for(user), 403)
 
     def test_internal_access_requires_marker_and_exact_role(self):

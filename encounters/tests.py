@@ -198,6 +198,12 @@ class OcularDiagnosticWorkflowTests(TestCase):
         unauthorized = User.objects.create_user("ocular-wrong-branch")
         unauthorized.groups.add(Group.objects.get(name="optometrist"))
         UserOrganization.objects.create(user=unauthorized, organization=self.clinic)
+        other_branch = OrganizationBranch.objects.create(
+            organization=self.clinic,
+            branch_code="OTHER",
+            name="Other",
+        )
+        UserBranchAccess.objects.create(user=unauthorized, branch=other_branch)
         self.client.force_authenticate(unauthorized)
         self.assertEqual(
             self.client.get(
