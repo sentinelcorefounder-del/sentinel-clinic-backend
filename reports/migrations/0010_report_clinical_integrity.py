@@ -62,6 +62,8 @@ def create_legacy_baselines(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    atomic = False
+
     dependencies = [
         ("organizations", "0008_alter_organization_organization_type"),
         ("reports", "0009_report_attachment_selection"),
@@ -141,5 +143,9 @@ class Migration(migrations.Migration):
             model_name="reportstatusevent",
             constraint=models.UniqueConstraint(condition=~models.Q(idempotency_key=""), fields=("report", "idempotency_key"), name="report_unique_status_event_idempotency"),
         ),
-        migrations.RunPython(create_legacy_baselines, migrations.RunPython.noop),
+        migrations.RunPython(
+            create_legacy_baselines,
+            migrations.RunPython.noop,
+            atomic=True,
+        ),
     ]

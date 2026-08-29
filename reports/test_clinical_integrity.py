@@ -1,11 +1,13 @@
 from datetime import date
+import importlib
 import tempfile
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.test import TestCase, override_settings
+from django.db.migrations.operations.special import RunPython
+from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
 from encounters.models import ScreeningEncounter
@@ -18,6 +20,17 @@ from reports.clinical_integrity import (
 )
 from reports.models import ReportStatusEvent, StructuredReport, StructuredReportVersion
 from users.models import UserBranchAccess, UserOrganization
+
+
+class RetinalReportClinicalIntegrityMigrationTests(SimpleTestCase):
+    def test_legacy_baseline_runs_atomically_inside_non_atomic_migration(self):
+        migration_module = importlib.import_module(
+            "reports.migrations.0010_report_clinical_integrity"
+        )
+
+        self.assertIs(migration_module.Migration.atomic, False)
+        self.assertIsInstance(migration_module.Migration.operations[-1], RunPython)
+        self.assertIs(migration_module.Migration.operations[-1].atomic, True)
 
 
 class RetinalReportClinicalIntegrityTests(TestCase):
