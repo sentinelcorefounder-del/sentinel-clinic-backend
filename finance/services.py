@@ -22,6 +22,12 @@ from .models import (
     ServicePartnerCorrectionRequest,
     ServicePartnerSettlementBatch,
     ServicePartnerSettlementItem,
+    EncounterSponsorship,
+    SponsorshipEvent,
+    TreasuryTransfer,
+    TreasuryTransferEvent,
+    OrganizationWallet,
+    WalletLedgerEntry,
 )
 
 
@@ -658,7 +664,7 @@ def reconcile_finance_controls():
 
 
 @transaction.atomic
-def price_encounter(encounter, actor=None, force=False):
+def price_encounter(encounter, actor=None, force=False, contract_override=None):
     record = EncounterFinancialRecord.objects.select_for_update().filter(encounter=encounter).first()
     if record is None:
         record = EncounterFinancialRecord.objects.create(encounter=encounter)
@@ -671,7 +677,7 @@ def price_encounter(encounter, actor=None, force=False):
     } and not force:
         raise ValidationError("This financial record has progressed beyond the safe repricing stage.")
 
-    contract = resolve_contract(encounter)
+    contract = contract_override or resolve_contract(encounter)
     if contract is None:
         record.status = EncounterFinancialRecord.Status.EXCEPTION
         record.exception_reason = "No active partner contract matched this encounter."
@@ -1410,6 +1416,13 @@ def capture_financial_record_wallet_reservation(financial_record, actor=None, re
     from .models import WalletReservation
 
     record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    sponsorship = EncounterSponsorship.objects.select_for_update().filter(
+        financial_record=record,
+        status=EncounterSponsorship.Status.APPROVED,
+    ).first()
+    if sponsorship:
+        capture_encounter_sponsorship(sponsorship, actor=actor)
+        return WalletReservation.objects.get(pk=sponsorship.reservation_id)
     reservation = record.wallet_reservations.filter(
         status__in=[WalletReservation.Status.ACTIVE, WalletReservation.Status.PARTIALLY_CAPTURED]
     ).order_by("created_at").first()
@@ -1824,3 +1837,433 @@ def attach_encounter_to_service_session(encounter, session, actor):
         },
     )
     return encounter
+
+
+def _sponsorship_event(sponsorship, action, actor, source, target, key, reason="", metadata=None):
+    return SponsorshipEvent.objects.create(
+        sponsorship=sponsorship, action=action, actor=actor,
+        source_status=source, target_status=target, reason=str(reason or "").strip(),
+        idempotency_key=key, metadata=metadata or {},
+    )
+
+
+@transaction.atomic
+def create_encounter_sponsorship(*, encounter, sponsor_wallet, category, reason,
+                                 idempotency_key, actor):
+    key = _require_idempotency_key(idempotency_key)
+    existing = EncounterSponsorship.objects.filter(idempotency_key=key).first()
+    if existing:
+        return existing
+    if EncounterSponsorship.objects.filter(encounter=encounter).exists():
+        raise ValidationError("This encounter already has a sponsorship record.")
+    if sponsor_wallet.organization.organization_type != "sentinel":
+        raise ValidationError("Sponsorship requires an existing Sentinel wallet.")
+    record = ensure_financial_record(encounter)
+    if record.status in {EncounterFinancialRecord.Status.UNPRICED, EncounterFinancialRecord.Status.EXCEPTION}:
+        contract_override = None
+        if not resolve_payer_organization(encounter) and encounter.originating_organization_id:
+            contract_override = _active_for_date(
+                PartnerContract.objects.filter(
+                    organization=encounter.originating_organization,
+                    programme=encounter.programme,
+                    status=PartnerContract.Status.ACTIVE,
+                ),
+                encounter.encounter_date,
+            ).order_by("-effective_from", "-id").first()
+        record = price_encounter(
+            encounter, actor=actor, force=True, contract_override=contract_override
+        )
+    if not record.pricing_rule_id or record.gross_amount <= 0:
+        raise ValidationError("Approved standard pricing is required before sponsorship.")
+    if record.captured_at or record.status in {
+        EncounterFinancialRecord.Status.CAPTURED,
+        EncounterFinancialRecord.Status.SETTLED,
+    }:
+        raise ValidationError("This encounter has already been financially captured.")
+    if record.wallet_reservations.exclude(status__in=["released", "cancelled"]).exists():
+        raise ValidationError("This encounter already has a wallet reservation.")
+    allocations = [
+        {
+            "role": allocation.beneficiary_role,
+            "organization_id": allocation.beneficiary_organization_id,
+            "organization": allocation.beneficiary_organization.name if allocation.beneficiary_organization else "",
+            "label": allocation.label,
+            "amount": str(allocation.amount),
+        }
+        for allocation in record.allocations.select_related("beneficiary_organization").order_by("id")
+    ]
+    sponsorship = EncounterSponsorship(
+        encounter=encounter, financial_record=record, sponsor_wallet=sponsor_wallet,
+        category=category, reason=str(reason or "").strip(), currency=record.currency,
+        patient_amount=Decimal("0.00"), gross_service_value=record.gross_amount,
+        pricing_snapshot=record.pricing_snapshot, allocation_snapshot=allocations,
+        idempotency_key=key, created_by=actor,
+    )
+    sponsorship.full_clean()
+    try:
+        with transaction.atomic():
+            sponsorship.save()
+    except IntegrityError as exc:
+        existing = EncounterSponsorship.objects.filter(idempotency_key=key).first()
+        if existing:
+            return existing
+        if EncounterSponsorship.objects.filter(encounter=encounter).exists():
+            raise ValidationError("This encounter already has a sponsorship record.") from exc
+        raise ValidationError("The sponsorship request conflicted with another update; refresh and retry.") from exc
+    _sponsorship_event(
+        sponsorship, "created", actor, "", sponsorship.status,
+        f"sponsorship:{sponsorship.pk}:created",
+        reason=sponsorship.reason,
+        metadata={"encounter_reference": encounter.encounter_id, "gross_service_value": str(record.gross_amount)},
+    )
+    return sponsorship
+
+
+@transaction.atomic
+def submit_encounter_sponsorship(sponsorship, *, actor):
+    sponsorship = EncounterSponsorship.objects.select_for_update().get(pk=sponsorship.pk)
+    if sponsorship.status == EncounterSponsorship.Status.SUBMITTED:
+        return sponsorship
+    if sponsorship.status != EncounterSponsorship.Status.DRAFT:
+        raise ValidationError("Only a draft sponsorship can be submitted.")
+    source = sponsorship.status
+    sponsorship.status = EncounterSponsorship.Status.SUBMITTED
+    sponsorship.submitted_at = timezone.now()
+    sponsorship.save(update_fields=["status", "submitted_at", "updated_at"])
+    _sponsorship_event(sponsorship, "submitted", actor, source, sponsorship.status,
+                       f"sponsorship:{sponsorship.pk}:submitted", reason=sponsorship.reason)
+    return sponsorship
+
+
+@transaction.atomic
+def decide_encounter_sponsorship(sponsorship, *, actor, approve, reason=""):
+    sponsorship = EncounterSponsorship.objects.select_for_update().select_related(
+        "sponsor_wallet__organization", "financial_record", "encounter"
+    ).get(pk=sponsorship.pk)
+    if approve and sponsorship.status == EncounterSponsorship.Status.APPROVED:
+        return sponsorship
+    if sponsorship.status != EncounterSponsorship.Status.SUBMITTED:
+        raise ValidationError("Only a submitted sponsorship can be decided.")
+    if sponsorship.created_by_id == getattr(actor, "id", None):
+        raise ValidationError("Maker-checker control: the creator cannot decide this sponsorship.")
+    decision_reason = str(reason or "").strip()
+    if not approve and not decision_reason:
+        raise ValidationError("A rejection reason is required.")
+    source = sponsorship.status
+    if approve:
+        wallet = OrganizationWallet.objects.select_for_update().get(pk=sponsorship.sponsor_wallet_id)
+        record = EncounterFinancialRecord.objects.select_for_update().get(pk=sponsorship.financial_record_id)
+        if wallet.organization.organization_type != "sentinel" or not wallet.is_active:
+            raise ValidationError("The Sentinel sponsor wallet is unavailable.")
+        if record.captured_at or record.status not in {
+            EncounterFinancialRecord.Status.PRICED,
+            EncounterFinancialRecord.Status.AWAITING_PAYMENT,
+        }:
+            raise ValidationError("The encounter is no longer eligible for sponsorship.")
+        if record.gross_amount != sponsorship.gross_service_value or not record.pricing_rule_id:
+            raise ValidationError("The approved pricing snapshot no longer matches this sponsorship.")
+        if wallet.available_balance < sponsorship.gross_service_value:
+            raise ValidationError("Insufficient genuine Sentinel funds for this sponsorship.")
+        record.payer_type = EncounterFinancialRecord.PayerType.PROGRAMME
+        record.payer_organization = wallet.organization
+        record.collector_type = EncounterFinancialRecord.CollectorType.SENTINEL
+        record.payment_method = EncounterFinancialRecord.PaymentMethod.WALLET
+        record.outstanding_amount = sponsorship.gross_service_value
+        record.save(update_fields=[
+            "payer_type", "payer_organization", "collector_type", "payment_method",
+            "outstanding_amount", "updated_at",
+        ])
+        reservation = reserve_wallet_funds(
+            wallet, record, sponsorship.gross_service_value,
+            f"sponsorship:{sponsorship.pk}:reservation", actor=actor,
+            reference=sponsorship.sponsorship_reference,
+        )
+        sponsorship.status = EncounterSponsorship.Status.APPROVED
+        sponsorship.reservation = reservation
+    else:
+        sponsorship.status = EncounterSponsorship.Status.REJECTED
+    sponsorship.decided_by = actor
+    sponsorship.decided_at = timezone.now()
+    sponsorship.decision_reason = decision_reason
+    sponsorship.save(update_fields=[
+        "status", "reservation", "decided_by", "decided_at", "decision_reason", "updated_at"
+    ])
+    _sponsorship_event(
+        sponsorship, "approved" if approve else "rejected", actor, source,
+        sponsorship.status, f"sponsorship:{sponsorship.pk}:decision",
+        reason=decision_reason or sponsorship.reason,
+        metadata={"reservation_id": sponsorship.reservation_id},
+    )
+    return sponsorship
+
+
+@transaction.atomic
+def capture_encounter_sponsorship(sponsorship, *, actor):
+    sponsorship = EncounterSponsorship.objects.select_for_update().select_related(
+        "reservation", "financial_record"
+    ).get(pk=sponsorship.pk)
+    if sponsorship.status == EncounterSponsorship.Status.CAPTURED:
+        return sponsorship
+    if sponsorship.status != EncounterSponsorship.Status.APPROVED or not sponsorship.reservation_id:
+        raise ValidationError("Only an approved sponsorship can be captured.")
+    capture_wallet_reservation(
+        sponsorship.reservation, amount=sponsorship.gross_service_value,
+        idempotency_key=f"sponsorship:{sponsorship.pk}:capture",
+        actor=actor, reference=sponsorship.sponsorship_reference,
+    )
+    source = sponsorship.status
+    sponsorship.status = EncounterSponsorship.Status.CAPTURED
+    sponsorship.captured_at = timezone.now()
+    sponsorship.save(update_fields=["status", "captured_at", "updated_at"])
+    _sponsorship_event(sponsorship, "captured", actor, source, sponsorship.status,
+                       f"sponsorship:{sponsorship.pk}:captured", reason=sponsorship.reason)
+    return sponsorship
+
+
+@transaction.atomic
+def cancel_encounter_sponsorship(sponsorship, *, actor, reason):
+    sponsorship = EncounterSponsorship.objects.select_for_update().select_related("reservation").get(pk=sponsorship.pk)
+    if sponsorship.status == EncounterSponsorship.Status.CANCELLED:
+        return sponsorship
+    if sponsorship.status not in {
+        EncounterSponsorship.Status.DRAFT,
+        EncounterSponsorship.Status.SUBMITTED,
+        EncounterSponsorship.Status.APPROVED,
+    }:
+        raise ValidationError("A captured or rejected sponsorship cannot be cancelled.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A cancellation reason is required.")
+    if sponsorship.reservation_id and sponsorship.reservation.remaining_amount > 0:
+        release_wallet_reservation(
+            sponsorship.reservation, amount=sponsorship.reservation.remaining_amount,
+            idempotency_key=f"sponsorship:{sponsorship.pk}:cancel-release",
+            actor=actor, reference=sponsorship.sponsorship_reference,
+        )
+    source = sponsorship.status
+    sponsorship.status = EncounterSponsorship.Status.CANCELLED
+    sponsorship.cancelled_by = actor
+    sponsorship.cancelled_at = timezone.now()
+    sponsorship.cancellation_reason = reason
+    sponsorship.save(update_fields=[
+        "status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"
+    ])
+    _sponsorship_event(sponsorship, "cancelled", actor, source, sponsorship.status,
+                       f"sponsorship:{sponsorship.pk}:cancelled", reason=reason)
+    return sponsorship
+
+
+def sentinel_treasury_summary():
+    sentinel_wallets = OrganizationWallet.objects.filter(
+        organization__organization_type="sentinel", is_active=True
+    )
+    wallet_ids = sentinel_wallets.values_list("id", flat=True)
+    available = sentinel_wallets.annotate(
+        value=models.Sum("ledger_entries__available_delta")
+    ).aggregate(total=Sum("value"))["total"] or Decimal("0.00")
+    reserved = sentinel_wallets.annotate(
+        value=models.Sum("ledger_entries__reserved_delta")
+    ).aggregate(total=Sum("value"))["total"] or Decimal("0.00")
+    approved_transfers = TreasuryTransfer.objects.filter(
+        wallet_id__in=wallet_ids, status=TreasuryTransfer.Status.APPROVED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    transferable = max(Decimal("0.00"), available - approved_transfers)
+    return {
+        "available": available,
+        "reserved": reserved,
+        "approved_transfer_commitments": approved_transfers,
+        "transferable_surplus": transferable,
+        "calculated_at": timezone.now(),
+        "formula": "Sentinel wallet available balance minus approved, unexecuted treasury transfers; pending funding is excluded and existing wallet reservations/captures are already reflected in available balance.",
+    }
+
+
+def _transfer_event(transfer, action, actor, source, target, key, reason="", metadata=None):
+    return TreasuryTransferEvent.objects.create(
+        transfer=transfer, action=action, actor=actor, source_status=source,
+        target_status=target, reason=str(reason or "").strip(),
+        idempotency_key=key, metadata=metadata or {},
+    )
+
+
+@transaction.atomic
+def create_treasury_transfer(*, wallet, amount, purpose, destination_label,
+                             idempotency_key, actor):
+    key = _require_idempotency_key(idempotency_key)
+    existing = TreasuryTransfer.objects.filter(idempotency_key=key).first()
+    if existing:
+        return existing
+    wallet = OrganizationWallet.objects.select_for_update().select_related("organization").get(pk=wallet.pk)
+    summary = sentinel_treasury_summary()
+    transfer = TreasuryTransfer(
+        wallet=wallet, amount=_money(amount), currency=wallet.currency,
+        purpose=str(purpose or "").strip(), destination_label=str(destination_label or "").strip(),
+        idempotency_key=key, created_by=actor,
+        available_surplus_snapshot={
+            "available": str(summary["available"]),
+            "approved_transfer_commitments": str(summary["approved_transfer_commitments"]),
+            "transferable_surplus": str(summary["transferable_surplus"]),
+            "calculated_at": summary["calculated_at"].isoformat(),
+            "formula": summary["formula"],
+        },
+    )
+    transfer.full_clean()
+    try:
+        with transaction.atomic():
+            transfer.save()
+    except IntegrityError as exc:
+        existing = TreasuryTransfer.objects.filter(idempotency_key=key).first()
+        if existing:
+            return existing
+        raise ValidationError("The transfer request conflicted with another update; refresh and retry.") from exc
+    _transfer_event(transfer, "created", actor, "", transfer.status,
+                    f"treasury-transfer:{transfer.pk}:created", reason=transfer.purpose)
+    return transfer
+
+
+@transaction.atomic
+def submit_treasury_transfer(transfer, *, actor):
+    transfer = TreasuryTransfer.objects.select_for_update().get(pk=transfer.pk)
+    if transfer.status == TreasuryTransfer.Status.SUBMITTED:
+        return transfer
+    if transfer.status != TreasuryTransfer.Status.DRAFT:
+        raise ValidationError("Only a draft transfer can be submitted.")
+    source = transfer.status
+    transfer.status = TreasuryTransfer.Status.SUBMITTED
+    transfer.submitted_at = timezone.now()
+    transfer.save(update_fields=["status", "submitted_at", "updated_at"])
+    _transfer_event(transfer, "submitted", actor, source, transfer.status,
+                    f"treasury-transfer:{transfer.pk}:submitted", reason=transfer.purpose)
+    return transfer
+
+
+@transaction.atomic
+def decide_treasury_transfer(transfer, *, actor, approve, reason=""):
+    transfer = TreasuryTransfer.objects.select_for_update().select_related("wallet").get(pk=transfer.pk)
+    if approve and transfer.status == TreasuryTransfer.Status.APPROVED:
+        return transfer
+    if transfer.status != TreasuryTransfer.Status.SUBMITTED:
+        raise ValidationError("Only a submitted transfer can be decided.")
+    if transfer.created_by_id == getattr(actor, "id", None):
+        raise ValidationError("Maker-checker control: the creator cannot decide this transfer.")
+    reason = str(reason or "").strip()
+    if not approve and not reason:
+        raise ValidationError("A rejection reason is required.")
+    if approve:
+        wallet = OrganizationWallet.objects.select_for_update().select_related("organization").get(
+            pk=transfer.wallet_id
+        )
+        if wallet.organization.organization_type != "sentinel" or not wallet.is_active:
+            raise ValidationError("The Sentinel treasury wallet is unavailable.")
+        existing_commitments = TreasuryTransfer.objects.filter(
+            wallet=wallet, status=TreasuryTransfer.Status.APPROVED
+        ).exclude(pk=transfer.pk).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        wallet_surplus = max(Decimal("0.00"), wallet.available_balance - existing_commitments)
+        if transfer.amount > wallet_surplus:
+            raise ValidationError("Transfer exceeds the calculated transferable surplus.")
+    summary = sentinel_treasury_summary()
+    source = transfer.status
+    transfer.status = TreasuryTransfer.Status.APPROVED if approve else TreasuryTransfer.Status.REJECTED
+    transfer.decided_by = actor
+    transfer.decided_at = timezone.now()
+    transfer.decision_reason = reason
+    transfer.available_surplus_snapshot = {
+        "available": str(summary["available"]),
+        "approved_transfer_commitments": str(summary["approved_transfer_commitments"]),
+        "transferable_surplus": str(summary["transferable_surplus"]),
+        "calculated_at": summary["calculated_at"].isoformat(),
+        "formula": summary["formula"],
+    }
+    transfer.save(update_fields=[
+        "status", "decided_by", "decided_at", "decision_reason",
+        "available_surplus_snapshot", "updated_at",
+    ])
+    _transfer_event(transfer, "approved" if approve else "rejected", actor, source,
+                    transfer.status, f"treasury-transfer:{transfer.pk}:decision",
+                    reason=reason or transfer.purpose)
+    return transfer
+
+
+@transaction.atomic
+def record_treasury_transfer_execution(transfer, *, actor, external_reference, evidence):
+    transfer = TreasuryTransfer.objects.select_for_update().select_related("wallet").get(pk=transfer.pk)
+    if transfer.status == TreasuryTransfer.Status.EXECUTED:
+        return transfer
+    if transfer.status != TreasuryTransfer.Status.APPROVED:
+        raise ValidationError("Only an approved transfer can be recorded as executed.")
+    reference = str(external_reference or "").strip()
+    if not reference or evidence is None:
+        raise ValidationError("Execution reference and evidence are required.")
+    wallet = OrganizationWallet.objects.select_for_update().get(pk=transfer.wallet_id)
+    if wallet.available_balance < transfer.amount:
+        raise ValidationError("Available Sentinel funds no longer cover this transfer.")
+    entry = WalletLedgerEntry.objects.create(
+        wallet=wallet, entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+        available_delta=-transfer.amount, reserved_delta=Decimal("0.00"),
+        currency=wallet.currency, idempotency_key=f"treasury-transfer:{transfer.pk}:executed",
+        reference=reference, description=f"Treasury transfer: {transfer.purpose[:180]}",
+        metadata={"treasury_transfer_id": transfer.pk}, actor=actor,
+    )
+    source = transfer.status
+    transfer.status = TreasuryTransfer.Status.EXECUTED
+    transfer.external_reference = reference
+    transfer.evidence = evidence
+    transfer.executed_by = actor
+    transfer.executed_at = timezone.now()
+    transfer.ledger_entry = entry
+    transfer.save(update_fields=[
+        "status", "external_reference", "evidence", "executed_by", "executed_at",
+        "ledger_entry", "updated_at",
+    ])
+    _transfer_event(transfer, "execution_recorded", actor, source, transfer.status,
+                    f"treasury-transfer:{transfer.pk}:executed", reason=transfer.purpose,
+                    metadata={"ledger_entry_id": entry.pk})
+    return transfer
+
+
+@transaction.atomic
+def cancel_treasury_transfer(transfer, *, actor, reason):
+    transfer = TreasuryTransfer.objects.select_for_update().get(pk=transfer.pk)
+    if transfer.status == TreasuryTransfer.Status.CANCELLED:
+        return transfer
+    if transfer.status not in {TreasuryTransfer.Status.DRAFT, TreasuryTransfer.Status.SUBMITTED, TreasuryTransfer.Status.APPROVED}:
+        raise ValidationError("Only an unexecuted transfer can be cancelled.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A cancellation reason is required.")
+    source = transfer.status
+    transfer.status = TreasuryTransfer.Status.CANCELLED
+    transfer.cancellation_reason = reason
+    transfer.save(update_fields=["status", "cancellation_reason", "updated_at"])
+    _transfer_event(transfer, "cancelled", actor, source, transfer.status,
+                    f"treasury-transfer:{transfer.pk}:cancelled", reason=reason)
+    return transfer
+
+
+@transaction.atomic
+def reverse_treasury_transfer(transfer, *, actor, reason):
+    transfer = TreasuryTransfer.objects.select_for_update().select_related("wallet", "ledger_entry").get(pk=transfer.pk)
+    if transfer.status == TreasuryTransfer.Status.REVERSED:
+        return transfer
+    if transfer.status != TreasuryTransfer.Status.EXECUTED or not transfer.ledger_entry_id:
+        raise ValidationError("Only an executed transfer can be reversed.")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValidationError("A reversal reason is required.")
+    entry = WalletLedgerEntry.objects.create(
+        wallet=transfer.wallet, entry_type=WalletLedgerEntry.EntryType.REVERSAL,
+        available_delta=transfer.amount, reserved_delta=Decimal("0.00"),
+        currency=transfer.currency, related_entry=transfer.ledger_entry,
+        idempotency_key=f"treasury-transfer:{transfer.pk}:reversed",
+        reference=transfer.external_reference,
+        description=f"Treasury transfer reversal: {reason[:170]}",
+        metadata={"treasury_transfer_id": transfer.pk}, actor=actor,
+    )
+    source = transfer.status
+    transfer.status = TreasuryTransfer.Status.REVERSED
+    transfer.reversal_entry = entry
+    transfer.save(update_fields=["status", "reversal_entry", "updated_at"])
+    _transfer_event(transfer, "reversed", actor, source, transfer.status,
+                    f"treasury-transfer:{transfer.pk}:reversed", reason=reason,
+                    metadata={"ledger_entry_id": entry.pk})
+    return transfer

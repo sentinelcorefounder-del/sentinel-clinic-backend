@@ -6,11 +6,14 @@ from datetime import timedelta
 import uuid
 from django.http import FileResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
-from django.db.models import Count
+from django.db.models import Count, Q, Sum
+from decimal import Decimal
 from pathlib import Path
+from payments.models import PaymentTransaction
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
@@ -22,8 +25,9 @@ from .models import (
     FinanceActionRequest, FinanceControlAudit,
     BillingProfile,
     ServicePartnerEarning, ServicePartnerSettlementBatch, ServicePartnerCorrectionRequest,
+    EncounterSponsorship, TreasuryTransfer, EncounterAllocation,
 )
-from encounters.models import AssessmentServiceSession
+from encounters.models import AssessmentServiceSession, ScreeningEncounter
 from organizations.models import Organization
 from .serializers import (
     AllocationRuleSerializer,
@@ -38,6 +42,7 @@ from .serializers import (
     AssessmentServiceSessionSerializer, ServicePartnerSerializer,
     ServicePartnerEarningSerializer, ServicePartnerSettlementSerializer,
     ServicePartnerCorrectionSerializer, ServicePartnerAdjustmentSerializer,
+    EncounterSponsorshipSerializer, TreasuryTransferSerializer,
 )
 from .permissions import (
     IsInternalFinanceAdministrator, IsInternalFinanceApprover,
@@ -59,6 +64,12 @@ from .services import (
     decide_service_partner_settlement, cancel_service_partner_settlement,
     mark_service_partner_settlement_paid,
     request_service_partner_correction, decide_service_partner_correction,
+    create_encounter_sponsorship, submit_encounter_sponsorship,
+    decide_encounter_sponsorship, capture_encounter_sponsorship,
+    cancel_encounter_sponsorship, sentinel_treasury_summary,
+    create_treasury_transfer, submit_treasury_transfer, decide_treasury_transfer,
+    record_treasury_transfer_execution, cancel_treasury_transfer,
+    reverse_treasury_transfer,
 )
 
 
@@ -636,7 +647,10 @@ class EncounterFinancialRecordViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = EncounterFinancialRecordSerializer
     queryset = EncounterFinancialRecord.objects.select_related(
         "encounter",
+        "encounter__patient",
         "encounter__originating_organization",
+        "encounter__service_branch",
+        "encounter__service_session",
         "contract",
         "pricing_rule",
     ).prefetch_related("allocations", "allocations__beneficiary_organization")
@@ -1274,5 +1288,338 @@ class FinanceCapabilitiesView(APIView):
                 "can_approve": allowed(IsInternalFinanceApprover),
                 "can_manage_service_partners": allowed(IsInternalFinanceAdministrator),
                 "can_manage_service_sessions": allowed(IsInternalFinanceAdministrator),
+            },
+        })
+
+
+def _finance_error(exc):
+    message = exc.messages if hasattr(exc, "messages") else [str(exc)]
+    return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class EncounterSponsorshipViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = EncounterSponsorshipSerializer
+    queryset = EncounterSponsorship.objects.select_related(
+        "encounter", "encounter__patient", "encounter__patient__assigned_clinic",
+        "encounter__service_branch", "financial_record", "sponsor_wallet__organization",
+        "created_by", "decided_by", "reservation",
+    ).prefetch_related("events", "events__actor")
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve"}:
+            role = IsFinanceViewer
+        elif self.action in {"approve", "reject"}:
+            role = IsInternalFinanceApprover
+        else:
+            role = IsInternalFinanceOperator
+        return [IsAuthenticated(), role()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        for parameter, field in (
+            ("status", "status"), ("organization", "encounter__patient__assigned_clinic_id"),
+            ("branch", "encounter__service_branch_id"),
+            ("service_session", "encounter__service_session_id"),
+        ):
+            value = (self.request.query_params.get(parameter) or "").strip()
+            if value and (parameter == "status" or value.isdigit()):
+                queryset = queryset.filter(**{field: value})
+        date_from = parse_date((self.request.query_params.get("date_from") or "").strip())
+        date_to = parse_date((self.request.query_params.get("date_to") or "").strip())
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
+        return queryset
+
+    def create(self, request):
+        try:
+            encounter = ScreeningEncounter.objects.select_related("patient").get(pk=request.data.get("encounter"))
+            wallet = OrganizationWallet.objects.select_related("organization").get(pk=request.data.get("sponsor_wallet"))
+            sponsorship = create_encounter_sponsorship(
+                encounter=encounter, sponsor_wallet=wallet,
+                category=request.data.get("category", ""), reason=request.data.get("reason", ""),
+                idempotency_key=request.data.get("idempotency_key", ""), actor=request.user,
+            )
+        except (ScreeningEncounter.DoesNotExist, OrganizationWallet.DoesNotExist):
+            return Response({"detail": "Encounter or Sentinel wallet not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(sponsorship).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        try:
+            item = submit_encounter_sponsorship(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            item = decide_encounter_sponsorship(self.get_object(), actor=request.user, approve=True)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        try:
+            item = decide_encounter_sponsorship(
+                self.get_object(), actor=request.user, approve=False,
+                reason=request.data.get("reason", ""),
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def capture(self, request, pk=None):
+        try:
+            item = capture_encounter_sponsorship(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        try:
+            item = cancel_encounter_sponsorship(
+                self.get_object(), actor=request.user, reason=request.data.get("reason", "")
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+
+class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = TreasuryTransferSerializer
+    queryset = TreasuryTransfer.objects.select_related(
+        "wallet__organization", "created_by", "decided_by", "executed_by",
+        "ledger_entry", "reversal_entry",
+    ).prefetch_related("events", "events__actor")
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve", "evidence"}:
+            role = IsFinanceViewer
+        elif self.action in {"approve", "reject", "reverse"}:
+            role = IsInternalFinanceApprover
+        else:
+            role = IsInternalFinanceOperator
+        return [IsAuthenticated(), role()]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        status_value = (self.request.query_params.get("status") or "").strip()
+        return queryset.filter(status=status_value) if status_value else queryset
+
+    def create(self, request):
+        try:
+            wallet = OrganizationWallet.objects.select_related("organization").get(pk=request.data.get("wallet"))
+            transfer = create_treasury_transfer(
+                wallet=wallet, amount=request.data.get("amount"),
+                purpose=request.data.get("purpose", ""),
+                destination_label=request.data.get("destination_label", ""),
+                idempotency_key=request.data.get("idempotency_key", ""), actor=request.user,
+            )
+        except OrganizationWallet.DoesNotExist:
+            return Response({"detail": "Sentinel wallet not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(transfer).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        try:
+            item = submit_treasury_transfer(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            item = decide_treasury_transfer(self.get_object(), actor=request.user, approve=True)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        try:
+            item = decide_treasury_transfer(
+                self.get_object(), actor=request.user, approve=False,
+                reason=request.data.get("reason", ""),
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser])
+    def execute(self, request, pk=None):
+        try:
+            item = record_treasury_transfer_execution(
+                self.get_object(), actor=request.user,
+                external_reference=request.data.get("external_reference", ""),
+                evidence=request.FILES.get("evidence"),
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        try:
+            item = cancel_treasury_transfer(
+                self.get_object(), actor=request.user, reason=request.data.get("reason", "")
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def reverse(self, request, pk=None):
+        try:
+            item = reverse_treasury_transfer(
+                self.get_object(), actor=request.user, reason=request.data.get("reason", "")
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["get"])
+    def evidence(self, request, pk=None):
+        return _evidence_response(self.get_object().evidence)
+
+
+class SentinelTreasuryDashboardView(APIView):
+    permission_classes = [IsAuthenticated, IsFinanceViewer]
+
+    def get(self, request):
+        filter_values = {
+            key: (request.query_params.get(key) or "").strip()
+            for key in ("date_from", "date_to", "organization", "branch", "service_session", "payment_source", "status")
+        }
+        date_from = parse_date(filter_values["date_from"])
+        date_to = parse_date(filter_values["date_to"])
+        summary = sentinel_treasury_summary()
+        wallet_ids = OrganizationWallet.objects.filter(
+            organization__organization_type="sentinel"
+        ).values_list("id", flat=True)
+        receipt_queryset = WalletLedgerEntry.objects.filter(
+            wallet_id__in=wallet_ids, entry_type=WalletLedgerEntry.EntryType.TOP_UP
+        ).filter(
+            Q(bank_transfer_funding_request__status=BankTransferFundingRequest.Status.CREDITED)
+            | Q(metadata__provider="paystack")
+        )
+        if filter_values["payment_source"] == "bank_transfer":
+            receipt_queryset = receipt_queryset.filter(
+                bank_transfer_funding_request__status=BankTransferFundingRequest.Status.CREDITED
+            )
+        elif filter_values["payment_source"] == "paystack":
+            receipt_queryset = receipt_queryset.filter(metadata__provider="paystack")
+        if date_from:
+            receipt_queryset = receipt_queryset.filter(created_at__date__gte=date_from)
+        if date_to:
+            receipt_queryset = receipt_queryset.filter(created_at__date__lte=date_to)
+        genuine_receipts = receipt_queryset.aggregate(total=Sum("available_delta"))["total"] or Decimal("0.00")
+        pending_queryset = BankTransferFundingRequest.objects.filter(wallet_id__in=wallet_ids).exclude(
+            status__in=[BankTransferFundingRequest.Status.CREDITED, BankTransferFundingRequest.Status.REJECTED,
+                        BankTransferFundingRequest.Status.EXPIRED, BankTransferFundingRequest.Status.REVERSED]
+        )
+        if filter_values["payment_source"] == "paystack":
+            pending_queryset = pending_queryset.none()
+        if date_from:
+            pending_queryset = pending_queryset.filter(created_at__date__gte=date_from)
+        if date_to:
+            pending_queryset = pending_queryset.filter(created_at__date__lte=date_to)
+        pending_bank_funding = pending_queryset.aggregate(
+            total=Sum("requested_amount")
+        )["total"] or Decimal("0.00")
+        pending_paystack_queryset = PaymentTransaction.objects.filter(
+            wallet_id__in=wallet_ids,
+            purpose=PaymentTransaction.Purpose.WALLET_TOP_UP,
+            status__in=[
+                PaymentTransaction.Status.CREATED,
+                PaymentTransaction.Status.INITIALIZED,
+                PaymentTransaction.Status.VERIFIED,
+            ],
+        )
+        if filter_values["payment_source"] == "bank_transfer":
+            pending_paystack_queryset = pending_paystack_queryset.none()
+        if date_from:
+            pending_paystack_queryset = pending_paystack_queryset.filter(created_at__date__gte=date_from)
+        if date_to:
+            pending_paystack_queryset = pending_paystack_queryset.filter(created_at__date__lte=date_to)
+        pending_paystack = pending_paystack_queryset.aggregate(
+            total=Sum("expected_amount")
+        )["total"] or Decimal("0.00")
+        pending_funding = pending_bank_funding + pending_paystack
+        sponsorship_queryset = EncounterSponsorship.objects.all()
+        for parameter, field in (
+            ("organization", "encounter__originating_organization_id"),
+            ("branch", "encounter__service_branch_id"),
+            ("service_session", "encounter__service_session_id"),
+            ("status", "status"),
+        ):
+            value = filter_values[parameter]
+            if value and (parameter == "status" or value.isdigit()):
+                sponsorship_queryset = sponsorship_queryset.filter(**{field: value})
+        if date_from:
+            sponsorship_queryset = sponsorship_queryset.filter(created_at__date__gte=date_from)
+        if date_to:
+            sponsorship_queryset = sponsorship_queryset.filter(created_at__date__lte=date_to)
+        sponsorships = {
+            status_value: Decimal("0.00")
+            for status_value, _label in EncounterSponsorship.Status.choices
+        }
+        for row in sponsorship_queryset.values("status").annotate(total=Sum("gross_service_value")):
+            sponsorships[row["status"]] = row["total"] or Decimal("0.00")
+        clinic_payable = EncounterAllocation.objects.filter(
+            beneficiary_role=AllocationRule.BeneficiaryRole.CLINIC,
+            status__in=[EncounterAllocation.Status.EARNED, EncounterAllocation.Status.SETTLEMENT_PENDING],
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        clinic_settled = EncounterAllocation.objects.filter(
+            beneficiary_role=AllocationRule.BeneficiaryRole.CLINIC,
+            status=EncounterAllocation.Status.SETTLED,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+        partner_rows = service_partner_payable_summary()
+        partner_outstanding = sum((row["outstanding"] or Decimal("0.00") for row in partner_rows), Decimal("0.00"))
+        partner_paid = ServicePartnerSettlementBatch.objects.filter(
+            status=ServicePartnerSettlementBatch.Status.PAID
+        ).aggregate(
+            total=Sum("final_amount")
+        )["total"] or Decimal("0.00")
+        corrections = WalletLedgerEntry.objects.filter(
+            wallet_id__in=wallet_ids,
+            entry_type__in=[WalletLedgerEntry.EntryType.REFUND, WalletLedgerEntry.EntryType.REVERSAL,
+                            WalletLedgerEntry.EntryType.ADJUSTMENT],
+        ).aggregate(total=Sum("available_delta"))["total"] or Decimal("0.00")
+        captured = sponsorships.get(EncounterSponsorship.Status.CAPTURED, Decimal("0.00"))
+        safeguarded = summary["reserved"] + clinic_payable + partner_outstanding + summary["approved_transfer_commitments"]
+        money = lambda value: str(Decimal(value).quantize(Decimal("0.01")))
+        return Response({
+            "verified_sentinel_cash_received": money(genuine_receipts),
+            "pending_unverified_funding": money(pending_funding),
+            "available_sentinel_funds": money(summary["available"]),
+            "reserved_sentinel_funds": money(summary["reserved"]),
+            "sponsorship_commitments": {key: money(value) for key, value in sponsorships.items()},
+            "sponsored_services_spent": money(captured),
+            "clinic_payables": money(clinic_payable),
+            "service_partner_payables": money(partner_outstanding),
+            "settled_allocations": money(clinic_settled),
+            "settled_service_partner_earnings": money(partner_paid),
+            "refunds_reversals_corrections": money(corrections),
+            "safeguarded_committed_funds": money(safeguarded),
+            "approved_transfer_commitments": money(summary["approved_transfer_commitments"]),
+            "transferable_surplus": money(summary["transferable_surplus"]),
+            "calculated_at": summary["calculated_at"], "formula": summary["formula"],
+            "applied_filters": filter_values,
+            "drill_down": {
+                "funding": "/api/finance/bank-transfer-funding/", "ledger": "/api/finance/wallet-ledger/",
+                "sponsorships": "/api/finance/sponsorships/", "allocations": "/api/finance/financial-records/",
+                "service_partner_payables": "/api/finance/internal/service-partner-payables/",
+                "transfers": "/api/finance/treasury-transfers/", "corrections": "/api/finance/action-requests/",
             },
         })

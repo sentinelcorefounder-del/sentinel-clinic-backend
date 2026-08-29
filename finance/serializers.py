@@ -24,7 +24,89 @@ from .models import (
     ServicePartnerSettlementBatch,
     ServicePartnerAdjustment,
     ServicePartnerCorrectionRequest,
+    EncounterSponsorship,
+    SponsorshipEvent,
+    TreasuryTransfer,
+    TreasuryTransferEvent,
 )
+
+
+class SponsorshipEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = SponsorshipEvent
+        fields = (
+            "id", "action", "actor_name", "source_status", "target_status",
+            "reason", "idempotency_key", "metadata", "created_at",
+        )
+        read_only_fields = fields
+
+
+class EncounterSponsorshipSerializer(serializers.ModelSerializer):
+    encounter_reference = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    patient_reference = serializers.CharField(source="encounter.patient.patient_id", read_only=True)
+    patient_display = serializers.SerializerMethodField()
+    organization_name = serializers.CharField(source="encounter.patient.assigned_clinic.name", read_only=True)
+    branch_name = serializers.CharField(source="encounter.service_branch.name", read_only=True, allow_null=True)
+    sponsor_name = serializers.CharField(source="sponsor_wallet.organization.name", read_only=True)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True)
+    decided_by_name = serializers.CharField(source="decided_by.username", read_only=True, allow_null=True)
+    events = SponsorshipEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = EncounterSponsorship
+        fields = (
+            "id", "sponsorship_reference", "encounter", "encounter_reference",
+            "patient_reference", "patient_display", "organization_name", "branch_name",
+            "financial_record", "sponsor_wallet", "sponsor_name", "category", "reason",
+            "status", "currency", "patient_amount", "gross_service_value",
+            "pricing_snapshot", "allocation_snapshot", "idempotency_key",
+            "created_by_name", "submitted_at", "decided_by_name", "decided_at",
+            "decision_reason", "reservation", "captured_at", "cancelled_at",
+            "cancellation_reason", "events", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_patient_display(self, obj):
+        patient = obj.encounter.patient
+        return f"{patient.patient_id} — {patient.first_name} {patient.last_name}".strip()
+
+
+class TreasuryTransferEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.CharField(source="actor.username", read_only=True)
+
+    class Meta:
+        model = TreasuryTransferEvent
+        fields = (
+            "id", "action", "actor_name", "source_status", "target_status",
+            "reason", "idempotency_key", "metadata", "created_at",
+        )
+        read_only_fields = fields
+
+
+class TreasuryTransferSerializer(serializers.ModelSerializer):
+    wallet_name = serializers.CharField(source="wallet.organization.name", read_only=True)
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True)
+    decided_by_name = serializers.CharField(source="decided_by.username", read_only=True, allow_null=True)
+    executed_by_name = serializers.CharField(source="executed_by.username", read_only=True, allow_null=True)
+    evidence_available = serializers.SerializerMethodField()
+    events = TreasuryTransferEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = TreasuryTransfer
+        fields = (
+            "id", "transfer_reference", "wallet", "wallet_name", "amount", "currency",
+            "purpose", "destination_label", "external_reference", "status",
+            "available_surplus_snapshot", "idempotency_key", "created_by_name",
+            "submitted_at", "decided_by_name", "decided_at", "decision_reason",
+            "executed_by_name", "executed_at", "ledger_entry", "reversal_entry",
+            "cancellation_reason", "evidence_available", "events", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_evidence_available(self, obj):
+        return bool(obj.evidence and obj.evidence.name)
 
 
 class ServicePartnerEarningSerializer(serializers.ModelSerializer):
@@ -239,8 +321,16 @@ class EncounterAllocationSerializer(serializers.ModelSerializer):
 
 class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
     encounter_id = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    patient_reference = serializers.CharField(source="encounter.patient.patient_id", read_only=True)
+    patient_display = serializers.SerializerMethodField()
     organization_name = serializers.CharField(
         source="encounter.originating_organization.name", read_only=True
+    )
+    branch_name = serializers.CharField(
+        source="encounter.service_branch.name", read_only=True, allow_null=True
+    )
+    service_session_reference = serializers.CharField(
+        source="encounter.service_session.session_reference", read_only=True, allow_null=True
     )
     payer_organization_name = serializers.CharField(
         source="payer_organization.name", read_only=True, allow_null=True
@@ -254,6 +344,10 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
     contract_name = serializers.CharField(source="contract.name", read_only=True)
     pricing_rule_name = serializers.CharField(source="pricing_rule.name", read_only=True)
     allocations = EncounterAllocationSerializer(many=True, read_only=True)
+
+    def get_patient_display(self, obj):
+        patient = obj.encounter.patient
+        return f"{patient.patient_id} — {patient.first_name} {patient.last_name}".strip()
 
     class Meta:
         model = EncounterFinancialRecord
@@ -271,6 +365,7 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
 
 class OrganizationWalletSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source="organization.name", read_only=True)
+    organization_type = serializers.CharField(source="organization.organization_type", read_only=True)
     available_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     reserved_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     spendable_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)

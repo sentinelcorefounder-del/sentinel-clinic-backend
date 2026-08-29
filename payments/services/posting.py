@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from finance.models import EncounterFinancialRecord
+from finance.models import EncounterFinancialRecord, EncounterSponsorship
 from finance.services import top_up_wallet
 from payments.models import PaymentTransaction
 
@@ -73,6 +73,16 @@ def post_verified_payment(payment, verify_payload):
         record = EncounterFinancialRecord.objects.select_for_update().get(
             pk=payment.financial_record_id
         )
+        if EncounterSponsorship.objects.filter(
+            financial_record=record,
+            status__in=[
+                EncounterSponsorship.Status.APPROVED,
+                EncounterSponsorship.Status.CAPTURED,
+            ],
+        ).exists():
+            raise ValidationError(
+                "This encounter is funded through an approved Sentinel sponsorship."
+            )
         if record.currency.upper() != payment.currency.upper():
             raise ValidationError("Payment currency does not match the financial record currency.")
         if record.outstanding_amount != received_amount:

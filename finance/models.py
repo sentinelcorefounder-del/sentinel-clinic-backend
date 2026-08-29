@@ -1326,3 +1326,231 @@ class FinanceControlAudit(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Finance control audit records are immutable.")
+
+
+def sponsorship_reference():
+    return f"SEN-SP-{uuid.uuid4().hex[:12].upper()}"
+
+
+class EncounterSponsorship(TimeStampedModel):
+    class Category(models.TextChoices):
+        COMPLIMENTARY = "complimentary_client_service", "Complimentary client service"
+        PROMOTIONAL = "approved_promotional_screening", "Approved promotional screening"
+        HARDSHIP = "hardship_support", "Hardship support"
+        PROGRAMME = "approved_programme_sponsorship", "Approved programme sponsorship"
+        REPLACEMENT = "correction_replacement", "Correction or replacement"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+        APPROVED = "approved", "Approved and reserved"
+        CAPTURED = "captured", "Captured"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled"
+
+    sponsorship_reference = models.CharField(
+        max_length=32, unique=True, default=sponsorship_reference, editable=False
+    )
+    encounter = models.OneToOneField(
+        "encounters.ScreeningEncounter", on_delete=models.PROTECT,
+        related_name="finance_sponsorship",
+    )
+    financial_record = models.OneToOneField(
+        EncounterFinancialRecord, on_delete=models.PROTECT,
+        related_name="sponsorship",
+    )
+    sponsor_wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, related_name="sponsorships"
+    )
+    category = models.CharField(max_length=50, choices=Category.choices)
+    reason = models.TextField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    currency = models.CharField(max_length=3, default="NGN")
+    patient_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    gross_service_value = models.DecimalField(max_digits=14, decimal_places=2)
+    pricing_snapshot = models.JSONField(default=dict)
+    allocation_snapshot = models.JSONField(default=list)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="created_encounter_sponsorships",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="decided_encounter_sponsorships",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+    reservation = models.OneToOneField(
+        WalletReservation, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="sponsorship",
+    )
+    captured_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="cancelled_encounter_sponsorships",
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status", "created_at"], name="fin_sponsor_status_idx"),
+            models.Index(fields=["sponsor_wallet", "status"], name="fin_sponsor_wallet_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(patient_amount=0), name="fin_sponsor_patient_zero"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(gross_service_value__gt=0), name="fin_sponsor_gross_positive"
+            ),
+        ]
+
+    def clean(self):
+        if self.patient_amount != 0:
+            raise ValidationError({"patient_amount": "A sponsored patient amount must be zero."})
+        if self.gross_service_value <= 0:
+            raise ValidationError({"gross_service_value": "The standard service value must be positive."})
+        if self.sponsor_wallet_id and self.sponsor_wallet.organization.organization_type != "sentinel":
+            raise ValidationError({"sponsor_wallet": "The sponsor wallet must belong to Sentinel."})
+        if self.sponsor_wallet_id and self.currency != self.sponsor_wallet.currency:
+            raise ValidationError({"currency": "Currency must match the sponsor wallet."})
+        if not self.reason.strip():
+            raise ValidationError({"reason": "A sponsorship reason is required."})
+
+
+class SponsorshipEvent(models.Model):
+    sponsorship = models.ForeignKey(
+        EncounterSponsorship, on_delete=models.PROTECT, related_name="events"
+    )
+    action = models.CharField(max_length=60)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="sponsorship_events",
+    )
+    source_status = models.CharField(max_length=20, blank=True, default="")
+    target_status = models.CharField(max_length=20)
+    reason = models.TextField(blank=True, default="")
+    idempotency_key = models.CharField(max_length=160, unique=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Sponsorship events are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Sponsorship events are immutable.")
+
+
+def treasury_transfer_reference():
+    return f"SEN-TR-{uuid.uuid4().hex[:12].upper()}"
+
+
+class TreasuryTransfer(TimeStampedModel):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+        APPROVED = "approved", "Approved"
+        EXECUTED = "executed", "Execution recorded"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled"
+        REVERSED = "reversed", "Reversed"
+
+    transfer_reference = models.CharField(
+        max_length=32, unique=True, default=treasury_transfer_reference, editable=False
+    )
+    wallet = models.ForeignKey(
+        OrganizationWallet, on_delete=models.PROTECT, related_name="treasury_transfers"
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    purpose = models.TextField()
+    destination_label = models.CharField(max_length=180)
+    external_reference = models.CharField(max_length=120, blank=True, default="")
+    evidence = models.FileField(upload_to=finance_action_evidence_path, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    available_surplus_snapshot = models.JSONField(default=dict)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="created_treasury_transfers",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="decided_treasury_transfers",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+    executed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="executed_treasury_transfers",
+    )
+    executed_at = models.DateTimeField(null=True, blank=True)
+    ledger_entry = models.OneToOneField(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="treasury_transfer",
+    )
+    reversal_entry = models.OneToOneField(
+        WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="reversed_treasury_transfer",
+    )
+    cancellation_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status", "created_at"], name="fin_transfer_status_idx"),
+            models.Index(fields=["wallet", "status"], name="fin_transfer_wallet_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(amount__gt=0), name="fin_transfer_amount_positive"
+            ),
+        ]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Transfer amount must be positive."})
+        if self.wallet_id and self.wallet.organization.organization_type != "sentinel":
+            raise ValidationError({"wallet": "Treasury transfers require a Sentinel wallet."})
+        if self.wallet_id and self.currency != self.wallet.currency:
+            raise ValidationError({"currency": "Currency must match the wallet."})
+        if not self.purpose.strip() or not self.destination_label.strip():
+            raise ValidationError("Purpose and destination label are required.")
+
+
+class TreasuryTransferEvent(models.Model):
+    transfer = models.ForeignKey(
+        TreasuryTransfer, on_delete=models.PROTECT, related_name="events"
+    )
+    action = models.CharField(max_length=60)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="treasury_transfer_events",
+    )
+    source_status = models.CharField(max_length=20, blank=True, default="")
+    target_status = models.CharField(max_length=20)
+    reason = models.TextField(blank=True, default="")
+    idempotency_key = models.CharField(max_length=160, unique=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Treasury transfer events are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Treasury transfer events are immutable.")

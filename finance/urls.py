@@ -18,6 +18,8 @@ from .views import (
     AssessmentServiceSessionViewSet,
     ServicePartnerViewSet,
     ServicePartnerPayablesViewSet,
+    EncounterSponsorshipViewSet,
+    TreasuryTransferViewSet,
 )
 
 router = DefaultRouter()
@@ -38,6 +40,8 @@ router.register("billing-profile", BillingProfileViewSet, basename="finance-bill
 router.register("internal/service-partners", ServicePartnerViewSet, basename="internal-finance-service-partner")
 router.register("internal/service-sessions", AssessmentServiceSessionViewSet, basename="internal-finance-service-session")
 router.register("internal/service-partner-payables", ServicePartnerPayablesViewSet, basename="internal-finance-service-partner-payable")
+router.register("sponsorships", EncounterSponsorshipViewSet, basename="finance-sponsorship")
+router.register("treasury-transfers", TreasuryTransferViewSet, basename="finance-treasury-transfer")
 
 urlpatterns = router.urls
 
@@ -48,6 +52,7 @@ from .views import (
     FinanceOrganizationOptionsView,
     FinanceReconciliationView,
     PartnerFinanceView,
+    SentinelTreasuryDashboardView,
 )
 
 urlpatterns += [
@@ -56,4 +61,5 @@ urlpatterns += [
     path("organization-options/", FinanceOrganizationOptionsView.as_view(), name="finance-organization-options"),
     path("reconciliation/", FinanceReconciliationView.as_view(), name="finance-reconciliation"),
     path("capabilities/", FinanceCapabilitiesView.as_view(), name="finance-capabilities"),
+    path("sentinel-dashboard/", SentinelTreasuryDashboardView.as_view(), name="sentinel-finance-dashboard"),
 ]
