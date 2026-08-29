@@ -9,7 +9,11 @@ from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
-from organizations.models import Organization, OrganizationBranch
+from organizations.models import (
+    Organization,
+    OrganizationBranch,
+    OrganizationProfile,
+)
 from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 
 
@@ -159,6 +163,21 @@ class Command(BaseCommand):
                     },
                 )
                 organizations[code] = (organization, branch)
+
+                if organization.organization_type == "clinic":
+                    OrganizationProfile.objects.update_or_create(
+                        organization=organization,
+                        defaults={
+                            "workflow_mode": "sentinel_managed",
+                            "referral_requirement": "not_required",
+                            "patient_ownership": "clinic",
+                            "can_create_direct_patients": True,
+                            "can_issue_reports_directly": False,
+                            "sentinel_review_policy": "mandatory",
+                            "default_payment_responsibility": "patient",
+                            "clinic_direct_screening_enabled": True,
+                        },
+                    )
 
             organization, branch = organizations[code]
             user, _ = User.objects.update_or_create(

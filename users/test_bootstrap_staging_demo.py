@@ -8,8 +8,16 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
 from django.test import TestCase, override_settings
+from django.urls import reverse
+from rest_framework.test import APIClient
 
-from organizations.models import Organization, OrganizationBranch
+from encounters.models import ScreeningEncounter
+from organizations.models import (
+    Organization,
+    OrganizationBranch,
+    OrganizationProfile,
+)
+from patients.models import Patient
 from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 
 
@@ -78,6 +86,10 @@ class BootstrapStagingDemoTests(TestCase):
         self.assertEqual(OrganizationBranch.objects.filter(organization__clinic_id__startswith="STG-").count(), 3)
         self.assertEqual(UserOrganization.objects.filter(user__username__startswith="staging_demo_").count(), 4)
         self.assertEqual(UserBranchAccess.objects.filter(user__username__startswith="staging_demo_").count(), 4)
+        self.assertEqual(
+            OrganizationProfile.objects.filter(organization__clinic_id="STG-CLINIC-DEMO").count(),
+            1,
+        )
 
         expected_roles = {
             "staging_demo_ops": {"sentinel_ops"},
@@ -109,3 +121,66 @@ class BootstrapStagingDemoTests(TestCase):
             Organization.objects.filter(clinic_id__startswith="STG-").count(),
             3,
         )
+
+    def test_clinic_account_can_use_existing_direct_assessment_workflow(self):
+        self.run_command()
+
+        User = get_user_model()
+        clinic_user = User.objects.get(username="staging_demo_clinic")
+        clinic = Organization.objects.get(clinic_id="STG-CLINIC-DEMO")
+        profile = OrganizationProfile.objects.get(organization=clinic)
+        self.assertTrue(profile.can_create_direct_patients)
+        self.assertTrue(profile.clinic_direct_screening_enabled)
+        self.assertEqual(profile.workflow_mode, "sentinel_managed")
+        self.assertFalse(profile.can_issue_reports_directly)
+        self.assertEqual(profile.sentinel_review_policy, "mandatory")
+        self.assertFalse(clinic_user.is_staff)
+        self.assertFalse(clinic_user.is_superuser)
+
+        client = APIClient()
+        client.force_authenticate(clinic_user)
+        capability_response = client.get(
+            reverse("my-organization-capabilities"),
+            HTTP_HOST="sentinel-clinic-backend-staging.onrender.com",
+        )
+        self.assertEqual(capability_response.status_code, 200)
+        self.assertTrue(capability_response.data["can_create_direct_patients"])
+        self.assertTrue(capability_response.data["clinic_direct_screening_enabled"])
+
+        patient_response = client.post(
+            reverse("clinic-direct-patient-create"),
+            {
+                "first_name": "Synthetic",
+                "last_name": "Test Patient",
+                "date_of_birth": "1990-01-01",
+                "sex": "other",
+                "country": "Example",
+            },
+            format="json",
+            HTTP_HOST="sentinel-clinic-backend-staging.onrender.com",
+        )
+        self.assertEqual(patient_response.status_code, 201, patient_response.data)
+
+        encounter_response = client.post(
+            reverse("encounter-list-create"),
+            {
+                "encounter_id": "STG-SYNTHETIC-ASSESSMENT-001",
+                "patient": patient_response.data["id"],
+                "encounter_date": "2026-08-29",
+                "encounter_type": "retinal_assessment",
+                "programme": "diabetic_screening",
+                "source_type": "clinic_direct",
+                "workflow_route": "sentinel_managed",
+                "payment_responsibility": "patient",
+            },
+            format="json",
+            HTTP_HOST="sentinel-clinic-backend-staging.onrender.com",
+        )
+        self.assertEqual(encounter_response.status_code, 201, encounter_response.data)
+        self.assertEqual(Patient.objects.filter(assigned_clinic=clinic).count(), 1)
+        encounter = ScreeningEncounter.objects.get(
+            encounter_id="STG-SYNTHETIC-ASSESSMENT-001"
+        )
+        self.assertEqual(encounter.originating_organization, clinic)
+        self.assertEqual(encounter.workflow_route, "sentinel_managed")
+        self.assertIsNotNone(encounter.service_branch)
