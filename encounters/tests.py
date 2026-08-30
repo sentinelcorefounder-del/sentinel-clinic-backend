@@ -20,6 +20,8 @@ from finance.models import (
 )
 from finance.services import top_up_wallet
 from consents.models import ConsentRecord
+from audit.models import PatientTimelineEvent
+from reports.models import StructuredReport, StructuredReportVersion
 
 from .models import (
     OcularAIReview,
@@ -27,6 +29,152 @@ from .models import (
     OcularInvestigation,
     ScreeningEncounter,
 )
+
+
+class ClinicalIntakeAccessTests(TestCase):
+    def setUp(self):
+        self.clinic = Organization.objects.create(
+            clinic_id="CLINIC-INTAKE", name="Clinical Intake Clinic",
+            organization_type="clinic",
+        )
+        self.other_clinic = Organization.objects.create(
+            clinic_id="CLINIC-INTAKE-OTHER", name="Other Intake Clinic",
+            organization_type="clinic",
+        )
+        self.hospital = Organization.objects.create(
+            clinic_id="HOSPITAL-INTAKE", name="Intake Hospital",
+            organization_type="hospital",
+        )
+        self.branch = OrganizationBranch.objects.create(
+            organization=self.clinic, branch_code="MAIN", name="Main",
+            is_head_office=True,
+        )
+        self.other_branch = OrganizationBranch.objects.create(
+            organization=self.clinic, branch_code="OTHER", name="Other",
+        )
+        self.patient = Patient.objects.create(
+            patient_id="PAT-INTAKE-1", first_name="Synthetic", last_name="Intake",
+            date_of_birth=date(1980, 1, 1), sex="female",
+            assigned_clinic=self.clinic, assigned_branch=self.branch,
+        )
+        self.encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-INTAKE-1", patient=self.patient,
+            encounter_date=date(2026, 8, 30), encounter_type="retinal_assessment",
+            programme="diabetic_screening", source_type="clinic_direct",
+            workflow_route="clinic_managed", payment_responsibility="patient",
+            originating_organization=self.clinic, service_branch=self.branch,
+            diabetes_duration="Ten years", symptoms_notes="Synthetic symptoms",
+            clinical_notes="Synthetic internal note",
+        )
+        self.client = APIClient()
+
+    def user(self, username, roles=(), organization=None, branch=None, superuser=False):
+        user = User.objects.create_user(username=username, password="test", is_superuser=superuser)
+        for role in roles:
+            user.groups.add(Group.objects.get_or_create(name=role)[0])
+        if organization:
+            UserOrganization.objects.create(user=user, organization=organization)
+        if branch:
+            UserBranchAccess.objects.create(user=user, branch=branch, is_default=True)
+        return user
+
+    def patch(self, user, payload):
+        self.client.force_authenticate(user)
+        return self.client.patch(
+            f"/api/encounters/{self.encounter.pk}/", payload, format="json"
+        )
+
+    def test_fresh_retrieval_returns_all_values_and_safe_blanks(self):
+        optometrist = self.user("intake-retrieve", {"optometrist"}, self.clinic, self.branch)
+        self.client.force_authenticate(optometrist)
+        response = self.client.get(f"/api/encounters/{self.encounter.pk}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["diabetes_duration"], "Ten years")
+        self.assertEqual(response.data["symptoms_notes"], "Synthetic symptoms")
+        self.assertEqual(response.data["clinical_notes"], "Synthetic internal note")
+        self.encounter.diabetes_duration = ""
+        self.encounter.symptoms_notes = ""
+        self.encounter.clinical_notes = ""
+        self.encounter.save()
+        response = self.client.get(f"/api/encounters/{self.encounter.pk}/")
+        self.assertEqual(
+            [response.data[field] for field in ("diabetes_duration", "symptoms_notes", "clinical_notes")],
+            ["", "", ""],
+        )
+
+    def test_exact_clinical_roles_can_update_and_partial_patch_preserves_other_fields(self):
+        optometrist = self.user("intake-opto", {"optometrist"}, self.clinic, self.branch)
+        response = self.patch(optometrist, {"clinical_notes": "Corrected synthetic note"})
+        self.assertEqual(response.status_code, 200, response.data)
+        self.encounter.refresh_from_db()
+        self.assertEqual(self.encounter.diabetes_duration, "Ten years")
+        self.assertEqual(self.encounter.symptoms_notes, "Synthetic symptoms")
+        self.assertEqual(self.encounter.clinical_notes, "Corrected synthetic note")
+
+        master = self.user(
+            "intake-master", {"clinic_admin", "optometrist"}, self.clinic, self.branch
+        )
+        self.assertEqual(self.patch(master, {"symptoms_notes": "Master correction"}).status_code, 200)
+        reviewer = self.user("intake-reviewer", {"reviewer"}, self.clinic, self.branch)
+        self.assertEqual(self.patch(reviewer, {"diabetes_duration": "Eleven years"}).status_code, 200)
+
+    def test_nonclinical_and_out_of_scope_users_cannot_update(self):
+        users = [
+            self.user("intake-admin", {"clinic_admin"}, self.clinic, self.branch),
+            self.user("intake-generic", {"admin"}, self.clinic, self.branch),
+            self.user("intake-super", (), self.clinic, self.branch, superuser=True),
+            self.user("intake-other-org", {"optometrist"}, self.other_clinic),
+            self.user("intake-wrong-branch", {"optometrist"}, self.clinic, self.other_branch),
+            self.user("intake-hospital", {"optometrist"}, self.hospital),
+        ]
+        for index, user in enumerate(users):
+            response = self.patch(user, {"clinical_notes": f"Denied {index}"})
+            self.assertIn(response.status_code, {403, 404})
+        self.encounter.refresh_from_db()
+        self.assertEqual(self.encounter.clinical_notes, "Synthetic internal note")
+
+    def test_mixed_patch_cannot_bypass_intake_authority(self):
+        admin = self.user("intake-mixed-admin", {"clinic_admin"}, self.clinic, self.branch)
+        response = self.patch(admin, {
+            "clinical_notes": "Denied mixed update",
+            "dilation_notes": "Must also roll back",
+        })
+        self.assertEqual(response.status_code, 403)
+        self.encounter.refresh_from_db()
+        self.assertEqual(self.encounter.clinical_notes, "Synthetic internal note")
+        self.assertEqual(self.encounter.dilation_notes, "")
+
+    def test_safe_audit_names_changed_fields_without_note_content(self):
+        optometrist = self.user("intake-audit", {"optometrist"}, self.clinic, self.branch)
+        secret_text = "Distinctive synthetic private note"
+        response = self.patch(optometrist, {"clinical_notes": secret_text})
+        self.assertEqual(response.status_code, 200)
+        event = PatientTimelineEvent.objects.get(event_type="clinical_intake_updated")
+        self.assertEqual(event.metadata, {"changed_fields": ["clinical_notes"]})
+        self.assertNotIn(secret_text, event.description)
+        self.assertNotIn(secret_text, str(event.metadata))
+
+    def test_issued_report_and_versions_are_unchanged(self):
+        report = StructuredReport.objects.create(
+            report_id="REP-INTAKE-1", encounter=self.encounter, patient=self.patient,
+            review_date=date(2026, 8, 30), report_status="clinic_issued",
+            notes="Controlled report note",
+        )
+        version = StructuredReportVersion.objects.create(
+            report=report, version_number=1,
+            clinical_snapshot={"notes": "Controlled report note"},
+            checksum_sha256="a" * 64, purpose="initial",
+        )
+        StructuredReport.objects.filter(pk=report.pk).update(issued_version=version)
+        optometrist = self.user("intake-issued", {"optometrist"}, self.clinic, self.branch)
+        response = self.patch(optometrist, {"clinical_notes": "Updated after issue"})
+        self.assertEqual(response.status_code, 200)
+        report.refresh_from_db()
+        version.refresh_from_db()
+        self.assertEqual(report.notes, "Controlled report note")
+        self.assertEqual(report.issued_version_id, version.pk)
+        self.assertEqual(report.versions.count(), 1)
+        self.assertEqual(version.clinical_snapshot, {"notes": "Controlled report note"})
 
 
 class OcularDiagnosticWorkflowTests(TestCase):

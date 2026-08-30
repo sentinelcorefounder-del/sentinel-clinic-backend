@@ -23,6 +23,7 @@ from organizations.services.branches import (
     get_user_default_branch,
 )
 from referrals.models import HospitalReferral
+from users.clinical_authority import exact_clinical_authority
 from users.models import UserOrganization
 from finance.models import (
     OrganizationWallet,
@@ -49,6 +50,11 @@ from .serializers import (
 
 
 CLOSED_REFERRAL_STATUSES = {"completed", "cancelled"}
+CLINICAL_INTAKE_FIELDS = frozenset({
+    "diabetes_duration",
+    "symptoms_notes",
+    "clinical_notes",
+})
 
 
 def latest_valid_consent(encounter, consent_type):
@@ -509,6 +515,7 @@ class ScreeningEncounterDetailView(
             service_branch_id__in=branch_ids
         )
 
+    @transaction.atomic
     def perform_update(self, serializer):
         org = get_user_clinic(self.request.user)
         if not org or org.organization_type != "clinic":
@@ -521,7 +528,49 @@ class ScreeningEncounterDetailView(
             raise PermissionDenied(
                 "You cannot update encounters outside your clinic."
             )
-        serializer.save()
+
+        changed_intake_fields = sorted(
+            field
+            for field in CLINICAL_INTAKE_FIELDS
+            if field in serializer.validated_data
+            and serializer.validated_data[field] != getattr(serializer.instance, field)
+        )
+        if changed_intake_fields:
+            authority = exact_clinical_authority(self.request.user)
+            if not authority:
+                raise PermissionDenied(
+                    "Exact optometrist or qualified reviewer authority is required "
+                    "to update clinical intake."
+                )
+            branch = serializer.instance.service_branch or patient.assigned_branch
+            has_branch_access = bool(branch) and self.request.user.branch_access.filter(
+                branch__organization=org,
+            ).filter(
+                Q(branch=branch) | Q(has_all_branch_access=True)
+            ).exists()
+            if not has_branch_access:
+                raise PermissionDenied(
+                    "You do not have access to the encounter branch."
+                )
+
+        encounter = serializer.save()
+        if changed_intake_fields:
+            record_patient_event(
+                patient=encounter.patient,
+                event_key=f"encounter:{encounter.pk}:clinical-intake:{encounter.updated_at.isoformat()}",
+                category="encounter",
+                event_type="clinical_intake_updated",
+                title="Clinical intake updated",
+                description=f"Clinical intake was updated for encounter {encounter.encounter_id}.",
+                source_type="encounter",
+                source_id=encounter.pk,
+                encounter_id=encounter.encounter_id,
+                actor=self.request.user,
+                organization=org,
+                visibility="clinic_ops",
+                metadata={"changed_fields": changed_intake_fields},
+                occurred_at=encounter.updated_at,
+            )
 
 
 class PatientEncounterListView(generics.ListAPIView):
