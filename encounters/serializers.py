@@ -156,11 +156,18 @@ class OcularDiagnosticAssessmentSerializer(serializers.ModelSerializer):
 
 
 class ScreeningEncounterSerializer(serializers.ModelSerializer):
+    assessment_location_type = serializers.ChoiceField(
+        choices=[("clinic", "Clinic"), ("hospital", "Hospital"), ("mobile", "Mobile / client site")],
+        write_only=True, required=False,
+    )
+    assessment_location_name = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=255)
+    assessment_location_address = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=500)
     poor_va_flag = serializers.SerializerMethodField()
     poor_va_reason = serializers.SerializerMethodField()
     source_hospital_name = serializers.SerializerMethodField()
     originating_organization_name = serializers.SerializerMethodField()
     ocular_assessment = OcularDiagnosticAssessmentSerializer(read_only=True)
+    service_package_locked = serializers.SerializerMethodField()
 
     class Meta:
         model = ScreeningEncounter
@@ -172,6 +179,12 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "encounter_date",
             "encounter_type",
             "programme",
+            "service_package",
+            "service_package_locked",
+            "assessment_location_snapshot",
+            "assessment_location_type",
+            "assessment_location_name",
+            "assessment_location_address",
             "ocular_assessment",
             "source_type",
             "workflow_route",
@@ -225,6 +238,7 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "originating_organization",
             "originating_organization_name",
             "service_branch",
+            "assessment_location_snapshot",
             "source_hospital_name",
             "source_overridden_by",
             "source_overridden_at",
@@ -246,6 +260,7 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
                 "workflow_route",
                 "payment_responsibility",
                 "programme",
+                "service_package",
             }
             changed = []
 
@@ -273,6 +288,30 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
                 })
 
         return attrs
+
+    def create(self, validated_data):
+        location_type = validated_data.pop("assessment_location_type", "")
+        location_name = (validated_data.pop("assessment_location_name", "") or "").strip()
+        location_address = (validated_data.pop("assessment_location_address", "") or "").strip()
+        branch = validated_data.get("service_branch")
+        if not location_type and branch:
+            location_type = "clinic"
+        if not location_name and branch:
+            location_name = branch.name
+            location_address = location_address or branch.address
+        if not location_type or not location_name:
+            raise serializers.ValidationError({
+                "assessment_location_name": "Location type and site/location name are required."
+            })
+        validated_data["assessment_location_snapshot"] = {
+            "location_type": location_type,
+            "site_name": location_name,
+            "address": location_address,
+            "branch_id": branch.pk if branch else None,
+            "branch_code": branch.branch_code if branch else "",
+            "branch_name": branch.name if branch else "",
+        }
+        return super().create(validated_data)
 
     def _normalise_va(self, value):
         return (value or "").strip().lower().replace(" ", "")
@@ -323,3 +362,25 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
     def get_originating_organization_name(self, obj):
         organization = getattr(obj, "originating_organization", None)
         return organization.name if organization else ""
+
+    def get_service_package_locked(self, obj):
+        try:
+            if obj.structured_report.report_status not in {
+                "draft", "under_review", "returned_to_clinic", "ops_rejected"
+            }:
+                return True
+        except Exception:
+            pass
+        try:
+            eye_report = obj.eye_health_report
+            eye_correction_open = bool(
+                eye_report.status == "draft" and eye_report.correction_source_version_id
+            )
+            if eye_report.versions.exists() and not eye_correction_open:
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(obj.ocular_assessment.completed_at)
+        except Exception:
+            return False

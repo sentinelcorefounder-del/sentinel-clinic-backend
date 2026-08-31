@@ -18,6 +18,12 @@ from .views import (
     approve_report_by_ops,
     reject_report_by_ops,
     clinic_issue_report,
+    EyeHealthScreeningReportView,
+    EyeHealthScreeningPreviewView,
+    EyeHealthScreeningFinalizeView,
+    EyeHealthScreeningCorrectionView,
+    EyeHealthScreeningPDFView,
+    CombinedScreeningBundleView,
 )
 
 urlpatterns = [
@@ -45,6 +51,12 @@ urlpatterns = [
     path("", StructuredReportListCreateView.as_view(), name="report-list-create"),
     path("<int:pk>/", StructuredReportDetailView.as_view(), name="report-detail"),
     path("<int:pk>/pdf/", StructuredReportPDFView.as_view(), name="report-pdf"),
+    path("eye-health/encounter/<int:encounter_id>/", EyeHealthScreeningReportView.as_view(), name="eye-health-report"),
+    path("eye-health/<int:pk>/preview/", EyeHealthScreeningPreviewView.as_view(), name="eye-health-preview"),
+    path("eye-health/<int:pk>/finalize/", EyeHealthScreeningFinalizeView.as_view(), name="eye-health-finalize"),
+    path("eye-health/<int:pk>/correction/", EyeHealthScreeningCorrectionView.as_view(), name="eye-health-correction"),
+    path("eye-health/<int:pk>/pdf/", EyeHealthScreeningPDFView.as_view(), name="eye-health-pdf"),
+    path("eye-health/combined/<int:encounter_id>/bundle/", CombinedScreeningBundleView.as_view(), name="combined-screening-bundle"),
     path("<int:pk>/submit-to-ops/", submit_report_to_ops, name="report-submit-to-ops"),
     path("<int:pk>/clinic-issue/", clinic_issue_report, name="report-clinic-issue"),
     path("<int:pk>/ops-approve/", approve_report_by_ops, name="report-ops-approve"),

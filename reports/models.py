@@ -469,3 +469,91 @@ class StructuredReportVersion(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Clinical report versions cannot be deleted.")
+
+
+class EyeHealthScreeningReport(models.Model):
+    class Outcome(models.TextChoices):
+        NO_IMMEDIATE_CONCERN = "no_immediate_concern", "No immediate concern identified"
+        ROUTINE_EXAM = "routine_eye_examination", "Routine eye examination advised"
+        FURTHER_ASSESSMENT = "further_assessment", "Further assessment recommended"
+        URGENT_OPHTHALMOLOGY = "urgent_ophthalmology", "Urgent ophthalmology assessment recommended"
+        INCONCLUSIVE = "inconclusive_repeat", "Inconclusive — repeat testing required"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        FINALIZED = "finalized", "Finalized"
+
+    encounter = models.OneToOneField(
+        ScreeningEncounter, on_delete=models.PROTECT, related_name="eye_health_report"
+    )
+    outcome = models.CharField(max_length=40, choices=Outcome.choices, blank=True, default="")
+    selected_advice = models.JSONField(default=list, blank=True)
+    advice = models.TextField(blank=True, default="")
+    right_visual_field_result = models.TextField(blank=True, default="")
+    left_visual_field_result = models.TextField(blank=True, default="")
+    right_fundus_result = models.TextField(blank=True, default="")
+    left_fundus_result = models.TextField(blank=True, default="")
+    selected_fundus_upload_ids = models.JSONField(default=list, blank=True)
+    selected_visual_field_investigation_ids = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    preview_checksum = models.CharField(max_length=64, blank=True, default="")
+    previewed_at = models.DateTimeField(null=True, blank=True)
+    lock_version = models.PositiveIntegerField(default=1)
+    finalized_version = models.OneToOneField(
+        "EyeHealthScreeningReportVersion", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="finalized_for_report",
+    )
+    correction_reason = models.TextField(blank=True, default="")
+    correction_source_version = models.ForeignKey(
+        "EyeHealthScreeningReportVersion", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="correction_drafts",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
+class EyeHealthScreeningReportVersion(models.Model):
+    report = models.ForeignKey(
+        EyeHealthScreeningReport, on_delete=models.PROTECT, related_name="versions"
+    )
+    version_number = models.PositiveIntegerField()
+    clinical_snapshot = models.JSONField(default=dict)
+    checksum_sha256 = models.CharField(max_length=64)
+    clinician_snapshot = models.JSONField(default=dict)
+    attachment_manifest = models.JSONField(default=list, blank=True)
+    editor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="eye_health_report_versions",
+    )
+    purpose = models.CharField(
+        max_length=20, choices=[("initial", "Initial"), ("correction", "Correction")],
+        default="initial",
+    )
+    correction_note = models.TextField(blank=True, default="")
+    source_version = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="corrected_versions",
+    )
+    pdf_object_key = models.CharField(max_length=500, blank=True, default="")
+    pdf_checksum_sha256 = models.CharField(max_length=64, blank=True, default="")
+    pdf_size = models.PositiveBigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["version_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "version_number"], name="eye_health_unique_version"
+            )
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Eye-health screening report versions are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Eye-health screening report versions cannot be deleted.")

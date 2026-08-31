@@ -11,11 +11,17 @@ from .views import (
     OcularInvestigationContentView,
     OcularAIReviewListCreateView,
     OcularAIReviewDecisionView,
+    EncounterServicePackageCorrectionView,
 )
 
 urlpatterns = [
     path("", ScreeningEncounterListCreateView.as_view(), name="encounter-list-create"),
     path("<int:pk>/", ScreeningEncounterDetailView.as_view(), name="encounter-detail"),
+    path(
+        "<int:pk>/service-package/",
+        EncounterServicePackageCorrectionView.as_view(),
+        name="encounter-service-package-correction",
+    ),
     path(
         "<int:encounter_id>/ocular-assessment/",
         OcularDiagnosticAssessmentDetailView.as_view(),

@@ -37,6 +37,7 @@ from .models import (
     OcularAIReview,
     OcularDiagnosticAssessment,
     OcularInvestigation,
+    EncounterServicePackageEvent,
     ScreeningEncounter,
 )
 from .ocular_ai_service import run_ocular_ai_review
@@ -256,25 +257,41 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
         requested_source = (
             serializer.validated_data.get("source_type") or ""
         ).strip()
-        requested_programme = (
-            serializer.validated_data.get("programme") or "diabetic_screening"
-        ).strip()
+        requested_package = (serializer.validated_data.get("service_package") or "").strip()
+        legacy_programme = (serializer.validated_data.get("programme") or "diabetic_screening").strip()
+        if not requested_package:
+            requested_package = {
+                "diabetic_screening": ScreeningEncounter.ServicePackage.DIABETIC_RETINAL,
+                "eye_health_screening": ScreeningEncounter.ServicePackage.EYE_HEALTH_SCREENING,
+                "combined_assessment": ScreeningEncounter.ServicePackage.COMBINED,
+                "ocular_diagnostics": ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR,
+            }.get(legacy_programme, "")
+        package_map = {
+            ScreeningEncounter.ServicePackage.DIABETIC_RETINAL: ("diabetic_screening", "retinal_assessment"),
+            ScreeningEncounter.ServicePackage.EYE_HEALTH_SCREENING: ("eye_health_screening", "eye_health_screening"),
+            ScreeningEncounter.ServicePackage.COMBINED: ("combined_assessment", "combined_assessment"),
+            ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR: ("ocular_diagnostics", "ocular_assessment"),
+        }
+        if requested_package not in package_map:
+            raise PermissionDenied("Choose a valid service package.")
+        requested_programme, requested_encounter_type = package_map[requested_package]
         valid_programmes = {
             "diabetic_screening",
+            "eye_health_screening",
             "ocular_diagnostics",
             "combined_assessment",
         }
         if requested_programme not in valid_programmes:
             raise PermissionDenied("Choose a valid assessment type.")
         if (
-            requested_programme in {"ocular_diagnostics", "combined_assessment"}
+            requested_package != ScreeningEncounter.ServicePackage.DIABETIC_RETINAL
             and not profile.ocular_diagnostics_enabled
         ):
             raise PermissionDenied(
                 "Ocular diagnostics is not enabled for this clinic."
             )
         if (
-            requested_programme == "ocular_diagnostics"
+            requested_package == ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
             and requested_source != "clinic_direct"
         ):
             raise PermissionDenied(
@@ -322,11 +339,8 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
             values = {
                 "originating_organization": org,
                 "programme": requested_programme,
-                "encounter_type": (
-                    "combined_assessment"
-                    if requested_programme == "combined_assessment"
-                    else "retinal_assessment"
-                ),
+                "service_package": requested_package,
+                "encounter_type": requested_encounter_type,
                 "source_type": "hospital_referral",
                 "workflow_route": "sentinel_managed",
                 "payment_responsibility": "hospital",
@@ -338,7 +352,7 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
 
         elif requested_source == "clinic_direct":
             if (
-                requested_programme != "ocular_diagnostics"
+                requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
                 and not profile.clinic_direct_screening_enabled
             ):
                 raise PermissionDenied(
@@ -346,7 +360,7 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
                     "enabled for this clinic."
                 )
 
-            if active_referrals and requested_programme != "ocular_diagnostics":
+            if active_referrals and requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR:
                 if not override_reason:
                     raise PermissionDenied(
                         "This patient has an active hospital referral. "
@@ -362,7 +376,7 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
             requested_route = (
                 serializer.validated_data.get("workflow_route") or ""
             )
-            if requested_programme == "ocular_diagnostics":
+            if requested_package == ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR:
                 route = "clinic_managed"
             elif profile.workflow_mode == "sentinel_managed":
                 route = "sentinel_managed"
@@ -381,13 +395,8 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
             values = {
                 "originating_organization": org,
                 "programme": requested_programme,
-                "encounter_type": (
-                    "ocular_assessment"
-                    if requested_programme == "ocular_diagnostics"
-                    else "combined_assessment"
-                    if requested_programme == "combined_assessment"
-                    else "retinal_assessment"
-                ),
+                "service_package": requested_package,
+                "encounter_type": requested_encounter_type,
                 "source_type": "clinic_direct",
                 "workflow_route": route,
                 "payment_responsibility": (
@@ -400,19 +409,19 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
                 "source_override_reason": (
                     override_reason
                     if active_referrals
-                    and requested_programme != "ocular_diagnostics"
+                    and requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
                     else ""
                 ),
                 "source_overridden_by": (
                     user
                     if active_referrals
-                    and requested_programme != "ocular_diagnostics"
+                    and requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
                     else None
                 ),
                 "source_overridden_at": (
                     timezone.now()
                     if active_referrals
-                    and requested_programme != "ocular_diagnostics"
+                    and requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
                     else None
                 ),
             }
@@ -434,7 +443,7 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
         if (
             active_referrals
             and requested_source == "clinic_direct"
-            and requested_programme != "ocular_diagnostics"
+            and requested_package != ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR
         ):
             record_patient_event(
                 patient=patient,
@@ -571,6 +580,105 @@ class ScreeningEncounterDetailView(
                 metadata={"changed_fields": changed_intake_fields},
                 occurred_at=encounter.updated_at,
             )
+
+
+class EncounterServicePackageCorrectionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        encounter = get_object_or_404(
+            ScreeningEncounter.objects.select_for_update().select_related(
+                "patient__assigned_clinic", "patient__assigned_branch", "service_branch"
+            ), pk=pk,
+        )
+        clinic = encounter.patient.assigned_clinic
+        user_org = get_user_clinic(request.user)
+        if not clinic or not user_org or user_org.pk != clinic.pk:
+            raise PermissionDenied("The encounter is outside your performing clinic.")
+        authority = exact_clinical_authority(request.user)
+        if not authority:
+            raise PermissionDenied("Exact optometrist or qualified reviewer authority is required.")
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not branch or not request.user.branch_access.filter(
+            branch__organization=clinic,
+        ).filter(Q(branch=branch) | Q(has_all_branch_access=True)).exists():
+            raise PermissionDenied("You do not have access to the encounter branch.")
+
+        finalized = False
+        try:
+            finalized = encounter.structured_report.report_status not in {
+                "draft", "under_review", "returned_to_clinic", "ops_rejected"
+            }
+        except Exception:
+            pass
+        try:
+            eye_report = encounter.eye_health_report
+            eye_correction_open = bool(
+                eye_report.status == "draft" and eye_report.correction_source_version_id
+            )
+            finalized = finalized or (
+                eye_report.versions.exists() and not eye_correction_open
+            )
+        except Exception:
+            pass
+        try:
+            finalized = finalized or bool(encounter.ocular_assessment.completed_at)
+        except Exception:
+            pass
+        if finalized:
+            return Response(
+                {"detail": "The service package is locked after report finalization."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        new_package = str(request.data.get("service_package") or "").strip()
+        valid = {value for value, _label in ScreeningEncounter.ServicePackage.choices}
+        if new_package not in valid:
+            return Response({"detail": "Choose a valid service package."}, status=400)
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"detail": "A correction reason is required."}, status=400)
+        old_package = encounter.service_package or ""
+        if old_package == new_package:
+            return Response(ScreeningEncounterSerializer(encounter, context={"request": request}).data)
+        diabetic_confirmed = bool(request.data.get("diabetic_confirmed", False))
+        if (
+            old_package in {"", ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR}
+            and new_package == ScreeningEncounter.ServicePackage.COMBINED
+            and not diabetic_confirmed
+        ):
+            return Response(
+                {"detail": "Confirm that the patient is diabetic before changing to the combined package."},
+                status=400,
+            )
+        programme, encounter_type = {
+            ScreeningEncounter.ServicePackage.DIABETIC_RETINAL: ("diabetic_screening", "retinal_assessment"),
+            ScreeningEncounter.ServicePackage.EYE_HEALTH_SCREENING: ("eye_health_screening", "eye_health_screening"),
+            ScreeningEncounter.ServicePackage.COMBINED: ("combined_assessment", "combined_assessment"),
+            ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR: ("ocular_diagnostics", "ocular_assessment"),
+        }[new_package]
+        encounter.service_package = new_package
+        encounter.programme = programme
+        encounter.encounter_type = encounter_type
+        encounter.save(update_fields=["service_package", "programme", "encounter_type", "updated_at"])
+        if new_package == ScreeningEncounter.ServicePackage.COMPREHENSIVE_OCULAR:
+            OcularDiagnosticAssessment.objects.get_or_create(encounter=encounter)
+        package_event = EncounterServicePackageEvent.objects.create(
+            encounter=encounter, old_package=old_package, new_package=new_package,
+            reason=reason, diabetic_confirmed=diabetic_confirmed, actor=request.user,
+        )
+        record_patient_event(
+            patient=encounter.patient,
+            event_key=f"encounter:{encounter.pk}:service-package:{package_event.pk}",
+            category="encounter", event_type="service_package_corrected",
+            title="Service package corrected",
+            description=f"Service package corrected for encounter {encounter.encounter_id}.",
+            source_type="encounter", source_id=encounter.pk, encounter_id=encounter.encounter_id,
+            actor=request.user, organization=clinic, visibility="clinic_ops",
+            metadata={"old_package": old_package, "new_package": new_package, "reason": reason},
+        )
+        return Response(ScreeningEncounterSerializer(encounter, context={"request": request}).data)
 
 
 class PatientEncounterListView(generics.ListAPIView):

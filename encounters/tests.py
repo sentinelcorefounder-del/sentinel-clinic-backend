@@ -266,7 +266,7 @@ class OcularDiagnosticWorkflowTests(TestCase):
             ).exists()
         )
 
-    def test_combined_encounter_has_both_programme_flags(self):
+    def test_combined_encounter_has_diabetic_and_eye_health_flags(self):
         response = self.client.post(
             "/api/encounters/",
             self.payload("combined_assessment"),
@@ -275,8 +275,29 @@ class OcularDiagnosticWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201, response.data)
         encounter = ScreeningEncounter.objects.get(pk=response.data["id"])
         self.assertTrue(encounter.includes_diabetic_screening)
-        self.assertTrue(encounter.includes_ocular_diagnostics)
-        self.assertTrue(hasattr(encounter, "ocular_assessment"))
+        self.assertTrue(encounter.includes_eye_health_screening)
+        self.assertFalse(encounter.includes_ocular_diagnostics)
+        self.assertFalse(hasattr(encounter, "ocular_assessment"))
+        self.assertEqual(encounter.assessment_location_snapshot["site_name"], self.branch.name)
+        self.assertEqual(encounter.assessment_location_snapshot["branch_code"], self.branch.branch_code)
+
+    def test_mobile_location_is_snapshotted_without_rewriting_branch(self):
+        payload = self.payload("eye_health_screening")
+        payload.update({
+            "assessment_location_type": "mobile",
+            "assessment_location_name": "Synthetic community site",
+            "assessment_location_address": "Synthetic district",
+        })
+        response = self.client.post("/api/encounters/", payload, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        encounter = ScreeningEncounter.objects.get(pk=response.data["id"])
+        self.assertEqual(encounter.assessment_location_snapshot["location_type"], "mobile")
+        self.assertEqual(encounter.assessment_location_snapshot["site_name"], "Synthetic community site")
+        self.assertEqual(encounter.assessment_location_snapshot["branch_id"], self.branch.pk)
+        self.branch.name = "Renamed after assessment"
+        self.branch.save(update_fields=["name"])
+        encounter.refresh_from_db()
+        self.assertEqual(encounter.assessment_location_snapshot["site_name"], "Synthetic community site")
 
     def test_disabled_clinic_cannot_create_ocular_encounter(self):
         self.profile.ocular_diagnostics_enabled = False

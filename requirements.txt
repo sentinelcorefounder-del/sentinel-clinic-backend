@@ -26,4 +26,5 @@ tzdata==2025.3
 urllib3==2.6.3
 whitenoise==6.12.0
 reportlab
+pypdf==5.9.0
 openai

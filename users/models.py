@@ -66,3 +66,19 @@ class UserBranchAccess(models.Model):
             raise ValidationError(
                 {"branch": "Branch must belong to the user's organization."}
             )
+
+
+class ClinicalProfessionalProfile(models.Model):
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="clinical_professional_profile"
+    )
+    display_name = models.CharField(max_length=255)
+    professional_role = models.CharField(max_length=120)
+    registration_number = models.CharField(max_length=120)
+    qualifications = models.CharField(max_length=255, blank=True, default="")
+    is_verified = models.BooleanField(default=False)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user.username} professional profile"

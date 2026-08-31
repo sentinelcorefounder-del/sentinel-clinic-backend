@@ -4,7 +4,56 @@ from .models import (
     ReportStatusEvent,
     StructuredReport,
     StructuredReportVersion,
+    EyeHealthScreeningReport,
+    EyeHealthScreeningReportVersion,
 )
+
+
+class EyeHealthScreeningReportVersionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EyeHealthScreeningReportVersion
+        fields = [
+            "id", "version_number", "checksum_sha256", "clinician_snapshot",
+            "attachment_manifest", "pdf_checksum_sha256", "pdf_size", "created_at",
+            "purpose", "correction_note", "source_version",
+        ]
+        read_only_fields = fields
+
+
+class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
+    finalized_version_detail = EyeHealthScreeningReportVersionSerializer(
+        source="finalized_version", read_only=True
+    )
+    professional_defaults = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EyeHealthScreeningReport
+        fields = [
+            "id", "encounter", "outcome", "selected_advice", "advice",
+            "right_visual_field_result", "left_visual_field_result",
+            "right_fundus_result", "left_fundus_result",
+            "selected_fundus_upload_ids", "selected_visual_field_investigation_ids",
+            "status", "previewed_at", "lock_version", "finalized_version",
+            "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
+            "correction_source_version",
+        ]
+        read_only_fields = [
+            "encounter", "status", "previewed_at", "lock_version", "finalized_version",
+            "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
+            "correction_source_version",
+        ]
+
+    def get_professional_defaults(self, obj):
+        user = self.context.get("request").user if self.context.get("request") else None
+        profile = getattr(user, "clinical_professional_profile", None)
+        if not profile or not profile.is_verified:
+            return None
+        return {
+            "display_name": profile.display_name,
+            "professional_role": profile.professional_role,
+            "registration_number": profile.registration_number,
+            "qualifications": profile.qualifications,
+        }
 
 
 class StructuredReportVersionSerializer(serializers.ModelSerializer):
@@ -228,6 +277,11 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"encounter": "The selected encounter does not belong to this patient."}
             )
+
+        if encounter and self.instance is None and not encounter.includes_diabetic_screening:
+            raise serializers.ValidationError({
+                "encounter": "Diabetic grading is available only for diabetic or combined service packages."
+            })
 
         if self.instance:
             immutable = {

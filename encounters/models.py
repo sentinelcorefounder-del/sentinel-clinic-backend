@@ -128,8 +128,15 @@ class AssessmentServiceSession(models.Model):
 
 
 class ScreeningEncounter(models.Model):
+    class ServicePackage(models.TextChoices):
+        DIABETIC_RETINAL = "diabetic_retinal_assessment", "Diabetic retinal assessment"
+        EYE_HEALTH_SCREENING = "eye_health_screening", "Eye-health screening"
+        COMBINED = "combined_diabetic_eye_health", "Combined diabetic and eye-health screening"
+        COMPREHENSIVE_OCULAR = "comprehensive_ocular_assessment", "Comprehensive ocular assessment"
+
     PROGRAMME_CHOICES = [
         ("diabetic_screening", "Diabetic Retinal Assessment"),
+        ("eye_health_screening", "Eye-health Screening"),
         ("ocular_diagnostics", "General Ocular Assessment"),
         ("combined_assessment", "Combined Diabetic and Ocular Assessment"),
     ]
@@ -169,6 +176,10 @@ class ScreeningEncounter(models.Model):
     )
     encounter_date = models.DateField()
     encounter_type = models.CharField(max_length=50, default="retinal_assessment")
+    service_package = models.CharField(
+        max_length=50, choices=ServicePackage.choices, null=True, blank=True,
+        help_text="Authoritative clinical service package. Historical unclassified ocular episodes remain blank.",
+    )
 
     programme = models.CharField(
         max_length=40, choices=PROGRAMME_CHOICES, default="diabetic_screening"
@@ -205,6 +216,7 @@ class ScreeningEncounter(models.Model):
         related_name="encounters",
     )
     service_delivery_snapshot = models.JSONField(default=dict, blank=True)
+    assessment_location_snapshot = models.JSONField(default=dict, blank=True)
     hospital_referral = models.ForeignKey(
         "referrals.HospitalReferral",
         on_delete=models.SET_NULL,
@@ -263,7 +275,7 @@ class ScreeningEncounter(models.Model):
     def save(self, *args, **kwargs):
         if self.pk:
             previous = ScreeningEncounter.objects.filter(pk=self.pk).values(
-                "service_session_id", "service_delivery_snapshot"
+                "service_session_id", "service_delivery_snapshot", "assessment_location_snapshot"
             ).first()
             if previous and previous["service_delivery_snapshot"]:
                 if (
@@ -273,15 +285,27 @@ class ScreeningEncounter(models.Model):
                     raise ValidationError(
                         "The service-session link and delivery snapshot are immutable."
                     )
+            if previous and previous["assessment_location_snapshot"] != self.assessment_location_snapshot:
+                raise ValidationError("The assessment-location snapshot is immutable.")
         return super().save(*args, **kwargs)
 
     @property
     def includes_diabetic_screening(self):
-        return self.programme in {"diabetic_screening", "combined_assessment"}
+        return self.service_package in {
+            self.ServicePackage.DIABETIC_RETINAL, self.ServicePackage.COMBINED,
+        } or (not self.service_package and self.programme in {"diabetic_screening", "combined_assessment"})
+
+    @property
+    def includes_eye_health_screening(self):
+        return self.service_package in {
+            self.ServicePackage.EYE_HEALTH_SCREENING, self.ServicePackage.COMBINED,
+        } or (not self.service_package and self.programme == "combined_assessment")
 
     @property
     def includes_ocular_diagnostics(self):
-        return self.programme in {"ocular_diagnostics", "combined_assessment"}
+        return self.service_package == self.ServicePackage.COMPREHENSIVE_OCULAR or (
+            not self.service_package and self.programme == "ocular_diagnostics"
+        )
 
     def update_status_from_related_records(self):
         if self.screening_status == "cancelled":
@@ -296,27 +320,35 @@ class ScreeningEncounter(models.Model):
                 ocular_completed = False
 
         try:
+            eye_health_completed = self.eye_health_report.status == "finalized"
+        except Exception:
+            eye_health_completed = False
+
+        try:
             report = self.structured_report
             has_reports = True
             has_completed_report = report.report_status in {
                 "issued", "submitted_to_ops", "ops_approved"
             }
         except Exception:
-            has_reports = self.reports.exists()
-            has_completed_report = self.reports.filter(
-                report_status__in=["issued", "submitted_to_ops", "ops_approved"]
-            ).exists()
+            has_reports = False
+            has_completed_report = False
 
-        if self.programme == "ocular_diagnostics" and ocular_completed:
+        if self.includes_ocular_diagnostics and ocular_completed:
             new_status = "completed"
         elif (
-            self.programme == "combined_assessment"
-            and ocular_completed
+            self.service_package == self.ServicePackage.COMBINED
+            and eye_health_completed
             and has_completed_report
         ):
             new_status = "completed"
+        elif self.service_package == self.ServicePackage.EYE_HEALTH_SCREENING and eye_health_completed:
+            new_status = "completed"
         elif (
-            self.programme == "diabetic_screening"
+            (
+                self.service_package == self.ServicePackage.DIABETIC_RETINAL
+                or (not self.service_package and self.programme == "diabetic_screening")
+            )
             and has_completed_report
         ):
             new_status = "completed"
@@ -330,6 +362,32 @@ class ScreeningEncounter(models.Model):
         if self.screening_status != new_status:
             self.screening_status = new_status
             self.save(update_fields=["screening_status", "updated_at"])
+
+
+class EncounterServicePackageEvent(models.Model):
+    encounter = models.ForeignKey(
+        ScreeningEncounter, on_delete=models.PROTECT, related_name="service_package_events"
+    )
+    old_package = models.CharField(max_length=50, blank=True, default="")
+    new_package = models.CharField(max_length=50, choices=ScreeningEncounter.ServicePackage.choices)
+    reason = models.TextField()
+    diabetic_confirmed = models.BooleanField(default=False)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="service_package_corrections",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Service-package audit events are append-only.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Service-package audit events cannot be deleted.")
 
 
 class OcularDiagnosticAssessment(models.Model):

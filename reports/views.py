@@ -1,12 +1,16 @@
 from io import BytesIO
 import os
+import hashlib
 
 from django.http import Http404, HttpResponse
+from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+from pypdf import PdfReader, PdfWriter
 from rest_framework import generics, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
@@ -17,7 +21,10 @@ from rest_framework.views import APIView
 from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
-from .models import ReportClinicalResponsibility, StructuredReport, ReportStatusEvent
+from .models import (
+    EyeHealthScreeningReport, ReportClinicalResponsibility,
+    StructuredReport, ReportStatusEvent,
+)
 from .clinical_integrity import (
     CLINICAL_FIELDS,
     accept_responsibility,
@@ -37,7 +44,11 @@ from .permissions import (
     CanReviewOpsReports,
     CanSubmitReportToOps,
 )
-from .serializers import StructuredReportSerializer
+from .serializers import EyeHealthScreeningReportSerializer, StructuredReportSerializer
+from .eye_health import (
+    build_complete_pdf, finalize_screening_report, professional_snapshot,
+    require_eye_health_authority, screening_snapshot,
+)
 from .referral_linking import (
     build_report_pdf_url,
     sync_report_to_local_hospital_referral,
@@ -750,4 +761,220 @@ class StructuredReportPDFView(APIView):
         response["Content-Disposition"] = (
             f'inline; filename="{report.report_id}-{report_format}.pdf"'
         )
+        return response
+
+
+class EyeHealthScreeningReportView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _encounter(self, request, encounter_id):
+        from encounters.models import ScreeningEncounter
+        encounter = get_object_or_404(
+            ScreeningEncounter.objects.select_related(
+                "patient__assigned_clinic", "patient__assigned_branch", "service_branch"
+            ), pk=encounter_id,
+        )
+        if not encounter.includes_eye_health_screening:
+            raise PermissionDenied("This encounter does not include eye-health screening.")
+        require_eye_health_authority(request.user, encounter)
+        return encounter
+
+    def get(self, request, encounter_id):
+        encounter = self._encounter(request, encounter_id)
+        report = EyeHealthScreeningReport.objects.filter(encounter=encounter).first()
+        if not report:
+            return Response({"detail": "No eye-health screening report draft exists."}, status=404)
+        return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+
+    @transaction.atomic
+    def post(self, request, encounter_id):
+        encounter = self._encounter(request, encounter_id)
+        encounter = encounter.__class__.objects.select_for_update().get(pk=encounter.pk)
+        report = EyeHealthScreeningReport.objects.select_for_update().filter(encounter=encounter).first()
+        _created = report is None
+        if report is None:
+            report = EyeHealthScreeningReport.objects.create(encounter=encounter)
+        if report.status == report.Status.FINALIZED:
+            return Response({"detail": "The finalized screening report is immutable."}, status=409)
+        supplied_version = request.data.get("expected_version")
+        if not _created:
+            try:
+                supplied_version = int(supplied_version)
+            except (TypeError, ValueError):
+                return Response({"detail": "The current report version is required."}, status=400)
+            if supplied_version != report.lock_version:
+                return Response(
+                    {"detail": "This screening report changed after it was loaded."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+        payload = request.data.copy()
+        payload.pop("expected_version", None)
+        serializer = EyeHealthScreeningReportSerializer(
+            report, data=payload, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(preview_checksum="", previewed_at=None, lock_version=report.lock_version + 1)
+        return Response(serializer.data, status=201 if _created else 200)
+
+    patch = post
+
+
+class EyeHealthScreeningPreviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_for_update().select_related(
+                "encounter__patient__assigned_clinic", "encounter__patient__assigned_branch",
+                "encounter__service_branch",
+            ), pk=pk,
+        )
+        try:
+            authority, clinic, branch = require_eye_health_authority(request.user, report.encounter)
+            clinician = professional_snapshot(request.user, authority)
+            clinician.update({
+                "clinic_id": clinic.pk, "clinic_name": clinic.name,
+                "branch_id": branch.pk, "branch_name": branch.name,
+            })
+            snapshot, checksum, _manifest = screening_snapshot(report, clinician)
+            pdf, _manifest = build_complete_pdf(report, snapshot)
+        except DjangoValidationError as exc:
+            return Response({"detail": exc.messages}, status=400)
+        report.preview_checksum = checksum
+        report.previewed_at = timezone.now()
+        report.save(update_fields=["preview_checksum", "previewed_at", "updated_at"])
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{report.encounter.encounter_id}-eye-health-preview.pdf"'
+        response["Cache-Control"] = "private, no-store, max-age=0"
+        return response
+
+
+class EyeHealthScreeningFinalizeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        report = get_object_or_404(EyeHealthScreeningReport, pk=pk)
+        try:
+            version = finalize_screening_report(
+                report, user=request.user,
+                expected_version=int(request.data.get("expected_version")),
+                signoff_confirmed=request.data.get("signoff_confirmed") is True,
+            )
+        except (DjangoValidationError, TypeError, ValueError) as exc:
+            detail = exc.messages if hasattr(exc, "messages") else [str(exc)]
+            return Response({"detail": detail}, status=400)
+        report.refresh_from_db()
+        return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+
+
+class EyeHealthScreeningCorrectionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_for_update().select_related(
+                "encounter__patient__assigned_clinic", "encounter__patient__assigned_branch",
+                "encounter__service_branch", "finalized_version",
+            ), pk=pk,
+        )
+        require_eye_health_authority(request.user, report.encounter)
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"detail": "A correction reason is required."}, status=400)
+        if (
+            report.status == report.Status.DRAFT
+            and report.correction_source_version_id
+            and report.correction_reason == reason
+        ):
+            return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+        if report.status != report.Status.FINALIZED or not report.finalized_version:
+            return Response({"detail": "Only a finalized report can enter correction."}, status=409)
+        report.status = report.Status.DRAFT
+        report.correction_reason = reason
+        report.correction_source_version = report.finalized_version
+        report.preview_checksum = ""
+        report.previewed_at = None
+        report.lock_version += 1
+        report.save(update_fields=[
+            "status", "correction_reason", "correction_source_version",
+            "preview_checksum", "previewed_at", "lock_version", "updated_at",
+        ])
+        report.encounter.update_status_from_related_records()
+        return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+
+
+class EyeHealthScreeningPDFView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from uploads.access import can_access_clinical_asset
+        from uploads.storage import get_private_clinical_storage
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_related(
+                "encounter__patient__assigned_clinic", "encounter__patient__assigned_branch",
+                "encounter__service_branch", "finalized_version",
+            ), pk=pk,
+        )
+        encounter = report.encounter
+        organization = encounter.patient.assigned_clinic
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not can_access_clinical_asset(
+            request.user, encounter=encounter, organization=organization, branch=branch
+        ):
+            raise PermissionDenied("You do not have access to this report.")
+        version = report.finalized_version
+        if not version or not version.pdf_object_key:
+            return Response({"detail": "No finalized screening report is available."}, status=404)
+        with get_private_clinical_storage().open(version.pdf_object_key, "rb") as source:
+            content = source.read()
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-eye-health-report.pdf"'
+        response["Cache-Control"] = "private, no-store, max-age=0"
+        return response
+
+
+class CombinedScreeningBundleView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, encounter_id):
+        from encounters.models import ScreeningEncounter
+        from uploads.access import can_access_clinical_asset
+        from uploads.storage import get_private_clinical_storage
+        encounter = get_object_or_404(
+            ScreeningEncounter.objects.select_related(
+                "patient__assigned_clinic", "patient__assigned_branch", "service_branch",
+            ), pk=encounter_id, service_package=ScreeningEncounter.ServicePackage.COMBINED,
+        )
+        organization = encounter.patient.assigned_clinic
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not can_access_clinical_asset(
+            request.user, encounter=encounter, organization=organization, branch=branch
+        ):
+            raise PermissionDenied("You do not have access to this report bundle.")
+        diabetic = getattr(encounter, "structured_report", None)
+        screening = getattr(encounter, "eye_health_report", None)
+        if (
+            not diabetic or diabetic.report_status != "issued" or not diabetic.issued_version
+            or not diabetic.issued_version.pdf_object_key
+            or not screening or not screening.finalized_version
+            or not screening.finalized_version.pdf_object_key
+        ):
+            return Response({"detail": "Both finalized report components are required."}, status=409)
+        storage = get_private_clinical_storage()
+        writer = PdfWriter()
+        for key in (
+            diabetic.issued_version.pdf_object_key,
+            screening.finalized_version.pdf_object_key,
+        ):
+            with storage.open(key, "rb") as source:
+                content = source.read()
+            for page in PdfReader(BytesIO(content), strict=True).pages:
+                writer.add_page(page)
+        output = BytesIO()
+        writer.write(output)
+        response = HttpResponse(output.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-combined-screening-bundle.pdf"'
+        response["Cache-Control"] = "private, no-store, max-age=0"
         return response

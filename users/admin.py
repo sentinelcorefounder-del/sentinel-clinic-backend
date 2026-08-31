@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import UserOrganization, UserSecurityProfile
+from .models import ClinicalProfessionalProfile, UserOrganization, UserSecurityProfile
 
 
 @admin.register(UserOrganization)
@@ -18,3 +18,10 @@ class UserSecurityProfileAdmin(admin.ModelAdmin):
         if request.user.is_superuser:
             return ()
         return ("is_internal_sentinel_staff",)
+
+
+@admin.register(ClinicalProfessionalProfile)
+class ClinicalProfessionalProfileAdmin(admin.ModelAdmin):
+    list_display = ("user", "display_name", "professional_role", "registration_number", "is_verified")
+    list_filter = ("is_verified",)
+    search_fields = ("user__username", "user__email", "display_name", "registration_number")
