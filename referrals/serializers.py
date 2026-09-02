@@ -22,6 +22,10 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     payment_paid_at = serializers.SerializerMethodField()
     report_status = serializers.SerializerMethodField()
     report_issued_at = serializers.SerializerMethodField()
+    targeted_patient_report_url = serializers.SerializerMethodField()
+    targeted_clinician_report_url = serializers.SerializerMethodField()
+    combined_patient_bundle_url = serializers.SerializerMethodField()
+    combined_clinician_bundle_url = serializers.SerializerMethodField()
 
     class Meta:
         model = HospitalReferral
@@ -55,6 +59,8 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "report_ready",
             "report_status",
             "report_issued_at",
+            "targeted_patient_report_url", "targeted_clinician_report_url",
+            "combined_patient_bundle_url", "combined_clinician_bundle_url",
             "hospital_commission_amount",
             "payout_status",
             "payout_date",
@@ -81,9 +87,12 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         report = instance.report
+        targeted = self._released_targeted_report(instance)
 
         if not report:
-            data["report_ready"] = False
+            data["report_ready"] = bool(targeted)
+            if targeted:
+                data["referral_status"] = "report_issued"
             return data
 
         status_map = {
@@ -123,6 +132,46 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(path)
 
         return path
+
+    def _released_targeted_report(self, obj):
+        encounter = obj.screening_encounters.select_related(
+            "eye_health_report__hospital_released_version"
+        ).filter(eye_health_report__hospital_released_at__isnull=False).order_by("-created_at").first()
+        if not encounter:
+            return None
+        report = getattr(encounter, "eye_health_report", None)
+        if not report or not report.hospital_released_version_id:
+            return None
+        return report
+
+    def _targeted_url(self, obj, audience):
+        report = self._released_targeted_report(obj)
+        if not report:
+            return ""
+        path = f"/api/reports/eye-health/{report.pk}/pdf/?report_format={audience}"
+        request = self.context.get("request")
+        return request.build_absolute_uri(path) if request else path
+
+    def get_targeted_patient_report_url(self, obj):
+        return self._targeted_url(obj, "patient")
+
+    def get_targeted_clinician_report_url(self, obj):
+        return self._targeted_url(obj, "clinician")
+
+    def _combined_url(self, obj, audience):
+        report = self._released_targeted_report(obj)
+        encounter = report.encounter if report else None
+        if not encounter or not encounter.includes_diabetic_screening or not obj.report_id:
+            return ""
+        path = f"/api/reports/eye-health/combined/{encounter.pk}/bundle/?report_format={audience}"
+        request = self.context.get("request")
+        return request.build_absolute_uri(path) if request else path
+
+    def get_combined_patient_bundle_url(self, obj):
+        return self._combined_url(obj, "patient")
+
+    def get_combined_clinician_bundle_url(self, obj):
+        return self._combined_url(obj, "clinician")
 
     def get_latest_payment(self, obj):
         try:

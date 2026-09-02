@@ -17,10 +17,12 @@ from rest_framework.test import APIClient
 from encounters.models import OcularDiagnosticAssessment, OcularInvestigation, ScreeningEncounter
 from organizations.models import Organization, OrganizationBranch
 from patients.models import Patient
-from reports.eye_health import LIMITATION
+from reports.eye_health import LIMITATION, generate_suggested_wording
 from reports.models import EyeHealthScreeningReport, StructuredReport, StructuredReportVersion
+from finance.models import EncounterFinancialRecord
+from referrals.models import HospitalReferral
 from uploads.storage import get_private_clinical_storage
-from users.models import ClinicalProfessionalProfile, UserBranchAccess, UserOrganization
+from users.models import ClinicalProfessionalProfile, UserBranchAccess, UserOrganization, UserSecurityProfile
 from uploads.models import ImageUpload
 
 
@@ -118,6 +120,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
             "outcome": "routine_eye_examination",
             "selected_advice": ["Arrange a routine comprehensive eye examination."],
             "advice": "Arrange a synthetic routine examination.",
+            "clinical_summary": "No immediate concern was identified within the areas assessed.",
             "right_visual_field_result": "Clinician confirmed right result",
             "left_visual_field_result": "Clinician confirmed left result",
             "right_fundus_result": "Clinician confirmed right fundus",
@@ -153,7 +156,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(version.clinical_snapshot["assessment_location"]["site_name"], "Synthetic client site")
         self.assertEqual(version.clinician_snapshot["user_id"], self.optometrist.pk)
         self.assertEqual(version.clinical_snapshot["limitation"], LIMITATION)
-        self.assertNotIn("glaucoma", str(version.clinical_snapshot).lower())
+        self.assertNotIn("no glaucoma", str(version.clinical_snapshot).lower())
         with get_private_clinical_storage().open(version.pdf_object_key, "rb") as source:
             self.assertEqual(len(PdfReader(BytesIO(source.read())).pages), 1)
         denied = self.client.post(
@@ -174,6 +177,98 @@ class EyeHealthScreeningWorkflowTests(TestCase):
             {"expected_version": report.lock_version, "signoff_confirmed": True}, format="json",
         )
         self.assertEqual(unauthorized_retry.status_code, 403)
+
+    def test_patient_and_clinician_formats_share_version_and_clean_gate(self):
+        report = self.save_draft(structured_findings={
+            "fundus_quality": "good",
+            "right": {"visual_field_reliability": "reliable", "visual_field_result": "within_expected_limits", "ght": "within_normal_limits", "vfi": "98"},
+            "left": {"visual_field_reliability": "reliable", "visual_field_result": "within_expected_limits", "ght": "within_normal_limits", "vfi": "97"},
+        })
+        for audience in ("patient", "clinician"):
+            preview = self.client.post(
+                f"/api/reports/eye-health/{report.pk}/preview/",
+                {"report_format": audience}, format="json",
+            )
+            self.assertEqual(preview.status_code, 200)
+            text = " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(preview.content)).pages)
+            self.assertIn("DRAFT — NOT FOR DISTRIBUTION", text)
+            if audience == "patient":
+                self.assertNotIn("Detailed clinical findings", text)
+                self.assertNotIn("Visual field index", text)
+            else:
+                self.assertIn("Clinician Report", text)
+                self.assertIn("Detailed clinical findings", text)
+                self.assertIn("Visual field index", text)
+        report.refresh_from_db()
+        report = self.preview_and_finalize(report)
+        version_id = report.finalized_version_id
+        blocked_clean = self.client.get(
+            f"/api/reports/eye-health/{report.pk}/pdf/?report_format=patient"
+        )
+        self.assertEqual(blocked_clean.status_code, 200)
+        blocked_text = " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(blocked_clean.content)).pages)
+        self.assertIn("DRAFT — NOT FOR DISTRIBUTION", blocked_text)
+        EncounterFinancialRecord.objects.update_or_create(
+            encounter=self.encounter,
+            defaults={
+                "status": EncounterFinancialRecord.Status.CAPTURED,
+                "financially_releasable": True,
+                "captured_at": timezone.now(),
+            },
+        )
+        clean_patient = self.client.get(
+            f"/api/reports/eye-health/{report.pk}/pdf/?report_format=patient"
+        )
+        clean_clinician = self.client.get(
+            f"/api/reports/eye-health/{report.pk}/pdf/?report_format=clinician"
+        )
+        for response in (clean_patient, clean_clinician):
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(
+                "DRAFT — NOT FOR DISTRIBUTION",
+                " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages),
+            )
+        report.refresh_from_db()
+        self.assertEqual(report.finalized_version_id, version_id)
+        self.assertEqual(report.versions.count(), 1)
+
+    def test_hospital_requires_exact_release_and_repeated_release_does_not_charge(self):
+        referral = HospitalReferral.objects.create(
+            referral_id="SNT-REF-EYE-RELEASE", source_hospital=self.hospital,
+            patient=self.patient, first_name=self.patient.first_name, last_name=self.patient.last_name,
+            reason_for_referral="Synthetic targeted screening", matched_clinic=self.clinic,
+        )
+        self.encounter.source_type = "hospital_referral"
+        self.encounter.payment_responsibility = "hospital"
+        self.encounter.originating_organization = self.hospital
+        self.encounter.hospital_referral = referral
+        self.encounter.save()
+        report = self.preview_and_finalize(self.save_draft())
+        EncounterFinancialRecord.objects.update_or_create(
+            encounter=self.encounter,
+            defaults={
+                "service_pathway": EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED,
+                "status": EncounterFinancialRecord.Status.CAPTURED,
+                "financially_releasable": True,
+                "captured_at": timezone.now(),
+            },
+        )
+        hospital_user = self.make_user("eye-hospital-release", {"hospital_admin"}, self.hospital)
+        self.client.force_authenticate(hospital_user)
+        denied = self.client.get(f"/api/reports/eye-health/{report.pk}/pdf/?report_format=clinician")
+        self.assertEqual(denied.status_code, 403)
+        ops = self.make_user("eye-release-ops", {"ops_admin"})
+        UserSecurityProfile.objects.create(user=ops, is_internal_sentinel_staff=True)
+        self.client.force_authenticate(ops)
+        first = self.client.post(f"/api/reports/eye-health/{report.pk}/release-hospital/", {}, format="json")
+        self.assertEqual(first.status_code, 200, getattr(first, "data", None))
+        second = self.client.post(f"/api/reports/eye-health/{report.pk}/release-hospital/", {}, format="json")
+        self.assertEqual(second.status_code, 200)
+        report.refresh_from_db()
+        self.assertEqual(report.hospital_released_version_id, report.finalized_version_id)
+        self.client.force_authenticate(hospital_user)
+        allowed = self.client.get(f"/api/reports/eye-health/{report.pk}/pdf/?report_format=clinician")
+        self.assertEqual(allowed.status_code, 200)
 
     def test_controlled_correction_preserves_first_version(self):
         report = self.preview_and_finalize(self.save_draft())
@@ -318,14 +413,98 @@ class EyeHealthScreeningWorkflowTests(TestCase):
             pdf_size=len(diabetic_pdf), editor=self.optometrist,
         )
         StructuredReport.objects.filter(pk=diabetic_report.pk).update(issued_version=version)
+        self.encounter.refresh_from_db()
+        self.encounter.update_status_from_related_records()
+        EncounterFinancialRecord.objects.update_or_create(
+            encounter=self.encounter,
+            defaults={
+                "status": EncounterFinancialRecord.Status.CAPTURED,
+                "financially_releasable": True,
+                "captured_at": timezone.now(),
+            },
+        )
         response = self.client.get(
             f"/api/reports/eye-health/combined/{self.encounter.pk}/bundle/"
         )
         self.assertEqual(response.status_code, 200)
         bundle = PdfReader(BytesIO(response.content))
         self.assertIn("UNCHANGED DIABETIC REPORT COMPONENT", bundle.pages[0].extract_text())
-        self.assertIn("Eye Health Screening Report", bundle.pages[1].extract_text())
+        self.assertIn("Targeted Retinal and Glaucoma-Risk Screening Report", bundle.pages[1].extract_text())
         eye_report.refresh_from_db()
+
+    def test_targeted_title_limitation_and_safe_deterministic_wording(self):
+        findings = {
+            "fundus_quality": "mildly_limited",
+            "optic_disc": ["possible_physiological_cupping"],
+            "retinal_vessels": ["no_concerning_feature"],
+            "retina_macula": ["no_visible_abnormality"],
+            "right": {"visual_field_reliability": "reduced_reliability", "visual_field_result": "essentially_full", "ght": "borderline"},
+            "left": {"visual_field_reliability": "reliable", "visual_field_result": "within_expected_limits", "ght": "within_normal_limits"},
+            "iop_interpretation": "within_expected_range",
+            "visual_acuity_interpretation": "within_expected_range",
+            "clinical_interpretation": "no_immediate_concern",
+        }
+        wording = generate_suggested_wording(findings)
+        self.assertIn("subtle changes may not be detectable", wording)
+        self.assertIn("does not exclude glaucoma", wording)
+        self.assertIn("No immediate concern was identified within the areas assessed", wording)
+        for prohibited in ("Eyes normal", "No ocular disease", "No glaucoma", "No diabetic retinopathy"):
+            self.assertNotIn(prohibited, wording)
+        report = self.preview_and_finalize(self.save_draft(
+            outcome="no_immediate_concern", structured_findings=findings,
+            generated_suggestion="Client text must not be trusted",
+        ))
+        snapshot = report.finalized_version.clinical_snapshot
+        self.assertEqual(snapshot["structured_findings"]["fundus_quality"], "mildly_limited")
+        self.assertEqual(snapshot["clinical_summary"], "No immediate concern was identified within the areas assessed.")
+        self.assertNotEqual(snapshot["generated_suggestion"], "Client text must not be trusted")
+        with get_private_clinical_storage().open(report.finalized_version.pdf_object_key, "rb") as source:
+            text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(source.read())).pages)
+        self.assertIn("Targeted Retinal and Glaucoma-Risk Screening Report", text)
+        self.assertIn(LIMITATION, text.replace("\n", " "))
+        self.assertNotIn("No diabetic retinopathy", text)
+
+    def test_explicit_regeneration_does_not_happen_on_ordinary_save(self):
+        report = self.save_draft(
+            structured_findings={"fundus_quality": "good"},
+            clinical_summary="Clinician-edited wording must survive.",
+        )
+        response = self.client.post(
+            f"/api/reports/eye-health/encounter/{self.encounter.pk}/",
+            {
+                "expected_version": report.lock_version,
+                "structured_findings": {"fundus_quality": "ungradable"},
+                "clinical_summary": "Clinician-edited wording must survive.",
+            }, format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["clinical_summary"], "Clinician-edited wording must survive.")
+        response = self.client.post(
+            f"/api/reports/eye-health/encounter/{self.encounter.pk}/",
+            {
+                "expected_version": response.data["lock_version"],
+                "structured_findings": {"fundus_quality": "ungradable"},
+                "regenerate_suggested_wording": True,
+            }, format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn("could not be assessed reliably", response.data["clinical_summary"])
+
+    def test_contradictory_or_ungradable_reassurance_is_blocked(self):
+        self.client.force_authenticate(self.optometrist)
+        contradictory = self.client.post(
+            f"/api/reports/eye-health/encounter/{self.encounter.pk}/",
+            {"structured_findings": {"optic_disc": ["no_concerning_feature", "disc_haemorrhage"]}},
+            format="json",
+        )
+        self.assertEqual(contradictory.status_code, 400)
+        report = self.save_draft(
+            outcome="no_immediate_concern",
+            structured_findings={"fundus_quality": "ungradable"},
+        )
+        preview = self.client.post(f"/api/reports/eye-health/{report.pk}/preview/", {}, format="json")
+        self.assertEqual(preview.status_code, 400)
+        self.assertIn("cannot support the reassuring outcome", str(preview.data))
 
     def test_package_correction_requires_confirmation_preserves_data_and_locks_after_version(self):
         OcularDiagnosticAssessment.objects.create(

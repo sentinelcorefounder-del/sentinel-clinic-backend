@@ -46,14 +46,17 @@ from .permissions import (
 )
 from .serializers import EyeHealthScreeningReportSerializer, StructuredReportSerializer
 from .eye_health import (
-    build_complete_pdf, finalize_screening_report, professional_snapshot,
-    require_eye_health_authority, screening_snapshot,
+    build_complete_pdf, finalize_screening_report, generate_suggested_wording,
+    normalise_structured_findings, professional_snapshot, require_eye_health_authority,
+    screening_snapshot,
 )
 from .referral_linking import (
     build_report_pdf_url,
     sync_report_to_local_hospital_referral,
 )
 from .release_control import is_report_released_to_hospital
+from .distribution import audit_clean_pdf_access, structured_clean_pdf_ready, targeted_clean_pdf_ready
+from .permissions import has_internal_ops_authority
 
 
 class StructuredReportRulesMixin:
@@ -743,10 +746,21 @@ class StructuredReportPDFView(APIView):
                 report_format = "hospital"
 
         issued_version = report.issued_version
-        if report.report_status == "issued" and issued_version and issued_version.pdf_object_key:
+        hospital_referral = None
+        if org and getattr(org, "organization_type", "") == "hospital":
+            hospital_referral = report.hospital_referrals.filter(source_hospital=org).first()
+        clean_ready = structured_clean_pdf_ready(
+            report, hospital_referral=hospital_referral
+        )
+        if clean_ready and report.report_status == "issued" and issued_version and issued_version.pdf_object_key:
             from uploads.storage import get_private_clinical_storage
             with get_private_clinical_storage().open(issued_version.pdf_object_key, "rb") as source:
                 pdf_bytes = source.read()
+            audit_clean_pdf_access(
+                actor=request.user, report_kind="diabetic_report", report_id=report.pk,
+                version_id=issued_version.pk, audience=report_format,
+                context="hospital" if hospital_referral else "internal",
+            )
             response = HttpResponse(pdf_bytes, content_type="application/pdf")
             response["Content-Disposition"] = f'inline; filename="{report.report_id}-issued.pdf"'
             return response
@@ -755,6 +769,7 @@ class StructuredReportPDFView(APIView):
             report=report,
             request=request,
             report_format=report_format,
+            force_draft=not clean_ready,
         ).build()
 
         response = HttpResponse(pdf_bytes, content_type="application/pdf")
@@ -775,7 +790,7 @@ class EyeHealthScreeningReportView(APIView):
             ), pk=encounter_id,
         )
         if not encounter.includes_eye_health_screening:
-            raise PermissionDenied("This encounter does not include eye-health screening.")
+            raise PermissionDenied("This encounter does not include targeted retinal and glaucoma-risk screening.")
         require_eye_health_authority(request.user, encounter)
         return encounter
 
@@ -783,7 +798,7 @@ class EyeHealthScreeningReportView(APIView):
         encounter = self._encounter(request, encounter_id)
         report = EyeHealthScreeningReport.objects.filter(encounter=encounter).first()
         if not report:
-            return Response({"detail": "No eye-health screening report draft exists."}, status=404)
+            return Response({"detail": "No targeted screening report draft exists."}, status=404)
         return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
 
     @transaction.atomic
@@ -809,11 +824,19 @@ class EyeHealthScreeningReportView(APIView):
                 )
         payload = request.data.copy()
         payload.pop("expected_version", None)
+        regenerate = payload.pop("regenerate_suggested_wording", False) is True
         serializer = EyeHealthScreeningReportSerializer(
             report, data=payload, partial=True, context={"request": request}
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save(preview_checksum="", previewed_at=None, lock_version=report.lock_version + 1)
+        extra = {"preview_checksum": "", "previewed_at": None, "lock_version": report.lock_version + 1}
+        if regenerate:
+            findings = normalise_structured_findings(
+                serializer.validated_data.get("structured_findings", report.structured_findings)
+            )
+            suggestion = generate_suggested_wording(findings)
+            extra.update(generated_suggestion=suggestion, clinical_summary=suggestion)
+        serializer.save(**extra)
         return Response(serializer.data, status=201 if _created else 200)
 
     patch = post
@@ -838,14 +861,15 @@ class EyeHealthScreeningPreviewView(APIView):
                 "branch_id": branch.pk, "branch_name": branch.name,
             })
             snapshot, checksum, _manifest = screening_snapshot(report, clinician)
-            pdf, _manifest = build_complete_pdf(report, snapshot)
+            audience = str(request.data.get("report_format") or request.query_params.get("report_format") or "patient").lower()
+            pdf, _manifest = build_complete_pdf(report, snapshot, audience=audience, draft=True)
         except DjangoValidationError as exc:
             return Response({"detail": exc.messages}, status=400)
         report.preview_checksum = checksum
         report.previewed_at = timezone.now()
         report.save(update_fields=["preview_checksum", "previewed_at", "updated_at"])
         response = HttpResponse(pdf, content_type="application/pdf")
-        response["Content-Disposition"] = f'inline; filename="{report.encounter.encounter_id}-eye-health-preview.pdf"'
+        response["Content-Disposition"] = f'inline; filename="{report.encounter.encounter_id}-targeted-retinal-glaucoma-risk-preview.pdf"'
         response["Cache-Control"] = "private, no-store, max-age=0"
         return response
 
@@ -920,19 +944,99 @@ class EyeHealthScreeningPDFView(APIView):
         encounter = report.encounter
         organization = encounter.patient.assigned_clinic
         branch = encounter.service_branch or encounter.patient.assigned_branch
-        if not can_access_clinical_asset(
-            request.user, encounter=encounter, organization=organization, branch=branch
-        ):
-            raise PermissionDenied("You do not have access to this report.")
-        version = report.finalized_version
-        if not version or not version.pdf_object_key:
+        audience = str(request.query_params.get("report_format") or "patient").lower()
+        if audience not in {"patient", "clinician"}:
+            return Response({"detail": "Report format must be patient or clinician."}, status=400)
+        user_org = get_user_organization(request.user)
+        referral = getattr(encounter, "hospital_referral", None)
+        is_hospital = bool(user_org and user_org.organization_type == "hospital")
+        if is_hospital:
+            roles = set(request.user.groups.values_list("name", flat=True))
+            if not referral or referral.source_hospital_id != user_org.id or not roles.intersection({"hospital_admin", "hospital_clinician"}):
+                raise PermissionDenied("You do not have access to this report.")
+            version = report.hospital_released_version
+            if not targeted_clean_pdf_ready(report, hospital_referral=referral):
+                raise PermissionDenied("This exact report version has not been released to the referring hospital.")
+            draft = False
+        else:
+            if not can_access_clinical_asset(
+                request.user, encounter=encounter, organization=organization, branch=branch
+            ):
+                raise PermissionDenied("You do not have access to this report.")
+            version = report.finalized_version
+            draft = not targeted_clean_pdf_ready(report)
+            if draft and not has_internal_ops_authority(request.user):
+                require_eye_health_authority(request.user, encounter)
+        if not version:
             return Response({"detail": "No finalized screening report is available."}, status=404)
-        with get_private_clinical_storage().open(version.pdf_object_key, "rb") as source:
-            content = source.read()
+        content, _manifest = build_complete_pdf(
+            report, version.clinical_snapshot, audience=audience, draft=draft,
+            manifest=version.attachment_manifest,
+        )
+        if not draft:
+            audit_clean_pdf_access(
+                actor=request.user, report_kind="targeted_report", report_id=report.pk,
+                version_id=version.pk, audience=audience,
+                context="hospital" if is_hospital else "internal",
+            )
         response = HttpResponse(content, content_type="application/pdf")
-        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-eye-health-report.pdf"'
+        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-targeted-{audience}-report.pdf"'
         response["Cache-Control"] = "private, no-store, max-age=0"
         return response
+
+
+class EyeHealthScreeningReleaseView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        from finance.services import capture_finance_for_hospital_publication
+        from referrals.models import HospitalReferral
+        if not has_internal_ops_authority(request.user):
+            raise PermissionDenied("Exact Sentinel Ops authority is required.")
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_for_update().select_related(
+                "encounter__hospital_referral__source_hospital", "finalized_version",
+            ), pk=pk,
+        )
+        if report.status != report.Status.FINALIZED or not report.finalized_version:
+            return Response({"detail": "Only a finalized targeted report can be released."}, status=409)
+        referral = getattr(report.encounter, "hospital_referral", None)
+        if not referral or not referral.source_hospital_id:
+            return Response({"detail": "This encounter has no original referring hospital."}, status=400)
+        referral = HospitalReferral.objects.select_for_update().get(pk=referral.pk)
+        if report.hospital_released_version_id == report.finalized_version_id and report.hospital_released_at:
+            return Response({"detail": "This exact targeted report version is already released.", "version": report.finalized_version_id})
+        try:
+            capture_finance_for_hospital_publication(report.encounter, actor=request.user)
+        except DjangoValidationError as exc:
+            detail = (getattr(exc, "messages", None) or [str(exc)])[0]
+            return Response({"detail": detail, "code": "PAYMENT_REQUIRED"}, status=402)
+        report.hospital_released_version = report.finalized_version
+        report.hospital_released_at = timezone.now()
+        report.hospital_released_by = request.user
+        report.lock_version += 1
+        report.save(update_fields=[
+            "hospital_released_version", "hospital_released_at", "hospital_released_by",
+            "lock_version", "updated_at",
+        ])
+        from ops.models import OpsAuditLog
+        OpsAuditLog.objects.create(
+            actor=request.user, action="targeted_report_released",
+            entity_type="targeted_report", entity_id=str(report.pk),
+            entity_label=f"targeted_report:{report.pk}",
+            message="Targeted report released to original referring hospital.",
+            metadata={
+                "hospital_id": referral.source_hospital_id,
+                "referral_id": referral.pk,
+                "report_version_id": report.hospital_released_version_id,
+            },
+        )
+        return Response({
+            "detail": "Targeted report released to the original referring hospital.",
+            "version": report.hospital_released_version_id,
+            "hospital": referral.source_hospital.name,
+        })
 
 
 class CombinedScreeningBundleView(APIView):
@@ -949,10 +1053,9 @@ class CombinedScreeningBundleView(APIView):
         )
         organization = encounter.patient.assigned_clinic
         branch = encounter.service_branch or encounter.patient.assigned_branch
-        if not can_access_clinical_asset(
-            request.user, encounter=encounter, organization=organization, branch=branch
-        ):
-            raise PermissionDenied("You do not have access to this report bundle.")
+        audience = str(request.query_params.get("report_format") or "patient").lower()
+        if audience not in {"patient", "clinician"}:
+            return Response({"detail": "Report format must be patient or clinician."}, status=400)
         diabetic = getattr(encounter, "structured_report", None)
         screening = getattr(encounter, "eye_health_report", None)
         if (
@@ -962,19 +1065,43 @@ class CombinedScreeningBundleView(APIView):
             or not screening.finalized_version.pdf_object_key
         ):
             return Response({"detail": "Both finalized report components are required."}, status=409)
+        user_org = get_user_organization(request.user)
+        referral = getattr(encounter, "hospital_referral", None)
+        is_hospital = bool(user_org and user_org.organization_type == "hospital")
+        if is_hospital:
+            if not referral or referral.source_hospital_id != user_org.id:
+                raise PermissionDenied("You do not have access to this report bundle.")
+            diabetic_referral = diabetic.hospital_referrals.filter(source_hospital=user_org).first()
+            if not structured_clean_pdf_ready(diabetic, hospital_referral=diabetic_referral) or not targeted_clean_pdf_ready(screening, hospital_referral=referral):
+                raise PermissionDenied("The exact combined report versions have not been released.")
+            screening_version = screening.hospital_released_version
+        else:
+            if not can_access_clinical_asset(
+                request.user, encounter=encounter, organization=organization, branch=branch
+            ):
+                raise PermissionDenied("You do not have access to this report bundle.")
+            if not structured_clean_pdf_ready(diabetic) or not targeted_clean_pdf_ready(screening):
+                return Response({"detail": "Clean report bundle is unavailable until completion and capture."}, status=402)
+            screening_version = screening.finalized_version
         storage = get_private_clinical_storage()
         writer = PdfWriter()
-        for key in (
-            diabetic.issued_version.pdf_object_key,
-            screening.finalized_version.pdf_object_key,
-        ):
-            with storage.open(key, "rb") as source:
-                content = source.read()
+        with storage.open(diabetic.issued_version.pdf_object_key, "rb") as source:
+            diabetic_content = source.read()
+        targeted_content, _manifest = build_complete_pdf(
+            screening, screening_version.clinical_snapshot, audience=audience, draft=False,
+            manifest=screening_version.attachment_manifest,
+        )
+        for content in (diabetic_content, targeted_content):
             for page in PdfReader(BytesIO(content), strict=True).pages:
                 writer.add_page(page)
+        audit_clean_pdf_access(
+            actor=request.user, report_kind="combined_report_bundle", report_id=encounter.pk,
+            version_id=screening_version.pk, audience=audience,
+            context="hospital" if is_hospital else "internal",
+        )
         output = BytesIO()
         writer.write(output)
         response = HttpResponse(output.getvalue(), content_type="application/pdf")
-        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-combined-screening-bundle.pdf"'
+        response["Content-Disposition"] = f'inline; filename="{encounter.encounter_id}-combined-{audience}-bundle.pdf"'
         response["Cache-Control"] = "private, no-store, max-age=0"
         return response

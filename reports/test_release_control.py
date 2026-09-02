@@ -198,6 +198,25 @@ class ReleaseControlTestCase(TestCase):
             {"expected_version": report.lock_version}, format="json"
         )
 
+    def test_patient_delivery_uses_shared_clean_pdf_gate(self):
+        report = self.create_report()
+        self.assertEqual(self.submit(report).status_code, 200)
+        self.assertEqual(self.issue(report).status_code, 200)
+        self.client.force_authenticate(self.ops_user)
+        blocked = self.client.post(
+            "/api/reports/patient-deliveries/",
+            {"report": report.pk, "recipient": "patient@example.test", "consent_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(blocked.status_code, 402)
+        self.assertEqual(self.release(report).status_code, 200)
+        allowed = self.client.post(
+            "/api/reports/patient-deliveries/",
+            {"report": report.pk, "recipient": "patient@example.test", "consent_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(allowed.status_code, 201, getattr(allowed, "data", None))
+
     def test_create_update_and_duplicate_protection(self):
         self.client.force_authenticate(self.clinic_user)
         created = self.client.post("/api/reports/", self.report_payload(), format="json")

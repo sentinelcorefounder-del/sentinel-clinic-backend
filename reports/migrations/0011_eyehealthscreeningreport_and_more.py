@@ -18,9 +18,12 @@ class Migration(migrations.Migration):
             name='EyeHealthScreeningReport',
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('outcome', models.CharField(blank=True, choices=[('no_immediate_concern', 'No immediate concern identified'), ('routine_eye_examination', 'Routine eye examination advised'), ('further_assessment', 'Further assessment recommended'), ('urgent_ophthalmology', 'Urgent ophthalmology assessment recommended'), ('inconclusive_repeat', 'Inconclusive — repeat testing required')], default='', max_length=40)),
+                ('outcome', models.CharField(blank=True, choices=[('no_immediate_concern', 'No immediate concern identified within the areas assessed'), ('routine_eye_examination', 'Routine comprehensive eye examination advised'), ('further_assessment', 'Further assessment recommended'), ('urgent_ophthalmology', 'Urgent ophthalmology assessment recommended'), ('inconclusive_repeat', 'Inconclusive — repeat testing required')], default='', max_length=40)),
                 ('selected_advice', models.JSONField(blank=True, default=list)),
                 ('advice', models.TextField(blank=True, default='')),
+                ('structured_findings', models.JSONField(blank=True, default=dict)),
+                ('generated_suggestion', models.TextField(blank=True, default='')),
+                ('clinical_summary', models.TextField(blank=True, default='')),
                 ('right_visual_field_result', models.TextField(blank=True, default='')),
                 ('left_visual_field_result', models.TextField(blank=True, default='')),
                 ('right_fundus_result', models.TextField(blank=True, default='')),
@@ -31,9 +34,11 @@ class Migration(migrations.Migration):
                 ('preview_checksum', models.CharField(blank=True, default='', max_length=64)),
                 ('previewed_at', models.DateTimeField(blank=True, null=True)),
                 ('lock_version', models.PositiveIntegerField(default=1)),
+                ('hospital_released_at', models.DateTimeField(blank=True, null=True)),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
                 ('encounter', models.OneToOneField(on_delete=django.db.models.deletion.PROTECT, related_name='eye_health_report', to='encounters.screeningencounter')),
+                ('hospital_released_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='eye_health_reports_released_to_hospital', to=settings.AUTH_USER_MODEL)),
             ],
             options={
                 'ordering': ['-created_at'],
@@ -63,6 +68,11 @@ class Migration(migrations.Migration):
             model_name='eyehealthscreeningreport',
             name='finalized_version',
             field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='finalized_for_report', to='reports.eyehealthscreeningreportversion'),
+        ),
+        migrations.AddField(
+            model_name='eyehealthscreeningreport',
+            name='hospital_released_version',
+            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='hospital_releases', to='reports.eyehealthscreeningreportversion'),
         ),
         migrations.AddConstraint(
             model_name='eyehealthscreeningreportversion',

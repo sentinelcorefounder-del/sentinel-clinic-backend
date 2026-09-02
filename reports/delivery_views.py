@@ -10,6 +10,7 @@ from common.tenant import get_user_organization
 
 from .models import PatientReportDelivery, StructuredReport
 from .serializers import PatientReportDeliverySerializer
+from .distribution import structured_clean_pdf_ready
 
 
 def _user_is_ops(user):
@@ -65,6 +66,12 @@ class PatientDeliveryListCreateView(APIView):
             return Response(
                 {"detail": "Only issued reports can be delivered."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not structured_clean_pdf_ready(report):
+            return Response(
+                {"detail": "Clean report delivery is unavailable until completion and the applicable financial gate pass."},
+                status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
         if not _user_is_ops(request.user):
@@ -129,6 +136,12 @@ class PatientDeliverySendView(APIView):
             return Response(
                 {"detail": "Delivery record not found."},
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not structured_clean_pdf_ready(delivery.report):
+            return Response(
+                {"detail": "Clean report delivery is unavailable until completion and the applicable financial gate pass."},
+                status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
         if not _user_is_ops(request.user):

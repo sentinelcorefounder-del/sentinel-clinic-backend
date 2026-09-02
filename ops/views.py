@@ -30,7 +30,7 @@ from patients.identity_services import ensure_master_identity
 from payments.services.paystack import initialize_transaction, verify_transaction
 from finance.services import capture_finance_for_hospital_publication
 from referrals.models import HospitalReferral
-from reports.models import StructuredReport, ReportStatusEvent
+from reports.models import EyeHealthScreeningReport, StructuredReport, ReportStatusEvent
 from reports.clinical_integrity import (
     assert_expected,
     bind_issued_pdf,
@@ -1003,6 +1003,7 @@ class OpsDistributionQueueView(OpsOnlyMixin, APIView):
             ).first()
 
             data.append({
+                "kind": "diabetic",
                 "id": report.id,
                 "report_id": report.report_id,
                 "patient_id": report.patient.patient_id if report.patient else "",
@@ -1034,6 +1035,52 @@ class OpsDistributionQueueView(OpsOnlyMixin, APIView):
                 "hospital_released_at": report.hospital_released_at,
                 "pdf_url": request.build_absolute_uri(
                     f"/api/reports/{report.id}/pdf/?report_format=clinician"
+                ),
+            })
+
+        targeted = EyeHealthScreeningReport.objects.select_related(
+            "encounter__patient__assigned_clinic", "encounter__hospital_referral__source_hospital",
+            "finalized_version", "hospital_released_version",
+        ).filter(status=EyeHealthScreeningReport.Status.FINALIZED, encounter__hospital_referral__isnull=False)
+        for report in targeted.order_by("-updated_at"):
+            referral = report.encounter.hospital_referral
+            distribution_status = (
+                "released_to_hospital"
+                if report.hospital_released_version_id == report.finalized_version_id and report.hospital_released_at
+                else "awaiting_distribution"
+            )
+            if status_filter not in {"", "all", distribution_status}:
+                continue
+            search_values = " ".join(filter(None, [
+                report.encounter.encounter_id,
+                report.encounter.patient.patient_id,
+                report.encounter.patient.first_name,
+                report.encounter.patient.last_name,
+                referral.referral_id,
+                referral.source_hospital.name if referral.source_hospital else "",
+            ])).lower()
+            if search and search.lower() not in search_values:
+                continue
+            data.append({
+                "kind": "targeted",
+                "id": report.id,
+                "report_id": f"TARGETED-{report.encounter.encounter_id}",
+                "patient_id": report.encounter.patient.patient_id,
+                "patient_name": f"{report.encounter.patient.first_name} {report.encounter.patient.last_name}".strip(),
+                "clinic_name": report.encounter.patient.assigned_clinic.name if report.encounter.patient.assigned_clinic else "",
+                "source_type": report.encounter.source_type,
+                "workflow_route": report.encounter.workflow_route,
+                "referral_id": referral.referral_id,
+                "source_hospital_name": referral.source_hospital.name if referral.source_hospital else "",
+                "has_hospital_recipient": bool(referral.source_hospital_id),
+                "report_status": report.status,
+                "lock_version": report.lock_version,
+                "distribution_status": distribution_status,
+                "patient_delivery_required": False,
+                "issued_at": report.finalized_version.created_at,
+                "hospital_released_at": report.hospital_released_at,
+                "pdf_url": request.build_absolute_uri(
+                    f"/api/reports/eye-health/{report.id}/pdf/?report_format=clinician"
                 ),
             })
 

@@ -25,23 +25,38 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
         source="finalized_version", read_only=True
     )
     professional_defaults = serializers.SerializerMethodField()
+    clean_pdf_ready = serializers.SerializerMethodField()
 
     class Meta:
         model = EyeHealthScreeningReport
         fields = [
             "id", "encounter", "outcome", "selected_advice", "advice",
+            "structured_findings", "generated_suggestion", "clinical_summary",
             "right_visual_field_result", "left_visual_field_result",
             "right_fundus_result", "left_fundus_result",
             "selected_fundus_upload_ids", "selected_visual_field_investigation_ids",
             "status", "previewed_at", "lock_version", "finalized_version",
             "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
             "correction_source_version",
+            "hospital_released_version", "hospital_released_at",
+            "clean_pdf_ready",
         ]
         read_only_fields = [
             "encounter", "status", "previewed_at", "lock_version", "finalized_version",
             "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
-            "correction_source_version",
+            "correction_source_version", "generated_suggestion",
+            "hospital_released_version", "hospital_released_at",
+            "clean_pdf_ready",
         ]
+
+    def validate_structured_findings(self, value):
+        from .eye_health import normalise_structured_findings
+        try:
+            return normalise_structured_findings(value)
+        except Exception as exc:
+            raise serializers.ValidationError(
+                exc.messages if hasattr(exc, "messages") else str(exc)
+            ) from exc
 
     def get_professional_defaults(self, obj):
         user = self.context.get("request").user if self.context.get("request") else None
@@ -54,6 +69,10 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
             "registration_number": profile.registration_number,
             "qualifications": profile.qualifications,
         }
+
+    def get_clean_pdf_ready(self, obj):
+        from .distribution import targeted_clean_pdf_ready
+        return targeted_clean_pdf_ready(obj)
 
 
 class StructuredReportVersionSerializer(serializers.ModelSerializer):

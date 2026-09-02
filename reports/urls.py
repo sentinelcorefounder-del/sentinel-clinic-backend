@@ -23,6 +23,7 @@ from .views import (
     EyeHealthScreeningFinalizeView,
     EyeHealthScreeningCorrectionView,
     EyeHealthScreeningPDFView,
+    EyeHealthScreeningReleaseView,
     CombinedScreeningBundleView,
 )
 
@@ -56,6 +57,7 @@ urlpatterns = [
     path("eye-health/<int:pk>/finalize/", EyeHealthScreeningFinalizeView.as_view(), name="eye-health-finalize"),
     path("eye-health/<int:pk>/correction/", EyeHealthScreeningCorrectionView.as_view(), name="eye-health-correction"),
     path("eye-health/<int:pk>/pdf/", EyeHealthScreeningPDFView.as_view(), name="eye-health-pdf"),
+    path("eye-health/<int:pk>/release-hospital/", EyeHealthScreeningReleaseView.as_view(), name="eye-health-release-hospital"),
     path("eye-health/combined/<int:encounter_id>/bundle/", CombinedScreeningBundleView.as_view(), name="combined-screening-bundle"),
     path("<int:pk>/submit-to-ops/", submit_report_to_ops, name="report-submit-to-ops"),
     path("<int:pk>/clinic-issue/", clinic_issue_report, name="report-clinic-issue"),

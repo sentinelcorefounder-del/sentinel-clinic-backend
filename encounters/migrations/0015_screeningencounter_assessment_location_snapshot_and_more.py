@@ -33,12 +33,12 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='screeningencounter',
             name='service_package',
-            field=models.CharField(blank=True, choices=[('diabetic_retinal_assessment', 'Diabetic retinal assessment'), ('eye_health_screening', 'Eye-health screening'), ('combined_diabetic_eye_health', 'Combined diabetic and eye-health screening'), ('comprehensive_ocular_assessment', 'Comprehensive ocular assessment')], help_text='Authoritative clinical service package. Historical unclassified ocular episodes remain blank.', max_length=50, null=True),
+            field=models.CharField(blank=True, choices=[('diabetic_retinal_assessment', 'Diabetic Retinal Assessment'), ('eye_health_screening', 'Targeted Retinal and Glaucoma-Risk Screening'), ('combined_diabetic_eye_health', 'Combined Diabetic Retinal Assessment and Targeted Glaucoma-Risk Screening'), ('comprehensive_ocular_assessment', 'Comprehensive Ocular Assessment')], help_text='Authoritative clinical service package. Historical unclassified ocular episodes remain blank.', max_length=50, null=True),
         ),
         migrations.AlterField(
             model_name='screeningencounter',
             name='programme',
-            field=models.CharField(choices=[('diabetic_screening', 'Diabetic Retinal Assessment'), ('eye_health_screening', 'Eye-health Screening'), ('ocular_diagnostics', 'General Ocular Assessment'), ('combined_assessment', 'Combined Diabetic and Ocular Assessment')], default='diabetic_screening', max_length=40),
+            field=models.CharField(choices=[('diabetic_screening', 'Diabetic Retinal Assessment'), ('eye_health_screening', 'Targeted Retinal and Glaucoma-Risk Screening'), ('ocular_diagnostics', 'Comprehensive Ocular Assessment'), ('combined_assessment', 'Combined Diabetic Retinal Assessment and Targeted Glaucoma-Risk Screening')], default='diabetic_screening', max_length=40),
         ),
         migrations.RunPython(
             classify_only_unambiguous_historical_packages,
@@ -49,7 +49,7 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('old_package', models.CharField(blank=True, default='', max_length=50)),
-                ('new_package', models.CharField(choices=[('diabetic_retinal_assessment', 'Diabetic retinal assessment'), ('eye_health_screening', 'Eye-health screening'), ('combined_diabetic_eye_health', 'Combined diabetic and eye-health screening'), ('comprehensive_ocular_assessment', 'Comprehensive ocular assessment')], max_length=50)),
+                ('new_package', models.CharField(choices=[('diabetic_retinal_assessment', 'Diabetic Retinal Assessment'), ('eye_health_screening', 'Targeted Retinal and Glaucoma-Risk Screening'), ('combined_diabetic_eye_health', 'Combined Diabetic Retinal Assessment and Targeted Glaucoma-Risk Screening'), ('comprehensive_ocular_assessment', 'Comprehensive Ocular Assessment')], max_length=50)),
                 ('reason', models.TextField()),
                 ('diabetic_confirmed', models.BooleanField(default=False)),
                 ('created_at', models.DateTimeField(auto_now_add=True)),

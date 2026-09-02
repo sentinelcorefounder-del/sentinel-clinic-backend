@@ -473,8 +473,8 @@ class StructuredReportVersion(models.Model):
 
 class EyeHealthScreeningReport(models.Model):
     class Outcome(models.TextChoices):
-        NO_IMMEDIATE_CONCERN = "no_immediate_concern", "No immediate concern identified"
-        ROUTINE_EXAM = "routine_eye_examination", "Routine eye examination advised"
+        NO_IMMEDIATE_CONCERN = "no_immediate_concern", "No immediate concern identified within the areas assessed"
+        ROUTINE_EXAM = "routine_eye_examination", "Routine comprehensive eye examination advised"
         FURTHER_ASSESSMENT = "further_assessment", "Further assessment recommended"
         URGENT_OPHTHALMOLOGY = "urgent_ophthalmology", "Urgent ophthalmology assessment recommended"
         INCONCLUSIVE = "inconclusive_repeat", "Inconclusive — repeat testing required"
@@ -489,6 +489,9 @@ class EyeHealthScreeningReport(models.Model):
     outcome = models.CharField(max_length=40, choices=Outcome.choices, blank=True, default="")
     selected_advice = models.JSONField(default=list, blank=True)
     advice = models.TextField(blank=True, default="")
+    structured_findings = models.JSONField(default=dict, blank=True)
+    generated_suggestion = models.TextField(blank=True, default="")
+    clinical_summary = models.TextField(blank=True, default="")
     right_visual_field_result = models.TextField(blank=True, default="")
     left_visual_field_result = models.TextField(blank=True, default="")
     right_fundus_result = models.TextField(blank=True, default="")
@@ -507,6 +510,15 @@ class EyeHealthScreeningReport(models.Model):
     correction_source_version = models.ForeignKey(
         "EyeHealthScreeningReportVersion", on_delete=models.PROTECT,
         null=True, blank=True, related_name="correction_drafts",
+    )
+    hospital_released_version = models.ForeignKey(
+        "EyeHealthScreeningReportVersion", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="hospital_releases",
+    )
+    hospital_released_at = models.DateTimeField(null=True, blank=True)
+    hospital_released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="eye_health_reports_released_to_hospital",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -552,8 +564,8 @@ class EyeHealthScreeningReportVersion(models.Model):
 
     def save(self, *args, **kwargs):
         if self.pk:
-            raise ValidationError("Eye-health screening report versions are immutable.")
+            raise ValidationError("Targeted screening report versions are immutable.")
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        raise ValidationError("Eye-health screening report versions cannot be deleted.")
+        raise ValidationError("Targeted screening report versions cannot be deleted.")

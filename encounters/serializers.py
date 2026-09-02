@@ -168,6 +168,7 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
     originating_organization_name = serializers.SerializerMethodField()
     ocular_assessment = OcularDiagnosticAssessmentSerializer(read_only=True)
     service_package_locked = serializers.SerializerMethodField()
+    targeted_screening_report_status = serializers.SerializerMethodField()
 
     class Meta:
         model = ScreeningEncounter
@@ -181,6 +182,7 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "programme",
             "service_package",
             "service_package_locked",
+            "targeted_screening_report_status",
             "assessment_location_snapshot",
             "assessment_location_type",
             "assessment_location_name",
@@ -384,3 +386,14 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             return bool(obj.ocular_assessment.completed_at)
         except Exception:
             return False
+
+    def get_targeted_screening_report_status(self, obj):
+        try:
+            report = obj.eye_health_report
+        except Exception:
+            return "not_started"
+        if report.status == "finalized":
+            return "finalized"
+        if report.previewed_at:
+            return "previewed"
+        return "draft"

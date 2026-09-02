@@ -115,10 +115,10 @@ class ForegroundWatermarkCanvas(pdf_canvas.Canvas):
             except Exception:
                 pass
             self.setFillColor(colors.HexColor("#7A8594"))
-            self.setFont("Helvetica-Bold", 64)
+            self.setFont("Helvetica-Bold", 34)
             self.translate(width / 2, height / 2)
             self.rotate(35)
-            self.drawCentredString(0, 0, "DRAFT")
+            self.drawCentredString(0, 0, "DRAFT — NOT FOR DISTRIBUTION")
             self.restoreState()
 
         self.saveState()
@@ -149,10 +149,11 @@ class ForegroundWatermarkCanvas(pdf_canvas.Canvas):
 
 
 class ReportPDFRenderer:
-    def __init__(self, report, request=None, report_format: str = "clinician"):
+    def __init__(self, report, request=None, report_format: str = "clinician", force_draft: bool = False):
         self.report = report
         self.request = request
         self.report_format = normalise_report_format(report_format)
+        self.force_draft = force_draft
         self.patient = report.patient
         self.encounter = report.encounter
         self.clinic = getattr(self.patient, "assigned_clinic", None)
@@ -278,6 +279,15 @@ class ReportPDFRenderer:
                 super().__init__(*args, **kwargs)
                 canvas_self.report = report
                 canvas_self.branding = self.branding
+
+            def _draw_overlay(canvas_self, page_count):
+                original_status = report.report_status
+                if self.force_draft:
+                    report.report_status = "under_review"
+                try:
+                    super(SentinelWatermarkCanvas, canvas_self)._draw_overlay(page_count)
+                finally:
+                    report.report_status = original_status
 
         doc.build(
             story,
