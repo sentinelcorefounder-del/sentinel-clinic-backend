@@ -50,7 +50,6 @@ def structured_report_is_grandfathered(report) -> bool:
     return bool(
         report.report_status == "issued"
         and version
-        and version.pdf_object_key
         and version.legacy_pdf_unbound
     )
 

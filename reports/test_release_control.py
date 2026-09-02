@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 from unittest.mock import patch
 import tempfile
 
@@ -8,6 +9,7 @@ from django.contrib.auth.models import Group
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
+from pypdf import PdfReader
 
 from encounters.models import ScreeningEncounter
 from finance.models import AllocationRule, PartnerContract, PricingRule, OrganizationWallet
@@ -23,7 +25,7 @@ from patients.models import Patient
 from referrals.models import HospitalReferral
 from referrals.serializers import HospitalReferralSerializer
 from reports.clinical_integrity import accept_responsibility, create_version_if_changed
-from reports.models import ReportStatusEvent, StructuredReport
+from reports.models import ReportStatusEvent, StructuredReport, StructuredReportVersion
 from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
 
 
@@ -216,6 +218,84 @@ class ReleaseControlTestCase(TestCase):
             format="json",
         )
         self.assertEqual(allowed.status_code, 201, getattr(allowed, "data", None))
+
+    def _legacy_report(self, *, status="issued", grandfathered=True, report_id="RPT-LEGACY-RC"):
+        report = StructuredReport.objects.create(
+            report_id=report_id,
+            encounter=self.encounter,
+            patient=self.patient,
+            review_date=date.today(),
+            ungradable=True,
+            urgency_outcome="image_retake",
+            report_status=status,
+        )
+        version = StructuredReportVersion.objects.create(
+            report=report,
+            version_number=1,
+            clinical_snapshot={},
+            checksum_sha256="0" * 64,
+            responsibility_snapshot={"baseline_source": "system_migration"},
+            purpose="legacy_baseline",
+            legacy_pdf_unbound=grandfathered,
+        )
+        if status == "issued":
+            report.issued_version = version
+            report.save(update_fields=["issued_version", "updated_at"])
+        return report
+
+    def test_legacy_issued_unbound_pdf_is_clean_without_retroactive_finance(self):
+        report = self._legacy_report()
+        self.financial_record.refresh_from_db()
+        finance_before = (
+            self.financial_record.status,
+            self.financial_record.financially_releasable,
+            self.financial_record.captured_at,
+        )
+
+        self.client.force_authenticate(self.clinic_user)
+        response = self.client.get(f"/api/reports/{report.pk}/pdf/")
+
+        self.assertEqual(response.status_code, 200)
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages)
+        self.assertNotIn("DRAFT", text)
+        self.financial_record.refresh_from_db()
+        self.assertEqual(
+            (
+                self.financial_record.status,
+                self.financial_record.financially_releasable,
+                self.financial_record.captured_at,
+            ),
+            finance_before,
+        )
+
+    def test_new_unissued_report_remains_watermarked(self):
+        report = self.create_report()
+        self.client.force_authenticate(self.clinic_user)
+        response = self.client.get(f"/api/reports/{report.pk}/pdf/")
+        self.assertEqual(response.status_code, 200)
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages)
+        self.assertIn("DRAFT", text)
+
+    def test_historical_draft_is_not_grandfathered(self):
+        report = self._legacy_report(
+            status="draft", grandfathered=False, report_id="RPT-LEGACY-DRAFT"
+        )
+        self.client.force_authenticate(self.clinic_user)
+        response = self.client.get(f"/api/reports/{report.pk}/pdf/")
+        self.assertEqual(response.status_code, 200)
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages)
+        self.assertIn("DRAFT", text)
+
+    def test_legacy_grandfathering_does_not_weaken_tenant_or_hospital_access(self):
+        report = self._legacy_report()
+        other_clinic = Organization.objects.create(
+            clinic_id="CLINIC-OTHER-RC", name="Other Release Clinic", organization_type="clinic"
+        )
+        wrong_clinic_user = self.make_user("clinic-wrong-legacy", "clinic_admin", other_clinic)
+        for user in (wrong_clinic_user, self.other_hospital_user):
+            self.client.force_authenticate(user)
+            response = self.client.get(f"/api/reports/{report.pk}/pdf/")
+            self.assertEqual(response.status_code, 403)
 
     def test_create_update_and_duplicate_protection(self):
         self.client.force_authenticate(self.clinic_user)
