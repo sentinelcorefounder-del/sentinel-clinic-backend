@@ -588,7 +588,7 @@ class EncounterServicePackageCorrectionView(APIView):
     @transaction.atomic
     def post(self, request, pk):
         encounter = get_object_or_404(
-            ScreeningEncounter.objects.select_for_update().select_related(
+            ScreeningEncounter.objects.select_for_update(of=("self",)).select_related(
                 "patient__assigned_clinic", "patient__assigned_branch", "service_branch"
             ), pk=pk,
         )
@@ -687,7 +687,7 @@ class EncounterAssessmentLocationCorrectionView(APIView):
     @transaction.atomic
     def post(self, request, pk):
         encounter = get_object_or_404(
-            ScreeningEncounter.objects.select_for_update().select_related(
+            ScreeningEncounter.objects.select_for_update(of=("self",)).select_related(
                 "patient__assigned_clinic", "patient__assigned_branch", "service_branch"
             ),
             pk=pk,
