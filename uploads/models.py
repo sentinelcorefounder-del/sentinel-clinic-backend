@@ -8,6 +8,10 @@ from organizations.models import Organization, OrganizationBranch
 import uuid
 
 
+def generate_image_upload_id():
+    return f"IMG-{uuid.uuid4().hex.upper()[:24]}"
+
+
 class ImageUpload(models.Model):
     STORAGE_KIND_CHOICES = [("public_media", "Public media"), ("private_clinical", "Private clinical")]
     DATASET_ELIGIBILITY_CHOICES = [("legacy_policy", "Legacy consent policy"), ("excluded", "Excluded"), ("approved", "Approved")]
@@ -29,7 +33,7 @@ class ImageUpload(models.Model):
         ("ungradable", "Ungradable"),
     ]
 
-    image_upload_id = models.CharField(max_length=30, unique=True)
+    image_upload_id = models.CharField(max_length=30, unique=True, default=generate_image_upload_id, editable=False)
     encounter = models.ForeignKey(
         ScreeningEncounter,
         on_delete=models.CASCADE,

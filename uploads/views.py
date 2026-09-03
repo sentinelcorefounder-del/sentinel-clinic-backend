@@ -12,7 +12,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.urls import reverse
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -365,6 +365,12 @@ class MobileTransferImageReviewView(APIView):
         return Response(_pending_payload(item, request))
 
 
+class DuplicateImageConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "This image has already been uploaded for this organization."
+    default_code = "duplicate_image"
+
+
 class ImageUploadListCreateView(generics.ListCreateAPIView):
     serializer_class = ImageUploadSerializer
     permission_classes = [CanManageUploads]
@@ -427,17 +433,35 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
             raise PermissionDenied("You do not have access to this encounter branch.")
         uploaded = serializer.validated_data.pop("image_file")
         private = save_private_upload(uploaded, category="images")
+        duplicate_checksum_qs = ImageUpload.objects.filter(
+            asset_organization=organization,
+            content_sha256=private["sha256"],
+            storage_kind="private_clinical",
+        )
+        if duplicate_checksum_qs.exists():
+            delete_private_object(private["key"])
+            raise DuplicateImageConflict()
         try:
-            image_upload = serializer.save(
-                patient=encounter.patient, image_file="",
-                storage_kind="private_clinical",
-                private_object_key=private["key"],
+            with transaction.atomic():
+                image_upload = serializer.save(
+                    patient=encounter.patient, image_file="",
+                    storage_kind="private_clinical",
+                    private_object_key=private["key"],
+                    content_sha256=private["sha256"],
+                    source_format=private["source_format"],
+                    pixel_width=private["width"], pixel_height=private["height"],
+                    asset_organization=organization, asset_branch=branch,
+                    confirmed_by=user, confirmed_at=timezone.now(),
+                )
+        except IntegrityError:
+            delete_private_object(private["key"])
+            if ImageUpload.objects.filter(
+                asset_organization=organization,
                 content_sha256=private["sha256"],
-                source_format=private["source_format"],
-                pixel_width=private["width"], pixel_height=private["height"],
-                asset_organization=organization, asset_branch=branch,
-                confirmed_by=user, confirmed_at=timezone.now(),
-            )
+                storage_kind="private_clinical",
+            ).exists():
+                raise DuplicateImageConflict()
+            raise
         except Exception:
             delete_private_object(private["key"])
             raise
@@ -468,6 +492,8 @@ class ImageUploadListCreateView(generics.ListCreateAPIView):
         except PermissionDenied:
             raise
         except ValidationError:
+            raise
+        except DuplicateImageConflict:
             raise
         except Exception as exc:
             print("UPLOAD ERROR:", repr(exc))
@@ -526,15 +552,31 @@ class ImageUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
                 raise PermissionDenied("You do not have access to this encounter branch.")
             private = save_private_upload(replacement, category="images")
             old_key = serializer.instance.private_object_key if serializer.instance.storage_kind == "private_clinical" else ""
+            duplicate_checksum_qs = ImageUpload.objects.filter(
+                asset_organization=organization, content_sha256=private["sha256"],
+                storage_kind="private_clinical",
+            ).exclude(pk=serializer.instance.pk)
+            if duplicate_checksum_qs.exists():
+                delete_private_object(private["key"])
+                raise DuplicateImageConflict()
             try:
-                upload = serializer.save(
-                    patient=encounter.patient, image_file="",
-                    storage_kind="private_clinical", private_object_key=private["key"],
-                    content_sha256=private["sha256"], source_format=private["source_format"],
-                    pixel_width=private["width"], pixel_height=private["height"],
-                    asset_organization=organization, asset_branch=branch,
-                    confirmed_by=user, confirmed_at=timezone.now(),
-                )
+                with transaction.atomic():
+                    upload = serializer.save(
+                        patient=encounter.patient, image_file="",
+                        storage_kind="private_clinical", private_object_key=private["key"],
+                        content_sha256=private["sha256"], source_format=private["source_format"],
+                        pixel_width=private["width"], pixel_height=private["height"],
+                        asset_organization=organization, asset_branch=branch,
+                        confirmed_by=user, confirmed_at=timezone.now(),
+                    )
+            except IntegrityError:
+                delete_private_object(private["key"])
+                if ImageUpload.objects.filter(
+                    asset_organization=organization, content_sha256=private["sha256"],
+                    storage_kind="private_clinical",
+                ).exclude(pk=serializer.instance.pk).exists():
+                    raise DuplicateImageConflict()
+                raise
             except Exception:
                 delete_private_object(private["key"])
                 raise

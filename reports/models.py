@@ -1,9 +1,14 @@
 from django.db import models
+import uuid
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
+
+
+def generate_report_id():
+    return f"RPT-{uuid.uuid4().hex.upper()[:24]}"
 
 
 class StructuredReport(models.Model):
@@ -84,7 +89,7 @@ class StructuredReport(models.Model):
         ("NPL", "No Perception of Light"),
     ]
 
-    report_id = models.CharField(max_length=30, unique=True)
+    report_id = models.CharField(max_length=30, unique=True, default=generate_report_id, editable=False)
 
     encounter = models.OneToOneField(
         ScreeningEncounter,

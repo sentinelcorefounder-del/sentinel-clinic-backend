@@ -379,6 +379,17 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(allowed.status_code, 200, allowed.data)
         report.refresh_from_db()
 
+        super_optometrist = self.make_user(
+            "eye-super-opto", {"clinic_admin", "ops_admin", "finance_admin", "optometrist"},
+            self.clinic, self.branch, profile=True, superuser=True,
+        )
+        self.client.force_authenticate(super_optometrist)
+        allowed_super = self.client.post(
+            f"/api/reports/eye-health/encounter/{self.encounter.pk}/",
+            {"advice": "Explicit superuser clinical role", "expected_version": report.lock_version}, format="json",
+        )
+        self.assertEqual(allowed_super.status_code, 200, allowed_super.data)
+
         self.client.force_authenticate(user=None)
         anonymous = self.client.get(f"/api/reports/eye-health/encounter/{self.encounter.pk}/")
         self.assertIn(anonymous.status_code, {401, 403})

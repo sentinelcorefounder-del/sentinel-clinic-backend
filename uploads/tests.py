@@ -70,7 +70,6 @@ class PrivateNormalUploadTests(TestCase):
         response = self.client.post(
             reverse("image-upload-list-create"),
             {
-                "image_upload_id": "NORMAL-PRIVATE",
                 "encounter": self.encounter.pk,
                 "patient": self.patient.pk,
                 "eye_laterality": "left",
@@ -94,6 +93,43 @@ class PrivateNormalUploadTests(TestCase):
         self.assertEqual(content.status_code, 200)
         content.close()
 
+
+    def test_identifier_is_generated_server_side(self):
+        response = self.client.post(
+            reverse("image-upload-list-create"),
+            {"encounter": self.encounter.pk, "patient": self.patient.pk, "eye_laterality":"left", "image_type":"fundus",
+             "image_file": SimpleUploadedFile("generated.jpg", valid_image(), content_type="image/jpeg")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(response.data["image_upload_id"].startswith("IMG-"))
+
+    def test_duplicate_bytes_return_sanitized_409_and_do_not_autoattach(self):
+        first = self.client.post(
+            reverse("image-upload-list-create"),
+            {"encounter": self.encounter.pk, "patient": self.patient.pk, "eye_laterality":"left", "image_type":"fundus",
+             "image_file": SimpleUploadedFile("first-name.jpg", valid_image(), content_type="image/jpeg")},
+            format="multipart",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        second_encounter = ScreeningEncounter.objects.create(
+            encounter_id="UPLOAD-ENC-2", patient=self.patient, encounter_date=date(2026,8,16),
+            originating_organization=self.clinic, service_branch=self.branch,
+        )
+        duplicate = self.client.post(
+            reverse("image-upload-list-create"),
+            {"encounter": second_encounter.pk, "patient": self.patient.pk, "eye_laterality":"right", "image_type":"fundus",
+             "image_file": SimpleUploadedFile("renamed-copy.jpg", valid_image(), content_type="image/jpeg")},
+            format="multipart",
+        )
+        self.assertEqual(duplicate.status_code, 409, duplicate.data)
+        text = str(duplicate.data).lower()
+        self.assertIn("already been uploaded", text)
+        for forbidden in ("private_image_unique_org_checksum", "integrityerror", "sha256", "private_object_key", "constraint", "sql"):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(ImageUpload.objects.count(), 1)
+        self.assertFalse(ImageUpload.objects.filter(encounter=second_encounter).exists())
+
     def test_legacy_default_image_uses_same_protected_endpoint(self):
         upload = ImageUpload.objects.create(
             image_upload_id="LEGACY-UPLOAD", encounter=self.encounter,
@@ -110,7 +146,6 @@ class PrivateNormalUploadTests(TestCase):
         response = self.client.post(
             reverse("image-upload-list-create"),
             {
-                "image_upload_id": "FAILED-PRIVATE",
                 "encounter": self.encounter.pk,
                 "patient": self.patient.pk,
                 "eye_laterality": "left",

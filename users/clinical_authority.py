@@ -3,7 +3,7 @@ CLINICAL_AUTHOR_ROLES = ("optometrist", "reviewer")
 
 def exact_clinical_authority(user):
     """Return the user's exact clinical-author role, without granting scope."""
-    if not user or not user.is_authenticated or user.is_superuser:
+    if not user or not user.is_authenticated:
         return ""
     roles = set(user.groups.values_list("name", flat=True))
     return next((role for role in CLINICAL_AUTHOR_ROLES if role in roles), "")

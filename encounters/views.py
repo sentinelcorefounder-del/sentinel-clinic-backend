@@ -681,6 +681,69 @@ class EncounterServicePackageCorrectionView(APIView):
         return Response(ScreeningEncounterSerializer(encounter, context={"request": request}).data)
 
 
+class EncounterAssessmentLocationCorrectionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        encounter = get_object_or_404(
+            ScreeningEncounter.objects.select_for_update().select_related(
+                "patient__assigned_clinic", "patient__assigned_branch", "service_branch"
+            ),
+            pk=pk,
+        )
+        clinic = encounter.patient.assigned_clinic
+        user_org = get_user_clinic(request.user)
+        if not clinic or not user_org or user_org.pk != clinic.pk:
+            raise PermissionDenied("The encounter is outside your performing clinic.")
+        if not exact_clinical_authority(request.user):
+            raise PermissionDenied("Exact optometrist or qualified reviewer authority is required.")
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not branch or not request.user.branch_access.filter(
+            branch__organization=clinic,
+        ).filter(Q(branch=branch) | Q(has_all_branch_access=True)).exists():
+            raise PermissionDenied("You do not have access to the encounter branch.")
+
+        reason = str(request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"detail": "A correction reason is required."}, status=400)
+        location_type = str(request.data.get("location_type") or "").strip()
+        site_name = str(request.data.get("site_name") or "").strip()
+        address = str(request.data.get("address") or "").strip()
+        if location_type not in {"clinic", "hospital", "mobile", "community", "other"} or not site_name:
+            return Response({"detail": "A valid location type and site/location name are required."}, status=400)
+
+        previous = dict(encounter.assessment_location_snapshot or {})
+        corrected = {
+            **previous,
+            "location_type": location_type,
+            "site_name": site_name,
+            "address": address,
+            "branch_id": branch.pk,
+            "branch_code": branch.branch_code,
+            "branch_name": branch.name,
+        }
+        if corrected == previous:
+            return Response(ScreeningEncounterSerializer(encounter, context={"request": request}).data)
+
+        # Intentional controlled bypass of ScreeningEncounter.save(): ordinary snapshot edits remain immutable.
+        ScreeningEncounter.objects.filter(pk=encounter.pk).update(
+            assessment_location_snapshot=corrected, updated_at=timezone.now()
+        )
+        encounter.refresh_from_db()
+        record_patient_event(
+            patient=encounter.patient,
+            event_key=f"encounter:{encounter.pk}:assessment-location:{uuid.uuid4().hex}",
+            category="encounter", event_type="assessment_location_corrected",
+            title="Assessment location corrected",
+            description=f"Assessment location corrected for encounter {encounter.encounter_id}.",
+            source_type="encounter", source_id=encounter.pk, encounter_id=encounter.encounter_id,
+            actor=request.user, organization=clinic, visibility="clinic_ops",
+            metadata={"previous_location": previous, "corrected_location": corrected, "reason": reason},
+        )
+        return Response(ScreeningEncounterSerializer(encounter, context={"request": request}).data)
+
+
 class PatientEncounterListView(generics.ListAPIView):
     serializer_class = ScreeningEncounterSerializer
 

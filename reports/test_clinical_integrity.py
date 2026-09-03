@@ -127,6 +127,12 @@ class RetinalReportClinicalIntegrityTests(TestCase):
         superuser = self.user("root", set(), superuser=True)
         self.assertEqual(self.create_api(superuser).status_code, 403)
 
+    def test_superuser_with_explicit_optometrist_role_and_scope_can_author(self):
+        user = self.user("root-opto", {"clinic_admin", "ops_admin", "finance_admin", "optometrist"}, self.clinic, self.branch, superuser=True)
+        response = self.create_api(user)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(response.data["report_id"].startswith("RPT-"))
+
     def test_cross_branch_and_organization_are_blocked(self):
         wrong_branch = self.user("wrong-branch", {"optometrist"}, self.clinic, self.other_branch)
         wrong_org = self.user("wrong-org", {"optometrist"}, self.other_clinic)

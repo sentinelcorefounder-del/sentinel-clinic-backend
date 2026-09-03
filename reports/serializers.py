@@ -222,6 +222,7 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = [
+            "report_id",
             "report_status",
             "submitted_to_ops_at",
             "submitted_to_ops_by",

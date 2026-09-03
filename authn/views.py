@@ -29,6 +29,11 @@ def get_security_profile(user):
 
 def serialize_user(user):
     org = get_user_organization(user)
+    # A superuser does not gain tenant authority from superuser status, but an
+    # explicitly assigned organization membership must still be represented to
+    # the frontend. Backend permission checks remain authoritative.
+    if org is None:
+        org = getattr(getattr(user, "organization_link", None), "organization", None)
     profile = get_security_profile(user)
 
     return {

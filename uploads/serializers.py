@@ -83,7 +83,7 @@ class ImageUploadSerializer(serializers.ModelSerializer):
             "image_quality", "gradable", "retake_required", "uploaded_at",
             "ai_analysis", "dataset_label",
         ]
-        read_only_fields = ["uploaded_at", "ai_analysis", "dataset_label", "patient_display", "encounter_display"]
+        read_only_fields = ["image_upload_id", "uploaded_at", "ai_analysis", "dataset_label", "patient_display", "encounter_display"]
 
     def get_patient_display(self, obj):
         patient = obj.patient

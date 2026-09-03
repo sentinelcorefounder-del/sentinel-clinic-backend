@@ -21,7 +21,7 @@ from finance.models import (
 from finance.services import top_up_wallet
 from consents.models import ConsentRecord
 from audit.models import PatientTimelineEvent
-from reports.models import StructuredReport, StructuredReportVersion
+from reports.models import StructuredReport, StructuredReportVersion, EyeHealthScreeningReport, EyeHealthScreeningReportVersion
 
 from .models import (
     OcularAIReview,
@@ -118,6 +118,15 @@ class ClinicalIntakeAccessTests(TestCase):
         reviewer = self.user("intake-reviewer", {"reviewer"}, self.clinic, self.branch)
         self.assertEqual(self.patch(reviewer, {"diabetes_duration": "Eleven years"}).status_code, 200)
 
+        super_optometrist = self.user(
+            "intake-super-opto", {"clinic_admin", "ops_admin", "finance_admin", "optometrist"},
+            self.clinic, self.branch, superuser=True,
+        )
+        self.assertEqual(
+            self.patch(super_optometrist, {"clinical_notes": "Superuser explicit-role correction"}).status_code,
+            200,
+        )
+
     def test_nonclinical_and_out_of_scope_users_cannot_update(self):
         users = [
             self.user("intake-admin", {"clinic_admin"}, self.clinic, self.branch),
@@ -175,6 +184,96 @@ class ClinicalIntakeAccessTests(TestCase):
         self.assertEqual(report.issued_version_id, version.pk)
         self.assertEqual(report.versions.count(), 1)
         self.assertEqual(version.clinical_snapshot, {"notes": "Controlled report note"})
+
+
+class EncounterCorrectionControlTests(TestCase):
+    def setUp(self):
+        self.clinic = Organization.objects.create(clinic_id="CORR-CLINIC", name="Correction Clinic", organization_type="clinic")
+        self.other_clinic = Organization.objects.create(clinic_id="CORR-OTHER", name="Other Clinic", organization_type="clinic")
+        self.hospital = Organization.objects.create(clinic_id="CORR-HOSP", name="Hospital", organization_type="hospital")
+        self.branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="MAIN", name="Main")
+        self.other_branch = OrganizationBranch.objects.create(organization=self.clinic, branch_code="OTHER", name="Other")
+        self.patient = Patient.objects.create(patient_id="CORR-PAT", first_name="Synthetic", last_name="Patient", date_of_birth=date(1980,1,1), sex="female", assigned_clinic=self.clinic, assigned_branch=self.branch)
+        self.encounter = ScreeningEncounter.objects.create(
+            encounter_id="CORR-ENC", patient=self.patient, encounter_date=date(2026,9,1),
+            service_package=ScreeningEncounter.ServicePackage.EYE_HEALTH_SCREENING,
+            programme="eye_health_screening", encounter_type="eye_health_screening",
+            originating_organization=self.clinic, service_branch=self.branch,
+            assessment_location_snapshot={"location_type":"clinic","site_name":"Old Site","address":"Old address","branch_id":self.branch.pk,"branch_code":self.branch.branch_code,"branch_name":self.branch.name},
+        )
+        self.client = APIClient()
+
+    def user(self, name, roles=(), org=None, branch=None, superuser=False):
+        user = User.objects.create_user(name, password="test", is_superuser=superuser)
+        for role in roles:
+            user.groups.add(Group.objects.get_or_create(name=role)[0])
+        if org: UserOrganization.objects.create(user=user, organization=org)
+        if branch: UserBranchAccess.objects.create(user=user, branch=branch, is_default=True)
+        return user
+
+    def post(self, user, suffix, payload):
+        self.client.force_authenticate(user)
+        return self.client.post(f"/api/encounters/{self.encounter.pk}/{suffix}/", payload, format="json")
+
+    def test_service_package_correction_requires_reason_and_explicit_clinical_scope(self):
+        allowed = self.user("corr-super-opto", {"clinic_admin","ops_admin","finance_admin","optometrist"}, self.clinic, self.branch, superuser=True)
+        missing_reason = self.post(allowed, "service-package", {"service_package":"diabetic_retinal_assessment"})
+        self.assertEqual(missing_reason.status_code, 400)
+        response = self.post(allowed, "service-package", {"service_package":"diabetic_retinal_assessment","reason":"Corrected booking selection"})
+        self.assertEqual(response.status_code, 200, response.data)
+        self.encounter.refresh_from_db()
+        self.assertTrue(self.encounter.includes_diabetic_screening)
+        event = PatientTimelineEvent.objects.get(event_type="service_package_corrected")
+        self.assertEqual(event.metadata["reason"], "Corrected booking selection")
+
+    def test_service_package_finalized_report_is_locked(self):
+        user = self.user("corr-opto-lock", {"optometrist"}, self.clinic, self.branch)
+        StructuredReport.objects.create(encounter=self.encounter, patient=self.patient, review_date=date(2026,9,1), report_status="issued")
+        response = self.post(user, "service-package", {"service_package":"diabetic_retinal_assessment","reason":"Should be locked"})
+        self.assertEqual(response.status_code, 409)
+
+    def test_location_correction_is_audited_and_ordinary_update_remains_immutable(self):
+        user = self.user("corr-location", {"optometrist"}, self.clinic, self.branch)
+        response = self.post(user, "assessment-location", {"location_type":"community","site_name":"Corrected Site","address":"New address","reason":"Capture location corrected"})
+        self.assertEqual(response.status_code, 200, response.data)
+        self.encounter.refresh_from_db()
+        self.assertEqual(self.encounter.assessment_location_snapshot["site_name"], "Corrected Site")
+        event = PatientTimelineEvent.objects.get(event_type="assessment_location_corrected")
+        self.assertEqual(event.metadata["previous_location"]["site_name"], "Old Site")
+        self.assertEqual(event.metadata["corrected_location"]["site_name"], "Corrected Site")
+        self.assertEqual(event.metadata["reason"], "Capture location corrected")
+        self.encounter.assessment_location_snapshot = {"site_name":"Silent rewrite"}
+        with self.assertRaises(Exception):
+            self.encounter.save()
+
+    def test_location_correction_does_not_rewrite_finalized_report_version_snapshot(self):
+        user = self.user("corr-location-history", {"optometrist"}, self.clinic, self.branch)
+        report = EyeHealthScreeningReport.objects.create(encounter=self.encounter, status="finalized")
+        version = EyeHealthScreeningReportVersion.objects.create(
+            report=report, version_number=1,
+            clinical_snapshot={"assessment_location": dict(self.encounter.assessment_location_snapshot)},
+            checksum_sha256="b" * 64, clinician_snapshot={"name":"Synthetic"}, editor=user,
+        )
+        EyeHealthScreeningReport.objects.filter(pk=report.pk).update(finalized_version=version)
+        response = self.post(user, "assessment-location", {"location_type":"community","site_name":"Corrected Site","reason":"Correct snapshot only"})
+        self.assertEqual(response.status_code, 200, response.data)
+        version.refresh_from_db()
+        self.assertEqual(version.clinical_snapshot["assessment_location"]["site_name"], "Old Site")
+
+    def test_location_correction_scope_boundaries(self):
+        users = [
+            self.user("corr-super-only", (), self.clinic, self.branch, superuser=True),
+            self.user("corr-admin", {"clinic_admin"}, self.clinic, self.branch),
+            self.user("corr-wrong-branch", {"optometrist"}, self.clinic, self.other_branch),
+            self.user("corr-wrong-org", {"optometrist"}, self.other_clinic),
+            self.user("corr-hospital", {"optometrist"}, self.hospital),
+        ]
+        for user in users:
+            response = self.post(user, "assessment-location", {"location_type":"clinic","site_name":"Denied","reason":"Denied"})
+            self.assertIn(response.status_code, {403,404})
+        self.encounter.refresh_from_db()
+        self.assertEqual(self.encounter.assessment_location_snapshot["site_name"], "Old Site")
+
 
 
 class OcularDiagnosticWorkflowTests(TestCase):
