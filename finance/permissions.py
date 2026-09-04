@@ -38,3 +38,12 @@ class IsInternalFinanceOperator(InternalFinancePermission):
 
 class IsInternalFinanceApprover(InternalFinancePermission):
     required_role = "approver"
+
+
+class IsInternalFinanceSessionManager(BasePermission):
+    message = "An exact internal finance operator or finance administrator role is required."
+
+    def has_permission(self, request, view):
+        return has_internal_finance_role(request.user, "operator") or has_internal_finance_role(
+            request.user, "administrator"
+        )

@@ -404,23 +404,28 @@ class InternalFinanceFoundationTests(TestCase):
 
     def test_session_api_denies_operator_approver_and_clinical_users(self):
         url = "/api/finance/internal/service-sessions/"
-        users = []
+        finance_users = []
         for index, group in enumerate((self.operator_group, self.approver_group)):
             user = get_user_model().objects.create_user(f"finance-role-{index}")
             user.groups.add(group)
             UserSecurityProfile.objects.create(
                 user=user, is_internal_sentinel_staff=True
             )
-            users.append(user)
+            finance_users.append(user)
+        for user in finance_users:
+            self.client.force_authenticate(user)
+            self.assertEqual(self.client.get(url).status_code, 200)
+
+        denied_users = []
         clinic_user = get_user_model().objects.create_user("clinic-foundation-user")
         clinic_user.groups.add(self.admin_group)
         UserOrganization.objects.create(user=clinic_user, organization=self.clinic)
-        users.append(clinic_user)
+        denied_users.append(clinic_user)
         partner_user = get_user_model().objects.create_user("partner-foundation-user")
         partner_user.groups.add(self.admin_group)
         UserOrganization.objects.create(user=partner_user, organization=self.partner)
-        users.append(partner_user)
-        for user in users:
+        denied_users.append(partner_user)
+        for user in denied_users:
             self.client.force_authenticate(user)
             self.assertEqual(self.client.get(url).status_code, 403)
 
@@ -741,7 +746,7 @@ class InternalFinanceFoundationTests(TestCase):
         session.refresh_from_db()
         activated_by_id = session.activated_by_id
         activated_at = session.activated_at
-        self.assertEqual(self.client.post(activate_url, {}, format="json").status_code, 409)
+        self.assertEqual(self.client.post(activate_url, {}, format="json").status_code, 200)
         session.refresh_from_db()
         self.assertEqual(session.activated_by_id, activated_by_id)
         self.assertEqual(session.activated_at, activated_at)

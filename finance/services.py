@@ -26,6 +26,10 @@ from .models import (
     SponsorshipEvent,
     TreasuryTransfer,
     TreasuryTransferEvent,
+    FounderFundedExpense,
+    FounderFundedExpenseEvent,
+    TreasuryExpenseCategory,
+    is_sentinel_treasury_organization,
     OrganizationWallet,
     WalletLedgerEntry,
 )
@@ -1856,8 +1860,8 @@ def create_encounter_sponsorship(*, encounter, sponsor_wallet, category, reason,
         return existing
     if EncounterSponsorship.objects.filter(encounter=encounter).exists():
         raise ValidationError("This encounter already has a sponsorship record.")
-    if sponsor_wallet.organization.organization_type != "sentinel":
-        raise ValidationError("Sponsorship requires an existing Sentinel wallet.")
+    if not is_eligible_sentinel_treasury_wallet(sponsor_wallet):
+        raise ValidationError("Sponsorship requires an eligible Sentinel treasury wallet.")
     record = ensure_financial_record(encounter)
     if record.status in {EncounterFinancialRecord.Status.UNPRICED, EncounterFinancialRecord.Status.EXCEPTION}:
         contract_override = None
@@ -1953,7 +1957,7 @@ def decide_encounter_sponsorship(sponsorship, *, actor, approve, reason=""):
     if approve:
         wallet = OrganizationWallet.objects.select_for_update().get(pk=sponsorship.sponsor_wallet_id)
         record = EncounterFinancialRecord.objects.select_for_update().get(pk=sponsorship.financial_record_id)
-        if wallet.organization.organization_type != "sentinel" or not wallet.is_active:
+        if not is_eligible_sentinel_treasury_wallet(wallet):
             raise ValidationError("The Sentinel sponsor wallet is unavailable.")
         if record.captured_at or record.status not in {
             EncounterFinancialRecord.Status.PRICED,
@@ -2053,10 +2057,96 @@ def cancel_encounter_sponsorship(sponsorship, *, actor, reason):
     return sponsorship
 
 
-def sentinel_treasury_summary():
-    sentinel_wallets = OrganizationWallet.objects.filter(
-        organization__organization_type="sentinel", is_active=True
+def _founder_expense_event(expense, action, actor, source, target, key, reason="", metadata=None):
+    return FounderFundedExpenseEvent.objects.create(
+        expense=expense, action=action, actor=actor, source_status=source, target_status=target,
+        reason=str(reason or "").strip(), idempotency_key=key, metadata=metadata or {},
     )
+
+
+@transaction.atomic
+def create_founder_funded_expense(*, expense_date, category, supplier_payee, description, amount,
+                                  currency, evidence, funding_treatment, idempotency_key, actor):
+    key = _require_idempotency_key(idempotency_key)
+    existing = FounderFundedExpense.objects.filter(idempotency_key=key).first()
+    if existing:
+        return existing
+    expense = FounderFundedExpense(
+        expense_date=expense_date, category=category, supplier_payee=str(supplier_payee or "").strip(),
+        description=str(description or "").strip(), amount=_money(amount),
+        currency=str(currency or "NGN").strip().upper(), evidence=evidence,
+        funding_treatment=funding_treatment, idempotency_key=key, created_by=actor,
+    )
+    expense.full_clean()
+    try:
+        expense.save()
+    except IntegrityError as exc:
+        existing = FounderFundedExpense.objects.filter(idempotency_key=key).first()
+        if existing:
+            return existing
+        raise ValidationError("The founder-expense record conflicted with another update; refresh and retry.") from exc
+    _founder_expense_event(expense, "created", actor, "", expense.status,
+                           f"founder-expense:{expense.pk}:created")
+    return expense
+
+
+@transaction.atomic
+def submit_founder_funded_expense(expense, *, actor):
+    expense = FounderFundedExpense.objects.select_for_update().get(pk=expense.pk)
+    if expense.status == FounderFundedExpense.Status.SUBMITTED:
+        return expense
+    if expense.status != FounderFundedExpense.Status.DRAFT:
+        raise ValidationError("Only a draft founder expense can be submitted.")
+    source = expense.status
+    expense.status = FounderFundedExpense.Status.SUBMITTED
+    expense.submitted_at = timezone.now()
+    expense.save(update_fields=["status", "submitted_at", "updated_at"])
+    _founder_expense_event(expense, "submitted", actor, source, expense.status,
+                           f"founder-expense:{expense.pk}:submitted")
+    return expense
+
+
+@transaction.atomic
+def decide_founder_funded_expense(expense, *, actor, approve, reason=""):
+    expense = FounderFundedExpense.objects.select_for_update().get(pk=expense.pk)
+    if approve and expense.status == FounderFundedExpense.Status.APPROVED:
+        return expense
+    if expense.status != FounderFundedExpense.Status.SUBMITTED:
+        raise ValidationError("Only a submitted founder expense can be decided.")
+    if expense.created_by_id == getattr(actor, "id", None):
+        raise ValidationError("Maker-checker control: the creator cannot decide this founder expense.")
+    reason = str(reason or "").strip()
+    if not approve and not reason:
+        raise ValidationError("A rejection reason is required.")
+    source = expense.status
+    expense.status = FounderFundedExpense.Status.APPROVED if approve else FounderFundedExpense.Status.REJECTED
+    expense.decided_by = actor
+    expense.decided_at = timezone.now()
+    expense.decision_reason = reason
+    expense.save(update_fields=["status", "decided_by", "decided_at", "decision_reason", "updated_at"])
+    _founder_expense_event(expense, "approved" if approve else "rejected", actor, source, expense.status,
+                           f"founder-expense:{expense.pk}:decision", reason=reason)
+    return expense
+
+
+def eligible_sentinel_treasury_wallets(*, active_only=True):
+    queryset = OrganizationWallet.objects.select_related("organization").filter(
+        organization__is_active=True
+    ).filter(
+        Q(organization__organization_type="sentinel")
+        | Q(organization__clinic_id="SNT-CLINIC")
+    )
+    if active_only:
+        queryset = queryset.filter(is_active=True)
+    return queryset
+
+
+def is_eligible_sentinel_treasury_wallet(wallet):
+    return bool(wallet and wallet.is_active and is_sentinel_treasury_organization(wallet.organization))
+
+
+def sentinel_treasury_summary():
+    sentinel_wallets = eligible_sentinel_treasury_wallets()
     wallet_ids = sentinel_wallets.values_list("id", flat=True)
     available = sentinel_wallets.annotate(
         value=models.Sum("ledger_entries__available_delta")
@@ -2088,16 +2178,22 @@ def _transfer_event(transfer, action, actor, source, target, key, reason="", met
 
 @transaction.atomic
 def create_treasury_transfer(*, wallet, amount, purpose, destination_label,
-                             idempotency_key, actor):
+                             idempotency_key, actor, category=None, founder_expense=None):
     key = _require_idempotency_key(idempotency_key)
     existing = TreasuryTransfer.objects.filter(idempotency_key=key).first()
     if existing:
         return existing
+    if founder_expense and TreasuryTransfer.objects.filter(founder_expense=founder_expense).exclude(
+        status__in=[TreasuryTransfer.Status.CANCELLED, TreasuryTransfer.Status.REJECTED, TreasuryTransfer.Status.REVERSED]
+    ).exists():
+        raise ValidationError("This founder expense already has an active reimbursement transfer.")
     wallet = OrganizationWallet.objects.select_for_update().select_related("organization").get(pk=wallet.pk)
     summary = sentinel_treasury_summary()
     transfer = TreasuryTransfer(
         wallet=wallet, amount=_money(amount), currency=wallet.currency,
+        category=str(category or TreasuryExpenseCategory.OTHER).strip(),
         purpose=str(purpose or "").strip(), destination_label=str(destination_label or "").strip(),
+        founder_expense=founder_expense,
         idempotency_key=key, created_by=actor,
         available_surplus_snapshot={
             "available": str(summary["available"]),
@@ -2153,7 +2249,7 @@ def decide_treasury_transfer(transfer, *, actor, approve, reason=""):
         wallet = OrganizationWallet.objects.select_for_update().select_related("organization").get(
             pk=transfer.wallet_id
         )
-        if wallet.organization.organization_type != "sentinel" or not wallet.is_active:
+        if not is_eligible_sentinel_treasury_wallet(wallet):
             raise ValidationError("The Sentinel treasury wallet is unavailable.")
         existing_commitments = TreasuryTransfer.objects.filter(
             wallet=wallet, status=TreasuryTransfer.Status.APPROVED
@@ -2185,15 +2281,15 @@ def decide_treasury_transfer(transfer, *, actor, approve, reason=""):
 
 
 @transaction.atomic
-def record_treasury_transfer_execution(transfer, *, actor, external_reference, evidence):
+def record_treasury_transfer_execution(transfer, *, actor, execution_date, external_reference, evidence):
     transfer = TreasuryTransfer.objects.select_for_update().select_related("wallet").get(pk=transfer.pk)
     if transfer.status == TreasuryTransfer.Status.EXECUTED:
         return transfer
     if transfer.status != TreasuryTransfer.Status.APPROVED:
         raise ValidationError("Only an approved transfer can be recorded as executed.")
     reference = str(external_reference or "").strip()
-    if not reference or evidence is None:
-        raise ValidationError("Execution reference and evidence are required.")
+    if not execution_date or not reference or evidence is None:
+        raise ValidationError("Execution date, reference and evidence are required.")
     wallet = OrganizationWallet.objects.select_for_update().get(pk=transfer.wallet_id)
     if wallet.available_balance < transfer.amount:
         raise ValidationError("Available Sentinel funds no longer cover this transfer.")
@@ -2210,11 +2306,30 @@ def record_treasury_transfer_execution(transfer, *, actor, external_reference, e
     transfer.evidence = evidence
     transfer.executed_by = actor
     transfer.executed_at = timezone.now()
+    transfer.execution_date = execution_date
     transfer.ledger_entry = entry
     transfer.save(update_fields=[
         "status", "external_reference", "evidence", "executed_by", "executed_at",
-        "ledger_entry", "updated_at",
+        "execution_date", "ledger_entry", "updated_at",
     ])
+    if transfer.founder_expense_id:
+        expense = FounderFundedExpense.objects.select_for_update().get(pk=transfer.founder_expense_id)
+        if expense.status == FounderFundedExpense.Status.SETTLED:
+            existing_execution = expense.reimbursement_transfers.filter(status=TreasuryTransfer.Status.EXECUTED).exclude(pk=transfer.pk).exists()
+            if existing_execution:
+                raise ValidationError("Founder expense has already been settled by another transfer.")
+        elif expense.status != FounderFundedExpense.Status.APPROVED:
+            raise ValidationError("Founder expense is no longer eligible for reimbursement.")
+        else:
+            expense.status = FounderFundedExpense.Status.SETTLED
+            expense.settled_at = transfer.executed_at
+            expense.save(update_fields=["status", "settled_at", "updated_at"])
+            FounderFundedExpenseEvent.objects.create(
+                expense=expense, action="reimbursed", actor=actor,
+                source_status=FounderFundedExpense.Status.APPROVED, target_status=expense.status,
+                idempotency_key=f"founder-expense:{expense.pk}:reimbursed:{transfer.pk}",
+                metadata={"treasury_transfer_id": transfer.pk, "ledger_entry_id": entry.pk},
+            )
     _transfer_event(transfer, "execution_recorded", actor, source, transfer.status,
                     f"treasury-transfer:{transfer.pk}:executed", reason=transfer.purpose,
                     metadata={"ledger_entry_id": entry.pk})
@@ -2263,6 +2378,18 @@ def reverse_treasury_transfer(transfer, *, actor, reason):
     transfer.status = TreasuryTransfer.Status.REVERSED
     transfer.reversal_entry = entry
     transfer.save(update_fields=["status", "reversal_entry", "updated_at"])
+    if transfer.founder_expense_id:
+        expense = FounderFundedExpense.objects.select_for_update().get(pk=transfer.founder_expense_id)
+        if expense.status == FounderFundedExpense.Status.SETTLED:
+            expense.status = FounderFundedExpense.Status.APPROVED
+            expense.settled_at = None
+            expense.save(update_fields=["status", "settled_at", "updated_at"])
+            FounderFundedExpenseEvent.objects.create(
+                expense=expense, action="reimbursement_reversed", actor=actor,
+                source_status=FounderFundedExpense.Status.SETTLED, target_status=expense.status,
+                reason=reason, idempotency_key=f"founder-expense:{expense.pk}:reimbursement-reversed:{transfer.pk}",
+                metadata={"treasury_transfer_id": transfer.pk, "ledger_entry_id": entry.pk},
+            )
     _transfer_event(transfer, "reversed", actor, source, transfer.status,
                     f"treasury-transfer:{transfer.pk}:reversed", reason=reason,
                     metadata={"ledger_entry_id": entry.pk})

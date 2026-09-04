@@ -13,7 +13,7 @@ from payments.models import PaymentTransaction
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
@@ -26,6 +26,7 @@ from .models import (
     BillingProfile,
     ServicePartnerEarning, ServicePartnerSettlementBatch, ServicePartnerCorrectionRequest,
     EncounterSponsorship, TreasuryTransfer, EncounterAllocation,
+    FounderFundedExpense, TreasuryExpenseCategory,
 )
 from encounters.models import AssessmentServiceSession, ScreeningEncounter
 from organizations.models import Organization
@@ -43,10 +44,11 @@ from .serializers import (
     ServicePartnerEarningSerializer, ServicePartnerSettlementSerializer,
     ServicePartnerCorrectionSerializer, ServicePartnerAdjustmentSerializer,
     EncounterSponsorshipSerializer, TreasuryTransferSerializer,
+    FounderFundedExpenseSerializer,
 )
 from .permissions import (
     IsInternalFinanceAdministrator, IsInternalFinanceApprover,
-    IsInternalFinanceOperator, has_internal_finance_role,
+    IsInternalFinanceOperator, IsInternalFinanceSessionManager, has_internal_finance_role,
 )
 from .documents import UnreliableDocumentSnapshot, render_bank_transfer_document
 from .services import (
@@ -69,7 +71,9 @@ from .services import (
     cancel_encounter_sponsorship, sentinel_treasury_summary,
     create_treasury_transfer, submit_treasury_transfer, decide_treasury_transfer,
     record_treasury_transfer_execution, cancel_treasury_transfer,
-    reverse_treasury_transfer,
+    reverse_treasury_transfer, eligible_sentinel_treasury_wallets,
+    create_founder_funded_expense, submit_founder_funded_expense,
+    decide_founder_funded_expense,
 )
 
 
@@ -104,8 +108,21 @@ class FinanceRolePermission(BasePermission):
         return user.groups.filter(name__in=self.role_groups[self.required_role]).exists()
 
 
-class IsFinanceViewer(FinanceRolePermission):
-    required_role = "viewer"
+class IsFinanceViewer(BasePermission):
+    message = "An internal Sentinel finance role is required."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        try:
+            if not user.security_profile.is_internal_sentinel_staff:
+                return False
+        except Exception:
+            return False
+        return user.groups.filter(
+            name__in={"finance_viewer", "finance_operator", "finance_approver", "finance_admin"}
+        ).exists()
 
 
 class IsInternalFinancePayablesViewer(BasePermission):
@@ -139,6 +156,11 @@ def _evidence_response(file_field):
 
 class ServicePartnerViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceAdministrator
+        return [IsAuthenticated(), role()]
+
     serializer_class = ServicePartnerSerializer
     queryset = Organization.objects.filter(organization_type="service_partner").order_by("name")
     http_method_names = ["get", "post", "patch", "head", "options"]
@@ -155,7 +177,7 @@ class ServicePartnerViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         with transaction.atomic():
             partner = get_object_or_404(
-                self.get_queryset().select_for_update(), pk=serializer.instance.pk
+                self.get_queryset().select_for_update(of=("self",)), pk=serializer.instance.pk
             )
             self.check_object_permissions(self.request, partner)
             changed = any(
@@ -176,7 +198,11 @@ class ServicePartnerViewSet(viewsets.ModelViewSet):
 
 
 class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, IsInternalFinanceAdministrator]
+    permission_classes = [IsAuthenticated, IsInternalFinanceSessionManager]
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceSessionManager
+        return [IsAuthenticated(), role()]
     serializer_class = AssessmentServiceSessionSerializer
     http_method_names = ["get", "post", "patch", "head", "options"]
 
@@ -188,7 +214,10 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         with transaction.atomic():
-            session = serializer.save()
+            try:
+                session = serializer.save()
+            except DjangoValidationError as exc:
+                raise DRFValidationError(getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or "Session terms are invalid.") from exc
             _audit_internal(
                 "service_session_created", self.request.user,
                 after={"session_id": session.id, "session_reference": session.session_reference,
@@ -198,7 +227,7 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         with transaction.atomic():
             session = get_object_or_404(
-                self.get_queryset().select_for_update(), pk=serializer.instance.pk
+                self.get_queryset().select_for_update(of=("self",)), pk=serializer.instance.pk
             )
             self.check_object_permissions(self.request, session)
             if session.status != AssessmentServiceSession.Status.DRAFT:
@@ -211,7 +240,10 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
             if not changed:
                 return
             before = {"session_reference": session.session_reference, "configuration_version": session.configuration_version}
-            session = serializer.save(configuration_version=session.configuration_version + 1)
+            try:
+                session = serializer.save(configuration_version=session.configuration_version + 1)
+            except DjangoValidationError as exc:
+                raise DRFValidationError(getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or "Session terms are invalid.") from exc
             _audit_internal(
                 "service_session_draft_edited", self.request.user, before=before,
                 after={"session_reference": session.session_reference,
@@ -222,14 +254,19 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
         with transaction.atomic():
-            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            session = get_object_or_404(self.get_queryset().select_for_update(of=("self",)), pk=pk)
             self.check_object_permissions(request, session)
+            if session.status == AssessmentServiceSession.Status.ACTIVE:
+                return Response(self.get_serializer(session).data)
             if session.status != AssessmentServiceSession.Status.DRAFT:
                 return Response({"detail": "Only a draft session can be activated."}, status=status.HTTP_409_CONFLICT)
             session.status = AssessmentServiceSession.Status.ACTIVE
             session.activated_by = request.user
             session.activated_at = timezone.now()
-            session.save(update_fields=["status", "activated_by", "activated_at", "updated_at"])
+            try:
+                session.save(update_fields=["status", "activated_by", "activated_at", "updated_at"])
+            except DjangoValidationError as exc:
+                return _finance_error(exc)
             _audit_internal("service_session_activated", request.user,
                             metadata={"session_id": session.id, "session_reference": session.session_reference,
                                       "configuration_version": session.configuration_version})
@@ -238,14 +275,17 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         with transaction.atomic():
-            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            session = get_object_or_404(self.get_queryset().select_for_update(of=("self",)), pk=pk)
             self.check_object_permissions(request, session)
             if session.status != AssessmentServiceSession.Status.ACTIVE:
                 return Response({"detail": "Only an active session can be completed."}, status=status.HTTP_409_CONFLICT)
             session.status = AssessmentServiceSession.Status.COMPLETED
             session.completed_by = request.user
             session.completed_at = timezone.now()
-            session.save(update_fields=["status", "completed_by", "completed_at", "updated_at"])
+            try:
+                session.save(update_fields=["status", "completed_by", "completed_at", "updated_at"])
+            except DjangoValidationError as exc:
+                return _finance_error(exc)
             _audit_internal("service_session_completed", request.user,
                             metadata={"session_id": session.id, "session_reference": session.session_reference,
                                       "configuration_version": session.configuration_version})
@@ -265,7 +305,10 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
             session.cancelled_by = request.user
             session.cancelled_at = timezone.now()
             session.cancellation_reason = reason
-            session.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"])
+            try:
+                session.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancellation_reason", "updated_at"])
+            except DjangoValidationError as exc:
+                return _finance_error(exc)
             _audit_internal("service_session_cancelled", request.user,
                             metadata={"session_id": session.id, "session_reference": session.session_reference,
                                       "reason": reason, "configuration_version": session.configuration_version})
@@ -723,13 +766,18 @@ class OrganizationWalletViewSet(FinanceAdminViewSet):
     serializer_class = OrganizationWalletSerializer
 
     def get_permissions(self):
-        if self.action in {"list", "retrieve"}:
+        if self.action in {"list", "retrieve", "sentinel_treasury"}:
             role = IsFinanceViewer
         elif self.action in {"top_up", "reserve"}:
             role = IsInternalFinanceOperator
         else:
             role = IsInternalFinanceAdministrator
         return [IsAuthenticated(), role()]
+
+    @action(detail=False, methods=["get"], url_path="sentinel-treasury")
+    def sentinel_treasury(self, request):
+        wallets = eligible_sentinel_treasury_wallets()
+        return Response(self.get_serializer(wallets, many=True).data)
 
     @action(detail=True, methods=["post"], url_path="top-up")
     def top_up(self, request, pk=None):
@@ -1264,7 +1312,7 @@ class FinanceReconciliationView(APIView):
 
 
 class FinanceCapabilitiesView(APIView):
-    permission_classes = [IsAuthenticated, IsFinanceViewer]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         def allowed(permission):
@@ -1287,7 +1335,7 @@ class FinanceCapabilitiesView(APIView):
                 "can_operate": allowed(IsInternalFinanceOperator),
                 "can_approve": allowed(IsInternalFinanceApprover),
                 "can_manage_service_partners": allowed(IsInternalFinanceAdministrator),
-                "can_manage_service_sessions": allowed(IsInternalFinanceAdministrator),
+                "can_manage_service_sessions": allowed(IsInternalFinanceSessionManager),
             },
         })
 
@@ -1393,6 +1441,69 @@ class EncounterSponsorshipViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(self.get_serializer(item).data)
 
 
+class FounderFundedExpenseViewSet(viewsets.ReadOnlyModelViewSet):
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    serializer_class = FounderFundedExpenseSerializer
+    queryset = FounderFundedExpense.objects.select_related(
+        "created_by", "decided_by"
+    ).prefetch_related("events", "events__actor")
+
+    def get_permissions(self):
+        if self.action in {"list", "retrieve", "evidence"}:
+            role = IsFinanceViewer
+        elif self.action in {"approve", "reject"}:
+            role = IsInternalFinanceApprover
+        else:
+            role = IsInternalFinanceOperator
+        return [IsAuthenticated(), role()]
+
+    def create(self, request):
+        try:
+            item = create_founder_funded_expense(
+                expense_date=request.data.get("expense_date"),
+                category=request.data.get("category", ""),
+                supplier_payee=request.data.get("supplier_payee", ""),
+                description=request.data.get("description", ""),
+                amount=request.data.get("amount"), currency=request.data.get("currency", "NGN"),
+                evidence=request.FILES.get("evidence") if hasattr(request, "FILES") else None,
+                funding_treatment=request.data.get("funding_treatment", ""),
+                idempotency_key=request.data.get("idempotency_key", ""), actor=request.user,
+            )
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        try:
+            item = submit_founder_funded_expense(self.get_object(), actor=request.user)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        try:
+            item = decide_founder_funded_expense(self.get_object(), actor=request.user, approve=True)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        try:
+            item = decide_founder_funded_expense(
+                self.get_object(), actor=request.user, approve=False, reason=request.data.get("reason", "")
+            )
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["get"])
+    def evidence(self, request, pk=None):
+        return _evidence_response(self.get_object().evidence)
+
+
 class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TreasuryTransferSerializer
     queryset = TreasuryTransfer.objects.select_related(
@@ -1417,14 +1528,20 @@ class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
     def create(self, request):
         try:
             wallet = OrganizationWallet.objects.select_related("organization").get(pk=request.data.get("wallet"))
+            founder_expense = None
+            founder_expense_id = request.data.get("founder_expense")
+            if founder_expense_id not in (None, ""):
+                founder_expense = FounderFundedExpense.objects.get(pk=founder_expense_id)
             transfer = create_treasury_transfer(
                 wallet=wallet, amount=request.data.get("amount"),
+                category=request.data.get("category", ""),
                 purpose=request.data.get("purpose", ""),
                 destination_label=request.data.get("destination_label", ""),
                 idempotency_key=request.data.get("idempotency_key", ""), actor=request.user,
+                founder_expense=founder_expense,
             )
-        except OrganizationWallet.DoesNotExist:
-            return Response({"detail": "Sentinel wallet not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (OrganizationWallet.DoesNotExist, FounderFundedExpense.DoesNotExist):
+            return Response({"detail": "Sentinel wallet or founder expense not found."}, status=status.HTTP_404_NOT_FOUND)
         except (DjangoValidationError, ValueError, TypeError) as exc:
             return _finance_error(exc)
         return Response(self.get_serializer(transfer).data, status=status.HTTP_201_CREATED)
@@ -1461,6 +1578,7 @@ class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
         try:
             item = record_treasury_transfer_execution(
                 self.get_object(), actor=request.user,
+                execution_date=request.data.get("execution_date"),
                 external_reference=request.data.get("external_reference", ""),
                 evidence=request.FILES.get("evidence"),
             )
@@ -1504,9 +1622,7 @@ class SentinelTreasuryDashboardView(APIView):
         date_from = parse_date(filter_values["date_from"])
         date_to = parse_date(filter_values["date_to"])
         summary = sentinel_treasury_summary()
-        wallet_ids = OrganizationWallet.objects.filter(
-            organization__organization_type="sentinel"
-        ).values_list("id", flat=True)
+        wallet_ids = eligible_sentinel_treasury_wallets().values_list("id", flat=True)
         receipt_queryset = WalletLedgerEntry.objects.filter(
             wallet_id__in=wallet_ids, entry_type=WalletLedgerEntry.EntryType.TOP_UP
         ).filter(

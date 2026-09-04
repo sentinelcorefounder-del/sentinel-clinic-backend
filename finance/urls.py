@@ -20,6 +20,7 @@ from .views import (
     ServicePartnerPayablesViewSet,
     EncounterSponsorshipViewSet,
     TreasuryTransferViewSet,
+    FounderFundedExpenseViewSet,
 )
 
 router = DefaultRouter()
@@ -42,6 +43,7 @@ router.register("internal/service-sessions", AssessmentServiceSessionViewSet, ba
 router.register("internal/service-partner-payables", ServicePartnerPayablesViewSet, basename="internal-finance-service-partner-payable")
 router.register("sponsorships", EncounterSponsorshipViewSet, basename="finance-sponsorship")
 router.register("treasury-transfers", TreasuryTransferViewSet, basename="finance-treasury-transfer")
+router.register("founder-expenses", FounderFundedExpenseViewSet, basename="finance-founder-expense")
 
 urlpatterns = router.urls
 

@@ -7,6 +7,35 @@ from django.db import models
 from django.db.models import Q
 
 
+
+
+SENTINEL_TREASURY_CLINICAL_ORG_CODES = {"SNT-CLINIC"}
+
+
+def is_sentinel_treasury_organization(organization):
+    return bool(
+        organization
+        and organization.is_active
+        and (
+            organization.organization_type == "sentinel"
+            or organization.clinic_id in SENTINEL_TREASURY_CLINICAL_ORG_CODES
+        )
+    )
+
+
+class TreasuryExpenseCategory(models.TextChoices):
+    SALARY_PAYROLL = "salary_payroll", "Salary / payroll"
+    CONTRACTOR = "contractor", "Contractor"
+    HOSTING_SOFTWARE = "hosting_software", "Hosting / software"
+    FIELD_OPERATIONS = "field_operations", "Field operations"
+    MARKETING_ADMIN = "marketing_administration", "Marketing / administration"
+    EQUIPMENT_SUPPLIES = "equipment_supplies", "Equipment / supplies"
+    TAX_PROFESSIONAL = "tax_professional_fees", "Tax / professional fees"
+    FOUNDER_REIMBURSEMENT = "founder_reimbursement", "Founder reimbursement"
+    INTERNAL_TRANSFER = "internal_account_transfer", "Internal account transfer"
+    OTHER = "other_operating_expense", "Other approved operating expense"
+
+
 class TimeStampedModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -896,7 +925,6 @@ class SettlementBatch(TimeStampedModel):
     )
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancellation_reason = models.TextField(blank=True, default="")
-
     class Meta:
         ordering = ["-period_end", "-created_at"]
         indexes = [
@@ -1414,8 +1442,8 @@ class EncounterSponsorship(TimeStampedModel):
             raise ValidationError({"patient_amount": "A sponsored patient amount must be zero."})
         if self.gross_service_value <= 0:
             raise ValidationError({"gross_service_value": "The standard service value must be positive."})
-        if self.sponsor_wallet_id and self.sponsor_wallet.organization.organization_type != "sentinel":
-            raise ValidationError({"sponsor_wallet": "The sponsor wallet must belong to Sentinel."})
+        if self.sponsor_wallet_id and not is_sentinel_treasury_organization(self.sponsor_wallet.organization):
+            raise ValidationError({"sponsor_wallet": "The sponsor wallet must be an eligible Sentinel treasury wallet."})
         if self.sponsor_wallet_id and self.currency != self.sponsor_wallet.currency:
             raise ValidationError({"currency": "Currency must match the sponsor wallet."})
         if not self.reason.strip():
@@ -1450,6 +1478,83 @@ class SponsorshipEvent(models.Model):
         raise ValidationError("Sponsorship events are immutable.")
 
 
+def founder_expense_reference():
+    return f"SEN-FE-{uuid.uuid4().hex[:12].upper()}"
+
+
+def founder_expense_evidence_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"finance/action-evidence/{instance.idempotency_key}/{uuid.uuid4().hex}.{suffix}"
+
+
+class FounderFundedExpense(TimeStampedModel):
+    class FundingTreatment(models.TextChoices):
+        CONTRIBUTION = "founder_contribution", "Founder contribution — not repayable"
+        REIMBURSABLE = "founder_reimbursable", "Amount owed to founder — reimbursable"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        SETTLED = "settled", "Settled"
+        CANCELLED = "cancelled", "Cancelled"
+
+    expense_reference = models.CharField(max_length=32, unique=True, default=founder_expense_reference, editable=False)
+    expense_date = models.DateField()
+    category = models.CharField(max_length=40, choices=TreasuryExpenseCategory.choices)
+    supplier_payee = models.CharField(max_length=180)
+    description = models.TextField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    evidence = models.FileField(upload_to=founder_expense_evidence_path)
+    funding_treatment = models.CharField(max_length=30, choices=FundingTreatment.choices)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_founder_expenses")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name="decided_founder_expenses")
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+    settled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-expense_date", "-id"]
+        indexes = [models.Index(fields=["status", "expense_date"], name="fin_founder_status_date_idx")]
+        constraints = [models.CheckConstraint(condition=models.Q(amount__gt=0), name="fin_founder_expense_positive")]
+
+    def clean(self):
+        if self.amount <= 0:
+            raise ValidationError({"amount": "Expense amount must be positive."})
+        if not self.supplier_payee.strip() or not self.description.strip():
+            raise ValidationError("Supplier/payee and description are required.")
+        if len(self.currency.strip()) != 3:
+            raise ValidationError({"currency": "Currency must be a three-letter code."})
+
+
+class FounderFundedExpenseEvent(models.Model):
+    expense = models.ForeignKey(FounderFundedExpense, on_delete=models.PROTECT, related_name="events")
+    action = models.CharField(max_length=60)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="founder_expense_events")
+    source_status = models.CharField(max_length=20, blank=True, default="")
+    target_status = models.CharField(max_length=20)
+    reason = models.TextField(blank=True, default="")
+    idempotency_key = models.CharField(max_length=160, unique=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Founder-expense events are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Founder-expense events are immutable.")
+
+
 def treasury_transfer_reference():
     return f"SEN-TR-{uuid.uuid4().hex[:12].upper()}"
 
@@ -1472,6 +1577,7 @@ class TreasuryTransfer(TimeStampedModel):
     )
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3, default="NGN")
+    category = models.CharField(max_length=40, choices=TreasuryExpenseCategory.choices)
     purpose = models.TextField()
     destination_label = models.CharField(max_length=180)
     external_reference = models.CharField(max_length=120, blank=True, default="")
@@ -1495,6 +1601,7 @@ class TreasuryTransfer(TimeStampedModel):
         related_name="executed_treasury_transfers",
     )
     executed_at = models.DateTimeField(null=True, blank=True)
+    execution_date = models.DateField(null=True, blank=True)
     ledger_entry = models.OneToOneField(
         WalletLedgerEntry, on_delete=models.PROTECT, null=True, blank=True,
         related_name="treasury_transfer",
@@ -1504,6 +1611,10 @@ class TreasuryTransfer(TimeStampedModel):
         related_name="reversed_treasury_transfer",
     )
     cancellation_reason = models.TextField(blank=True, default="")
+    founder_expense = models.ForeignKey(
+        FounderFundedExpense, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="reimbursement_transfers",
+    )
 
     class Meta:
         ordering = ["-created_at", "-id"]
@@ -1520,12 +1631,22 @@ class TreasuryTransfer(TimeStampedModel):
     def clean(self):
         if self.amount <= 0:
             raise ValidationError({"amount": "Transfer amount must be positive."})
-        if self.wallet_id and self.wallet.organization.organization_type != "sentinel":
-            raise ValidationError({"wallet": "Treasury transfers require a Sentinel wallet."})
+        if self.wallet_id and not is_sentinel_treasury_organization(self.wallet.organization):
+            raise ValidationError({"wallet": "Treasury transfers require an eligible Sentinel treasury wallet."})
         if self.wallet_id and self.currency != self.wallet.currency:
             raise ValidationError({"currency": "Currency must match the wallet."})
         if not self.purpose.strip() or not self.destination_label.strip():
             raise ValidationError("Purpose and destination label are required.")
+        if self.founder_expense_id:
+            expense = self.founder_expense
+            if expense.funding_treatment != FounderFundedExpense.FundingTreatment.REIMBURSABLE:
+                raise ValidationError({"founder_expense": "Founder contributions are not reimbursable."})
+            if expense.status != FounderFundedExpense.Status.APPROVED:
+                raise ValidationError({"founder_expense": "Founder expense must be approved before reimbursement."})
+            if self.category != TreasuryExpenseCategory.FOUNDER_REIMBURSEMENT:
+                raise ValidationError({"category": "Founder reimbursements require the founder-reimbursement category."})
+            if self.amount != expense.amount or self.currency != expense.currency:
+                raise ValidationError({"amount": "Founder reimbursement must settle the approved expense in full."})
 
 
 class TreasuryTransferEvent(models.Model):

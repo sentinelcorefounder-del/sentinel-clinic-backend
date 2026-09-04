@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
 from organizations.models import Organization
 from encounters.models import AssessmentServiceSession
 
@@ -28,6 +28,8 @@ from .models import (
     SponsorshipEvent,
     TreasuryTransfer,
     TreasuryTransferEvent,
+    FounderFundedExpense,
+    FounderFundedExpenseEvent,
 )
 
 
@@ -97,16 +99,56 @@ class TreasuryTransferSerializer(serializers.ModelSerializer):
         model = TreasuryTransfer
         fields = (
             "id", "transfer_reference", "wallet", "wallet_name", "amount", "currency",
-            "purpose", "destination_label", "external_reference", "status",
+            "category", "purpose", "destination_label", "external_reference", "status",
             "available_surplus_snapshot", "idempotency_key", "created_by_name",
             "submitted_at", "decided_by_name", "decided_at", "decision_reason",
-            "executed_by_name", "executed_at", "ledger_entry", "reversal_entry",
-            "cancellation_reason", "evidence_available", "events", "created_at", "updated_at",
+            "executed_by_name", "executed_at", "execution_date", "ledger_entry", "reversal_entry",
+            "cancellation_reason", "founder_expense", "evidence_available", "events", "created_at", "updated_at",
         )
         read_only_fields = fields
 
     def get_evidence_available(self, obj):
         return bool(obj.evidence and obj.evidence.name)
+
+
+class FounderFundedExpenseEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.CharField(source="actor.username", read_only=True, allow_null=True)
+
+    class Meta:
+        model = FounderFundedExpenseEvent
+        fields = (
+            "id", "action", "actor_name", "source_status", "target_status",
+            "reason", "idempotency_key", "metadata", "created_at",
+        )
+        read_only_fields = fields
+
+
+class FounderFundedExpenseSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source="created_by.username", read_only=True)
+    decided_by_name = serializers.CharField(source="decided_by.username", read_only=True, allow_null=True)
+    evidence_available = serializers.SerializerMethodField()
+    reimbursement_transfer_id = serializers.SerializerMethodField()
+    events = FounderFundedExpenseEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = FounderFundedExpense
+        fields = (
+            "id", "expense_reference", "expense_date", "category", "supplier_payee",
+            "description", "amount", "currency", "funding_treatment", "status",
+            "idempotency_key", "created_by_name", "submitted_at", "decided_by_name",
+            "decided_at", "decision_reason", "settled_at", "reimbursement_transfer_id",
+            "evidence_available", "events", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_evidence_available(self, obj):
+        return bool(obj.evidence and obj.evidence.name)
+
+    def get_reimbursement_transfer_id(self, obj):
+        transfer = obj.reimbursement_transfers.exclude(
+            status__in=["cancelled", "rejected", "reversed"]
+        ).order_by("-created_at", "-id").first()
+        return transfer.id if transfer else None
 
 
 class ServicePartnerEarningSerializer(serializers.ModelSerializer):
@@ -369,6 +411,7 @@ class OrganizationWalletSerializer(serializers.ModelSerializer):
     available_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     reserved_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     spendable_balance = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    transferable_balance = serializers.SerializerMethodField()
 
     class Meta:
         model = OrganizationWallet
@@ -379,6 +422,14 @@ class OrganizationWalletSerializer(serializers.ModelSerializer):
         if organization.organization_type == "service_partner":
             raise serializers.ValidationError("Service partners cannot have organization wallets.")
         return organization
+
+    def get_transferable_balance(self, obj):
+        from .models import TreasuryTransfer
+        committed = obj.treasury_transfers.filter(
+            status=TreasuryTransfer.Status.APPROVED
+        ).aggregate(total=Sum("amount"))["total"] or 0
+        transferable = max(obj.available_balance - committed, 0)
+        return f"{transferable:.2f}"
 
 
 class WalletLedgerEntrySerializer(serializers.ModelSerializer):

@@ -156,14 +156,14 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.assertEqual(ServicePartnerEarning.objects.count(), 0)
 
     def test_non_sentinel_wallet_cannot_sponsor_or_transfer(self):
-        with self.assertRaisesMessage(Exception, "Sentinel wallet"):
+        with self.assertRaisesMessage(Exception, "Sentinel treasury wallet"):
             create_encounter_sponsorship(
                 encounter=self.encounter, sponsor_wallet=self.afri_wallet,
                 category=EncounterSponsorship.Category.HARDSHIP,
                 reason="Synthetic invalid sponsor", idempotency_key="invalid-sponsor",
                 actor=self.operator,
             )
-        with self.assertRaisesMessage(Exception, "Sentinel wallet"):
+        with self.assertRaisesMessage(Exception, "Sentinel treasury wallet"):
             create_treasury_transfer(
                 wallet=self.afri_wallet, amount="100.00", purpose="Invalid source",
                 destination_label="Synthetic destination", idempotency_key="invalid-transfer",
@@ -358,10 +358,10 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.assertEqual(summary["transferable_surplus"], Decimal("20000.00"))
         evidence = SimpleUploadedFile("evidence.pdf", b"synthetic evidence", content_type="application/pdf")
         transfer = record_treasury_transfer_execution(
-            transfer, actor=self.operator, external_reference="SYNTHETIC-EXECUTION", evidence=evidence
+            transfer, actor=self.operator, execution_date=date.today(), external_reference="SYNTHETIC-EXECUTION", evidence=evidence
         )
         repeated = record_treasury_transfer_execution(
-            transfer, actor=self.operator, external_reference="IGNORED-RETRY", evidence=evidence
+            transfer, actor=self.operator, execution_date=date.today(), external_reference="IGNORED-RETRY", evidence=evidence
         )
         self.assertEqual(repeated.ledger_entry_id, transfer.ledger_entry_id)
         self.assertEqual(transfer.events.filter(action="execution_recorded").count(), 1)
@@ -453,7 +453,7 @@ class SponsorshipAndTreasuryTests(TestCase):
         ), actor=self.operator), actor=self.approver, approve=True)
         evidence = SimpleUploadedFile("evidence.pdf", b"synthetic evidence", content_type="application/pdf")
         transfer = record_treasury_transfer_execution(
-            transfer, actor=self.operator, external_reference="SYNTHETIC-EVIDENCE", evidence=evidence
+            transfer, actor=self.operator, execution_date=date.today(), external_reference="SYNTHETIC-EVIDENCE", evidence=evidence
         )
         client = APIClient()
         path = f"/api/finance/treasury-transfers/{transfer.pk}/evidence/"
