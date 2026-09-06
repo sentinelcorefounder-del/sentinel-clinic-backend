@@ -1308,7 +1308,7 @@ def refund_to_wallet(wallet, amount, idempotency_key, financial_record=None, act
 def reserve_financial_record_from_originating_wallet(financial_record, actor=None, reference=""):
     from .models import OrganizationWallet, WalletReservation
 
-    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+    record = EncounterFinancialRecord.objects.select_for_update(of=("self",)).select_related(
         "encounter", "encounter__originating_organization",
         "payer_organization"
     ).get(pk=financial_record.pk)
