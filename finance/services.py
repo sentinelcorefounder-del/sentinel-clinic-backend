@@ -29,6 +29,10 @@ from .models import (
     FounderFundedExpense,
     FounderFundedExpenseEvent,
     TreasuryExpenseCategory,
+    FinanceServiceCode,
+    EncounterChargeComponent,
+    HistoricalAssessmentFinance,
+    canonical_finance_service_code,
     is_sentinel_treasury_organization,
     OrganizationWallet,
     WalletLedgerEntry,
@@ -359,7 +363,13 @@ def infer_financial_identity(encounter):
     responsibility = (encounter.payment_responsibility or "").strip()
     if responsibility == "patient":
         payer_type = EncounterFinancialRecord.PayerType.PATIENT
-        collector_type = EncounterFinancialRecord.CollectorType.SENTINEL
+        origin = getattr(encounter, "originating_organization", None)
+        if origin and origin.organization_type == "clinic":
+            collector_type = EncounterFinancialRecord.CollectorType.CLINIC
+        elif origin and origin.organization_type == "hospital":
+            collector_type = EncounterFinancialRecord.CollectorType.HOSPITAL
+        else:
+            collector_type = EncounterFinancialRecord.CollectorType.SENTINEL
         payment_method = EncounterFinancialRecord.PaymentMethod.PAYSTACK
     elif responsibility in {"hospital", "clinic"}:
         payer_type = EncounterFinancialRecord.PayerType.ORGANIZATION
@@ -428,9 +438,16 @@ def resolve_payer_organization(encounter):
 
 
 def resolve_contract(encounter):
-    organization = resolve_payer_organization(encounter)
+    # Contract pricing belongs to the organisation delivering/owning the service,
+    # even when the patient is the payer. Payer identity remains separate on the
+    # financial record.
+    organization = (
+        encounter.originating_organization
+        if (encounter.payment_responsibility or "").strip() == "patient"
+        else resolve_payer_organization(encounter)
+    )
     if organization is None:
-        raise ValidationError("Encounter has no organisation responsible for payment.")
+        raise ValidationError("Encounter has no organisation available for contract pricing.")
 
     contracts = PartnerContract.objects.filter(
         organization=organization,
@@ -441,10 +458,18 @@ def resolve_contract(encounter):
 
 
 def resolve_pricing_rule(encounter, contract):
+    canonical_service = canonical_finance_service_code(encounter)
+    legacy_aliases = {
+        FinanceServiceCode.DIABETIC_RETINAL_ASSESSMENT: {"retinal_assessment", "diabetic_eye_screening"},
+        FinanceServiceCode.COMBINED_DIABETIC_EYE_HEALTH: {"combined_assessment"},
+        FinanceServiceCode.EYE_HEALTH_SCREENING: {"eye_health_screening"},
+        FinanceServiceCode.OCULAR_ASSESSMENT: {"ocular_assessment"},
+    }
+    service_types = {canonical_service, *legacy_aliases.get(canonical_service, set())}
     candidates = _active_for_date(
         contract.pricing_rules.filter(
             is_active=True,
-            service_type=encounter.encounter_type,
+            service_type__in=service_types,
         ),
         encounter.encounter_date,
     )
@@ -728,6 +753,12 @@ def price_encounter(encounter, actor=None, force=False, contract_override=None):
         record.collector_type,
         record.payment_method,
     ) = infer_financial_identity(encounter)
+    record.collecting_organization = (
+        encounter.originating_organization
+        if record.payer_type == EncounterFinancialRecord.PayerType.PATIENT
+        and getattr(encounter, "originating_organization_id", None)
+        else None
+    )
     record.currency = contract.currency
     record.gross_amount = rule.gross_amount
     record.allocated_amount = allocated_total
@@ -744,6 +775,7 @@ def price_encounter(encounter, actor=None, force=False, contract_override=None):
         "pricing_rule_name": rule.name,
         "pricing_rule_version": rule.version,
         "pricing_rule_supersedes_id": rule.supersedes_id,
+        "service_code": canonical_finance_service_code(encounter),
         "service_type": rule.service_type,
         "source_type": rule.source_type,
         "workflow_route": rule.workflow_route,
@@ -758,6 +790,22 @@ def price_encounter(encounter, actor=None, force=False, contract_override=None):
         "payment_method": record.payment_method,
     }
     record.save()
+
+    EncounterChargeComponent.objects.update_or_create(
+        idempotency_key=f"encounter:{encounter.pk}:base-service",
+        defaults={
+            "financial_record": record,
+            "service_code": canonical_finance_service_code(encounter),
+            "description": rule.name,
+            "quantity": 1,
+            "unit_amount": rule.gross_amount,
+            "gross_amount": rule.gross_amount,
+            "currency": contract.currency,
+            "pricing_rule": rule,
+            "pricing_snapshot": dict(record.pricing_snapshot),
+            "status": EncounterChargeComponent.Status.OPEN,
+        },
+    )
 
     EncounterAllocation.objects.bulk_create(
         [
@@ -2131,10 +2179,8 @@ def decide_founder_funded_expense(expense, *, actor, approve, reason=""):
 
 def eligible_sentinel_treasury_wallets(*, active_only=True):
     queryset = OrganizationWallet.objects.select_related("organization").filter(
-        organization__is_active=True
-    ).filter(
-        Q(organization__organization_type="sentinel")
-        | Q(organization__clinic_id="SNT-CLINIC")
+        organization__is_active=True,
+        organization__is_sentinel_treasury=True,
     )
     if active_only:
         queryset = queryset.filter(is_active=True)
@@ -2166,6 +2212,85 @@ def sentinel_treasury_summary():
         "calculated_at": timezone.now(),
         "formula": "Sentinel wallet available balance minus approved, unexecuted treasury transfers; pending funding is excluded and existing wallet reservations/captures are already reflected in available balance.",
     }
+
+
+@transaction.atomic
+def post_opening_balance(*, wallet, amount, idempotency_key, actor=None, reference="", description="", metadata=None):
+    amount = _money(amount)
+    if amount <= 0:
+        raise ValidationError("Opening balance must be greater than zero.")
+    existing = WalletLedgerEntry.objects.filter(idempotency_key=_require_idempotency_key(idempotency_key)).first()
+    if existing:
+        return existing
+    wallet = OrganizationWallet.objects.select_for_update().get(pk=wallet.pk)
+    return WalletLedgerEntry.objects.create(
+        wallet=wallet, entry_type=WalletLedgerEntry.EntryType.OPENING_BALANCE,
+        available_delta=amount, reserved_delta=Decimal("0.00"), currency=wallet.currency,
+        idempotency_key=idempotency_key, reference=str(reference or "").strip(),
+        description=str(description or "Opening balance").strip()[:255],
+        metadata=metadata or {}, actor=actor,
+    )
+
+
+@transaction.atomic
+def record_historical_assessment_finance(*, encounter, service_code, assessment_date, payment_state, amount,
+                                         amount_paid, collecting_organization, payment_method, payment_reference,
+                                         source_note, idempotency_key, actor):
+    key = _require_idempotency_key(idempotency_key)
+    existing = HistoricalAssessmentFinance.objects.filter(idempotency_key=key).first()
+    if existing:
+        return existing
+    item = HistoricalAssessmentFinance(
+        encounter=encounter, service_code=service_code, assessment_date=assessment_date,
+        payment_state=payment_state, amount=_money(amount), amount_paid=_money(amount_paid),
+        currency="NGN", collecting_organization=collecting_organization,
+        payment_method=str(payment_method or "").strip(),
+        payment_reference=str(payment_reference or "").strip(),
+        source_note=str(source_note or "").strip(), idempotency_key=key, imported_by=actor,
+    )
+    item.full_clean()
+    item.save()
+    record = ensure_financial_record(encounter)
+    if record.status == EncounterFinancialRecord.Status.UNPRICED:
+        record.currency = item.currency
+        record.gross_amount = item.amount
+        record.outstanding_amount = max(Decimal("0.00"), item.amount - item.amount_paid)
+        record.collecting_organization = item.collecting_organization
+        record.payer_type = EncounterFinancialRecord.PayerType.PATIENT
+        record.collector_type = (
+            EncounterFinancialRecord.CollectorType.CLINIC
+            if item.collecting_organization and item.collecting_organization.organization_type == "clinic"
+            else EncounterFinancialRecord.CollectorType.HOSPITAL
+            if item.collecting_organization and item.collecting_organization.organization_type == "hospital"
+            else EncounterFinancialRecord.CollectorType.NONE
+        )
+        record.payment_method = EncounterFinancialRecord.PaymentMethod.UNSET
+        record.status = (
+            EncounterFinancialRecord.Status.CAPTURED
+            if item.payment_state == HistoricalAssessmentFinance.PaymentState.PAID and record.outstanding_amount == 0
+            else EncounterFinancialRecord.Status.AWAITING_PAYMENT
+        )
+        record.financially_releasable = record.status == EncounterFinancialRecord.Status.CAPTURED
+        if record.financially_releasable:
+            record.captured_at = timezone.now()
+        record.pricing_snapshot = {
+            "historical_import": True, "service_code": item.service_code,
+            "historical_assessment_date": str(item.assessment_date),
+            "payment_state": item.payment_state, "amount_paid": str(item.amount_paid),
+        }
+        record.save()
+        EncounterChargeComponent.objects.get_or_create(
+            idempotency_key=f"historical:{item.pk}:service",
+            defaults={
+                "financial_record": record, "service_code": item.service_code,
+                "description": f"Historical {item.get_service_code_display()}", "quantity": 1,
+                "unit_amount": item.amount, "gross_amount": item.amount, "currency": item.currency,
+                "pricing_snapshot": dict(record.pricing_snapshot),
+                "status": EncounterChargeComponent.Status.CAPTURED
+                if record.status == EncounterFinancialRecord.Status.CAPTURED else EncounterChargeComponent.Status.OPEN,
+            },
+        )
+    return item
 
 
 def _transfer_event(transfer, action, actor, source, target, key, reason="", metadata=None):

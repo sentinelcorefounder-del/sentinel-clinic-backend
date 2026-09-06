@@ -53,7 +53,7 @@ def serialize_user(user):
             "organization_type": org.organization_type,
             "contact_email": org.contact_email,
             "is_active": org.is_active,
-            "is_sentinel_internal": org.organization_type == "sentinel" or org.clinic_id == "SNT-CLINIC",
+            "is_sentinel_internal": org.organization_type == "sentinel",
         } if org else None,
     }
 

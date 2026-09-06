@@ -21,6 +21,7 @@ from .views import (
     EncounterSponsorshipViewSet,
     TreasuryTransferViewSet,
     FounderFundedExpenseViewSet,
+    HistoricalAssessmentFinanceViewSet,
 )
 
 router = DefaultRouter()
@@ -44,6 +45,7 @@ router.register("internal/service-partner-payables", ServicePartnerPayablesViewS
 router.register("sponsorships", EncounterSponsorshipViewSet, basename="finance-sponsorship")
 router.register("treasury-transfers", TreasuryTransferViewSet, basename="finance-treasury-transfer")
 router.register("founder-expenses", FounderFundedExpenseViewSet, basename="finance-founder-expense")
+router.register("historical-assessments", HistoricalAssessmentFinanceViewSet, basename="finance-historical-assessment")
 
 urlpatterns = router.urls
 
@@ -55,6 +57,7 @@ from .views import (
     FinanceReconciliationView,
     PartnerFinanceView,
     SentinelTreasuryDashboardView,
+    FinanceServiceCatalogueView,
 )
 
 urlpatterns += [
@@ -64,4 +67,5 @@ urlpatterns += [
     path("reconciliation/", FinanceReconciliationView.as_view(), name="finance-reconciliation"),
     path("capabilities/", FinanceCapabilitiesView.as_view(), name="finance-capabilities"),
     path("sentinel-dashboard/", SentinelTreasuryDashboardView.as_view(), name="sentinel-finance-dashboard"),
+    path("service-catalogue/", FinanceServiceCatalogueView.as_view(), name="finance-service-catalogue"),
 ]

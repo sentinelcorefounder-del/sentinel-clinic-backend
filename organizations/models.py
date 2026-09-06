@@ -14,6 +14,10 @@ class Organization(models.Model):
     name = models.CharField(max_length=255)
     contact_email = models.EmailField(blank=True)
     is_active = models.BooleanField(default=True)
+    is_sentinel_treasury = models.BooleanField(
+        default=False,
+        help_text="Protected designation for the single authoritative Project Sentinel treasury organisation.",
+    )
 
     organization_type = models.CharField(
         max_length=20,
@@ -48,6 +52,13 @@ class Organization(models.Model):
 
     class Meta:
         ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_sentinel_treasury"],
+                condition=models.Q(is_sentinel_treasury=True),
+                name="organizations_single_sentinel_treasury",
+            )
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.clinic_id})"

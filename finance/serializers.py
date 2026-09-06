@@ -30,6 +30,8 @@ from .models import (
     TreasuryTransferEvent,
     FounderFundedExpense,
     FounderFundedExpenseEvent,
+    EncounterChargeComponent,
+    HistoricalAssessmentFinance,
 )
 
 
@@ -386,10 +388,28 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
     contract_name = serializers.CharField(source="contract.name", read_only=True)
     pricing_rule_name = serializers.CharField(source="pricing_rule.name", read_only=True)
     allocations = EncounterAllocationSerializer(many=True, read_only=True)
+    charge_components = serializers.SerializerMethodField()
 
     def get_patient_display(self, obj):
         patient = obj.encounter.patient
         return f"{patient.patient_id} — {patient.first_name} {patient.last_name}".strip()
+
+    def get_charge_components(self, obj):
+        return [
+            {
+                "id": item.id,
+                "service_code": item.service_code,
+                "service_label": item.get_service_code_display(),
+                "description": item.description,
+                "quantity": item.quantity,
+                "unit_amount": str(item.unit_amount),
+                "gross_amount": str(item.gross_amount),
+                "currency": item.currency,
+                "pricing_rule": item.pricing_rule_id,
+                "status": item.status,
+            }
+            for item in obj.charge_components.all()
+        ]
 
     class Meta:
         model = EncounterFinancialRecord
@@ -580,12 +600,45 @@ class ServiceAllowanceReservationSerializer(serializers.ModelSerializer):
         read_only_fields = tuple(field.name for field in ServiceAllowanceReservation._meta.fields)
 
 
+class EncounterChargeComponentSerializer(serializers.ModelSerializer):
+    service_label = serializers.CharField(source="get_service_code_display", read_only=True)
+
+    class Meta:
+        model = EncounterChargeComponent
+        fields = (
+            "id", "service_code", "service_label", "description", "quantity",
+            "unit_amount", "gross_amount", "currency", "pricing_rule",
+            "pricing_snapshot", "status", "created_at",
+        )
+        read_only_fields = fields
+
+
+class HistoricalAssessmentFinanceSerializer(serializers.ModelSerializer):
+    encounter_reference = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    collecting_organization_name = serializers.CharField(
+        source="collecting_organization.name", read_only=True, allow_null=True
+    )
+    imported_by_name = serializers.CharField(source="imported_by.username", read_only=True)
+
+    class Meta:
+        model = HistoricalAssessmentFinance
+        fields = (
+            "id", "encounter", "encounter_reference", "service_code", "assessment_date",
+            "payment_state", "amount", "amount_paid", "currency",
+            "collecting_organization", "collecting_organization_name", "payment_method",
+            "payment_reference", "source_note", "idempotency_key", "imported_by_name",
+            "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+
 class PartnerFinanceSummarySerializer(serializers.Serializer):
     organization_id = serializers.IntegerField()
     organization_name = serializers.CharField()
     organization_type = serializers.CharField()
     wallet = OrganizationWalletSerializer(allow_null=True)
     active_contract = PartnerContractSerializer(allow_null=True)
+    active_contracts = PartnerContractSerializer(many=True)
     active_pricing_rules = PricingRuleSerializer(many=True)
     recent_ledger = WalletLedgerEntrySerializer(many=True)
     recent_financial_records = EncounterFinancialRecordSerializer(many=True)

@@ -26,7 +26,8 @@ from .models import (
     BillingProfile,
     ServicePartnerEarning, ServicePartnerSettlementBatch, ServicePartnerCorrectionRequest,
     EncounterSponsorship, TreasuryTransfer, EncounterAllocation,
-    FounderFundedExpense, TreasuryExpenseCategory,
+    FounderFundedExpense, TreasuryExpenseCategory, HistoricalAssessmentFinance,
+    FinanceServiceCode,
 )
 from encounters.models import AssessmentServiceSession, ScreeningEncounter
 from organizations.models import Organization
@@ -44,7 +45,7 @@ from .serializers import (
     ServicePartnerEarningSerializer, ServicePartnerSettlementSerializer,
     ServicePartnerCorrectionSerializer, ServicePartnerAdjustmentSerializer,
     EncounterSponsorshipSerializer, TreasuryTransferSerializer,
-    FounderFundedExpenseSerializer,
+    FounderFundedExpenseSerializer, HistoricalAssessmentFinanceSerializer,
 )
 from .permissions import (
     IsInternalFinanceAdministrator, IsInternalFinanceApprover,
@@ -66,6 +67,7 @@ from .services import (
     decide_service_partner_settlement, cancel_service_partner_settlement,
     mark_service_partner_settlement_paid,
     request_service_partner_correction, decide_service_partner_correction,
+    record_historical_assessment_finance,
     create_encounter_sponsorship, submit_encounter_sponsorship,
     decide_encounter_sponsorship, capture_encounter_sponsorship,
     cancel_encounter_sponsorship, sentinel_treasury_summary,
@@ -1195,10 +1197,14 @@ class PartnerFinanceView(APIView):
         if not organization:
             return Response({"detail": "No organisation is linked to this account."}, status=status.HTTP_403_FORBIDDEN)
         wallet = OrganizationWallet.objects.filter(organization=organization, currency="NGN", is_active=True).first()
-        contract = _active_contract_for(organization)
-        rules = PricingRule.objects.none()
-        if contract:
-            rules = contract.pricing_rules.filter(is_active=True).prefetch_related("allocation_rules")
+        today = timezone.localdate()
+        contracts = PartnerContract.objects.filter(
+            organization=organization, status=PartnerContract.Status.ACTIVE, effective_from__lte=today
+        ).filter(Q(effective_to__isnull=True) | Q(effective_to__gte=today)).order_by("programme", "-effective_from", "-id")
+        contract = contracts.first()
+        rules = PricingRule.objects.filter(
+            contract__in=contracts, is_active=True, effective_from__lte=today
+        ).filter(Q(effective_to__isnull=True) | Q(effective_to__gte=today)).select_related("contract").prefetch_related("allocation_rules").order_by("service_type", "priority", "-version")
         ledger = WalletLedgerEntry.objects.none()
         if wallet:
             ledger = wallet.ledger_entries.select_related("financial_record")[:50]
@@ -1211,6 +1217,7 @@ class PartnerFinanceView(APIView):
             "organization_type": organization.organization_type,
             "wallet": wallet,
             "active_contract": contract,
+            "active_contracts": contracts,
             "active_pricing_rules": rules,
             "recent_ledger": ledger,
             "recent_financial_records": records,
@@ -1617,6 +1624,53 @@ class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=True, methods=["get"])
     def evidence(self, request, pk=None):
         return _evidence_response(self.get_object().evidence)
+
+
+class HistoricalAssessmentFinanceViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = HistoricalAssessmentFinanceSerializer
+    queryset = HistoricalAssessmentFinance.objects.select_related(
+        "encounter", "collecting_organization", "imported_by"
+    )
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else IsInternalFinanceOperator
+        return [IsAuthenticated(), role()]
+
+    def create(self, request):
+        try:
+            encounter = ScreeningEncounter.objects.select_related("originating_organization").get(
+                pk=request.data.get("encounter")
+            )
+            collector = None
+            collector_id = request.data.get("collecting_organization")
+            if collector_id not in (None, ""):
+                collector = Organization.objects.get(pk=collector_id)
+            item = record_historical_assessment_finance(
+                encounter=encounter,
+                service_code=request.data.get("service_code", ""),
+                assessment_date=request.data.get("assessment_date"),
+                payment_state=request.data.get("payment_state", "historical_unknown"),
+                amount=request.data.get("amount", "0"),
+                amount_paid=request.data.get("amount_paid", "0"),
+                collecting_organization=collector,
+                payment_method=request.data.get("payment_method", ""),
+                payment_reference=request.data.get("payment_reference", ""),
+                source_note=request.data.get("source_note", ""),
+                idempotency_key=request.data.get("idempotency_key", ""),
+                actor=request.user,
+            )
+        except (ScreeningEncounter.DoesNotExist, Organization.DoesNotExist):
+            return Response({"detail": "Encounter or collecting organisation not found."}, status=status.HTTP_404_NOT_FOUND)
+        except (DjangoValidationError, ValueError, TypeError) as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data, status=status.HTTP_201_CREATED)
+
+
+class FinanceServiceCatalogueView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response([{"code": value, "label": label} for value, label in FinanceServiceCode.choices])
 
 
 class SentinelTreasuryDashboardView(APIView):

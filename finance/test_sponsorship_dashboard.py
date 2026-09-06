@@ -61,7 +61,10 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.settings_override = override_settings(MEDIA_ROOT=self.media.name)
         self.settings_override.enable()
         self.sentinel = Organization.objects.create(
-            clinic_id="SENTINEL-TREASURY", name="Project Sentinel", organization_type="sentinel"
+            clinic_id="SENTINEL-TREASURY",
+            name="Project Sentinel",
+            organization_type="sentinel",
+            is_sentinel_treasury=True,
         )
         self.afri = Organization.objects.create(
             clinic_id="AFRI-SEPARATE", name="Afriophthalmics", organization_type="clinic"

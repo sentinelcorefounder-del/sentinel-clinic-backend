@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from finance.models import EncounterFinancialRecord, EncounterSponsorship
+from finance.models import EncounterFinancialRecord, EncounterSponsorship, OrganizationWallet, WalletLedgerEntry
 from finance.services import top_up_wallet
 from payments.models import PaymentTransaction
 
@@ -102,6 +102,34 @@ def post_verified_payment(payment, verify_payload):
             "outstanding_amount", "status", "financially_releasable",
             "secured_at", "captured_at", "exception_reason", "updated_at",
         ])
+        if record.collecting_organization_id:
+            collector_wallet = OrganizationWallet.objects.select_for_update().filter(
+                organization_id=record.collecting_organization_id,
+                currency=record.currency,
+                is_active=True,
+            ).first()
+            if collector_wallet is None:
+                raise ValidationError(
+                    "The collecting organisation has no active wallet for this patient payment."
+                )
+            WalletLedgerEntry.objects.get_or_create(
+                idempotency_key=f"paystack:{payment.reference}:patient-receipt",
+                defaults={
+                    "wallet": collector_wallet,
+                    "entry_type": WalletLedgerEntry.EntryType.PATIENT_RECEIPT,
+                    "available_delta": received_amount,
+                    "reserved_delta": Decimal("0.00"),
+                    "currency": collector_wallet.currency,
+                    "financial_record": record,
+                    "reference": payment.reference,
+                    "description": "Patient payment received for assessment",
+                    "metadata": {
+                        "payment_transaction_id": payment.id,
+                        "provider": "paystack",
+                        "collector_organization_id": record.collecting_organization_id,
+                    },
+                },
+            )
         from finance.models import FinancialAuditLog
         FinancialAuditLog.objects.create(
             financial_record=record,

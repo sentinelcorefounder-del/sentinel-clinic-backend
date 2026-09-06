@@ -123,7 +123,7 @@ class FinanceEngineTests(TestCase):
         pathway, payer, collector, method = infer_financial_identity(self.encounter)
         self.assertEqual(pathway, EncounterFinancialRecord.ServicePathway.HOSPITAL_REFERRED)
         self.assertEqual(payer, EncounterFinancialRecord.PayerType.PATIENT)
-        self.assertEqual(collector, EncounterFinancialRecord.CollectorType.SENTINEL)
+        self.assertEqual(collector, EncounterFinancialRecord.CollectorType.HOSPITAL)
         self.assertEqual(method, EncounterFinancialRecord.PaymentMethod.PAYSTACK)
 
     def test_dynamic_hospital_and_testing_clinic_beneficiaries_are_frozen(self):

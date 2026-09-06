@@ -1543,7 +1543,7 @@ class OpsCreateUserView(OpsOnlyMixin, APIView):
         clinic_group, _ = Group.objects.get_or_create(name="clinic_admin")
         user.groups.add(clinic_group)
 
-        sentinel_clinic = Organization.objects.filter(clinic_id="SNT-CLINIC").first()
+        sentinel_clinic = Organization.objects.filter(is_sentinel_treasury=True, organization_type="sentinel").first()
 
         if sentinel_clinic:
             from users.models import UserOrganization

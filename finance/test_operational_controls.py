@@ -37,7 +37,8 @@ class OperationalFinanceControlsTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.sentinel_clinic = Organization.objects.create(
-            clinic_id="SNT-CLINIC", name="Project Sentinel", organization_type="clinic"
+            clinic_id="SNT-TREASURY", name="Project Sentinel Treasury",
+            organization_type="sentinel", is_sentinel_treasury=True,
         )
         self.sentinel_wallet = OrganizationWallet.objects.create(organization=self.sentinel_clinic)
         self.clinic = Organization.objects.create(
@@ -78,7 +79,7 @@ class OperationalFinanceControlsTests(TestCase):
     def _evidence(self, name="evidence.pdf"):
         return SimpleUploadedFile(name, b"synthetic evidence", content_type="application/pdf")
 
-    def test_existing_clinical_project_sentinel_wallet_is_authoritative_without_duplication(self):
+    def test_explicit_project_sentinel_treasury_wallet_is_authoritative_without_duplication(self):
         self._fund()
         wallets = list(eligible_sentinel_treasury_wallets())
         self.assertEqual([wallet.pk for wallet in wallets], [self.sentinel_wallet.pk])

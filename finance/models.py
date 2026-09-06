@@ -9,17 +9,43 @@ from django.db.models import Q
 
 
 
-SENTINEL_TREASURY_CLINICAL_ORG_CODES = {"SNT-CLINIC"}
+class FinanceServiceCode(models.TextChoices):
+    DIABETIC_RETINAL_ASSESSMENT = "diabetic_retinal_assessment", "Diabetic retinal assessment"
+    COMBINED_DIABETIC_EYE_HEALTH = "combined_diabetic_eye_health", "Combined diabetic eye health assessment"
+    EYE_HEALTH_SCREENING = "eye_health_screening", "Eye health assessment"
+    OCULAR_ASSESSMENT = "ocular_assessment", "Comprehensive ocular assessment"
+    OCULAR_AI_REVIEW = "ocular_ai_review", "Ocular AI clinical review"
+
+
+FINANCE_SERVICE_ALIASES = {
+    "retinal_assessment": FinanceServiceCode.DIABETIC_RETINAL_ASSESSMENT,
+    "diabetic_eye_screening": FinanceServiceCode.DIABETIC_RETINAL_ASSESSMENT,
+    "combined_assessment": FinanceServiceCode.COMBINED_DIABETIC_EYE_HEALTH,
+}
+
+
+def canonical_finance_service_code(encounter):
+    package = str(getattr(encounter, "service_package", "") or "").strip()
+    if package in FinanceServiceCode.values:
+        return package
+    programme = str(getattr(encounter, "programme", "") or "").strip()
+    encounter_type = str(getattr(encounter, "encounter_type", "") or "").strip()
+    if programme == "ocular_diagnostics" or encounter_type == "ocular_assessment":
+        return FinanceServiceCode.OCULAR_ASSESSMENT
+    if programme == "eye_health_screening" or encounter_type == "eye_health_screening":
+        return FinanceServiceCode.EYE_HEALTH_SCREENING
+    if programme == "combined_assessment" or encounter_type == "combined_assessment":
+        return FinanceServiceCode.COMBINED_DIABETIC_EYE_HEALTH
+    if programme == "diabetic_screening" or encounter_type in {"retinal_assessment", "diabetic_eye_screening"}:
+        return FinanceServiceCode.DIABETIC_RETINAL_ASSESSMENT
+    return package or FINANCE_SERVICE_ALIASES.get(encounter_type, encounter_type)
 
 
 def is_sentinel_treasury_organization(organization):
     return bool(
         organization
         and organization.is_active
-        and (
-            organization.organization_type == "sentinel"
-            or organization.clinic_id in SENTINEL_TREASURY_CLINICAL_ORG_CODES
-        )
+        and getattr(organization, "is_sentinel_treasury", False)
     )
 
 
@@ -417,6 +443,87 @@ class EncounterAllocation(TimeStampedModel):
         ]
 
 
+class EncounterChargeComponent(TimeStampedModel):
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        CAPTURED = "captured", "Captured"
+        CANCELLED = "cancelled", "Cancelled"
+        REFUNDED = "refunded", "Refunded"
+
+    financial_record = models.ForeignKey(
+        EncounterFinancialRecord, on_delete=models.CASCADE, related_name="charge_components"
+    )
+    service_code = models.CharField(max_length=80, choices=FinanceServiceCode.choices)
+    description = models.CharField(max_length=180)
+    quantity = models.PositiveIntegerField(default=1)
+    unit_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    gross_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3, default="NGN")
+    pricing_rule = models.ForeignKey(
+        PricingRule, on_delete=models.PROTECT, null=True, blank=True, related_name="charge_components"
+    )
+    pricing_snapshot = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    idempotency_key = models.CharField(max_length=160, unique=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.CheckConstraint(condition=Q(quantity__gt=0), name="fin_charge_component_quantity_gt_zero"),
+            models.CheckConstraint(condition=Q(unit_amount__gte=0), name="fin_charge_component_unit_nonnegative"),
+            models.CheckConstraint(condition=Q(gross_amount__gte=0), name="fin_charge_component_gross_nonnegative"),
+        ]
+
+    def clean(self):
+        expected = (Decimal(self.quantity) * self.unit_amount).quantize(Decimal("0.01"))
+        if self.gross_amount != expected:
+            raise ValidationError({"gross_amount": "Gross amount must equal quantity × unit amount."})
+        if self.financial_record_id and self.currency != self.financial_record.currency:
+            raise ValidationError({"currency": "Charge currency must match the financial record."})
+
+
+class HistoricalAssessmentFinance(TimeStampedModel):
+    class PaymentState(models.TextChoices):
+        PAID = "historical_paid", "Already paid historically"
+        UNPAID = "historical_unpaid", "Still unpaid"
+        UNKNOWN = "historical_unknown", "Payment status unknown"
+
+    encounter = models.OneToOneField(
+        "encounters.ScreeningEncounter", on_delete=models.PROTECT, related_name="historical_finance"
+    )
+    service_code = models.CharField(max_length=80, choices=FinanceServiceCode.choices)
+    assessment_date = models.DateField()
+    payment_state = models.CharField(max_length=30, choices=PaymentState.choices)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    amount_paid = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    currency = models.CharField(max_length=3, default="NGN")
+    collecting_organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="historical_collections",
+    )
+    payment_method = models.CharField(max_length=40, blank=True, default="")
+    payment_reference = models.CharField(max_length=120, blank=True, default="")
+    source_note = models.TextField()
+    idempotency_key = models.CharField(max_length=160, unique=True)
+    imported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="imported_historical_finance"
+    )
+
+    class Meta:
+        ordering = ["-assessment_date", "-id"]
+
+    def clean(self):
+        if self.amount < 0 or self.amount_paid < 0:
+            raise ValidationError("Historical amounts cannot be negative.")
+        if self.amount_paid > self.amount:
+            raise ValidationError({"amount_paid": "Paid amount cannot exceed the historical charge."})
+        if self.payment_state == self.PaymentState.PAID and self.amount_paid <= 0:
+            raise ValidationError({"amount_paid": "A historically paid assessment requires the amount actually paid."})
+        if self.payment_state == self.PaymentState.UNPAID and self.amount_paid != 0:
+            raise ValidationError({"amount_paid": "An unpaid historical assessment cannot contain a paid amount."})
+
+
+
 class FinancialAuditLog(models.Model):
     financial_record = models.ForeignKey(
         EncounterFinancialRecord,
@@ -655,6 +762,8 @@ class WalletLedgerEntry(models.Model):
         SETTLEMENT = "settlement", "Settlement"
         TRANSFER = "transfer", "Transfer"
         WRITE_OFF = "write_off", "Write off"
+        OPENING_BALANCE = "opening_balance", "Opening balance"
+        PATIENT_RECEIPT = "patient_receipt", "Patient receipt"
 
     wallet = models.ForeignKey(
         OrganizationWallet,
