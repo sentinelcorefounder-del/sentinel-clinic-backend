@@ -585,7 +585,12 @@ class ImageUploadDetailView(generics.RetrieveUpdateDestroyAPIView):
         else:
             upload = serializer.save(patient=encounter.patient)
 
-        latest_report = encounter.reports.order_by("-created_at").first()
+        latest_report = (
+                    encounter.patient.reports
+                    .filter(encounter=encounter)
+                    .order_by("-created_at")
+                    .first()
+                )
         if latest_report:
             from .dataset_pipeline import sync_dataset_from_report
             sync_dataset_from_report(latest_report)

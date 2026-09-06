@@ -9,6 +9,7 @@ CLINIC_ASSET_ROLES = {
     "optometrist",
     "ophthalmologist",
     "reviewer",
+    "clinic_owner_optometrist",
 }
 HOSPITAL_ASSET_ROLES = {"hospital_admin"}
 
@@ -34,13 +35,14 @@ def can_access_clinical_asset(user, *, encounter, organization, branch):
     report = getattr(referral, "report", None) if referral else None
 
     internal_access = has_internal_ops_authority(user)
+    performing_clinic = getattr(getattr(encounter, "patient", None), "assigned_clinic", None)
     clinic_access = bool(
         not user.is_superuser
         and roles & CLINIC_ASSET_ROLES
         and linked
-        and organization
-        and linked.organization_id == organization.id
-        and _has_clinic_branch_access(user, organization, branch)
+        and performing_clinic
+        and linked.organization_id == performing_clinic.id
+        and _has_clinic_branch_access(user, performing_clinic, branch)
     )
     hospital_access = bool(
         not user.is_superuser

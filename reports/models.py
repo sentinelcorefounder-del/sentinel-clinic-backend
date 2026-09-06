@@ -576,6 +576,86 @@ class EyeHealthScreeningReportVersion(models.Model):
         raise ValidationError("Targeted screening report versions cannot be deleted.")
 
 
+
+class DiabeticRecall(models.Model):
+    STATUS_CHOICES = [
+        ("scheduled", "Scheduled"),
+        ("contacted", "Contacted"),
+        ("booked", "Booked"),
+        ("completed", "Completed"),
+        ("deferred", "Deferred"),
+    ]
+    SOURCE_CHOICES = [
+        ("encounter", "Encounter"),
+        ("structured_report", "Structured report"),
+        ("historical_report", "Historical report"),
+    ]
+
+    patient = models.ForeignKey(
+        Patient, on_delete=models.CASCADE, related_name="diabetic_recalls"
+    )
+    encounter = models.OneToOneField(
+        ScreeningEncounter, on_delete=models.CASCADE, related_name="diabetic_recall"
+    )
+    organization = models.ForeignKey(
+        "organizations.Organization", on_delete=models.PROTECT, related_name="diabetic_recalls"
+    )
+    historical_report = models.ForeignKey(
+        "HistoricalReportDocument", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="diabetic_recalls",
+    )
+    recall_months = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(24)]
+    )
+    base_date = models.DateField()
+    due_date = models.DateField(db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="scheduled", db_index=True)
+    note = models.TextField(blank=True, default="")
+    source_type = models.CharField(max_length=30, choices=SOURCE_CHOICES, default="encounter")
+    contacted_at = models.DateTimeField(null=True, blank=True)
+    booked_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    deferred_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="created_diabetic_recalls",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="updated_diabetic_recalls",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["due_date", "id"]
+        indexes = [
+            models.Index(fields=["organization", "status", "due_date"], name="rpt_diabrec_org_status_due"),
+            models.Index(fields=["patient", "due_date"], name="rpt_diabrec_patient_due"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.encounter_id and self.patient_id and self.encounter.patient_id != self.patient_id:
+            errors["patient"] = "Recall patient must match the encounter patient."
+        if self.encounter_id and not self.encounter.is_diabetic:
+            errors["encounter"] = "Diabetic recall requires an encounter marked diabetic."
+        if self.encounter_id and self.organization_id:
+            clinic_id = self.encounter.patient.assigned_clinic_id
+            if clinic_id != self.organization_id:
+                errors["organization"] = "Recall organisation must match the patient's clinic."
+        if self.historical_report_id and self.historical_report.encounter_id != self.encounter_id:
+            errors["historical_report"] = "Historical report must belong to the recall encounter."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Diabetic recall - {self.patient} - {self.due_date}"
+
 def generate_historical_report_id():
     return f"HIST-RPT-{uuid.uuid4().hex.upper()[:20]}"
 

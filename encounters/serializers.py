@@ -214,6 +214,7 @@ class ScreeningEncounterSerializer(serializers.ModelSerializer):
             "right_va_method",
 
             # technician/clinical intake
+            "is_diabetic",
             "diabetes_duration",
             "symptoms_notes",
             "clinical_notes",

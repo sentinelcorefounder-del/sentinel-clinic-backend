@@ -6,6 +6,7 @@ ALLOWED_PATIENT_WRITE_ROLES = {
     "super_admin",
     "clinic_admin",
     "clinic_screener",
+    "clinic_owner_optometrist",
 }
 
 

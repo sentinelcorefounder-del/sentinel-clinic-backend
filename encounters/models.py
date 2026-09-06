@@ -252,6 +252,7 @@ class ScreeningEncounter(models.Model):
         max_length=20, choices=VA_METHOD_CHOICES, blank=True, default=""
     )
 
+    is_diabetic = models.BooleanField(default=False, db_index=True)
     diabetes_duration = models.CharField(max_length=50, blank=True)
     symptoms_notes = models.TextField(blank=True)
     clinical_notes = models.TextField(blank=True)

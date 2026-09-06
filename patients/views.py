@@ -81,6 +81,7 @@ class PatientListCreateView(generics.ListCreateAPIView):
         hospital_id = (
             self.request.query_params.get("hospital_id") or ""
         ).strip()
+        diabetic = (self.request.query_params.get("diabetic") or "all").strip().lower()
 
         if search:
             queryset = queryset.filter(
@@ -112,6 +113,11 @@ class PatientListCreateView(generics.ListCreateAPIView):
                 hospital_referrals__matched_clinic=org,
                 hospital_referrals__source_hospital_id=hospital_id,
             )
+
+        if diabetic == "yes":
+            queryset = queryset.filter(encounters__is_diabetic=True)
+        elif diabetic == "no":
+            queryset = queryset.exclude(encounters__is_diabetic=True)
 
         return queryset.distinct().order_by("-created_at")
 

@@ -1,4 +1,4 @@
-CLINICAL_AUTHOR_ROLES = ("optometrist", "reviewer")
+CLINICAL_AUTHOR_ROLES = ("optometrist", "reviewer", "clinic_owner_optometrist")
 
 
 def exact_clinical_authority(user):

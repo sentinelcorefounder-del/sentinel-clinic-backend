@@ -53,7 +53,7 @@ def _service_partner_report_complete(encounter):
 @transaction.atomic
 def recognize_service_partner_earning(financial_record, trigger_source="financial_capture"):
     """Converge payment and report completion into one immutable partner earning."""
-    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+    record = EncounterFinancialRecord.objects.select_for_update(of=("self",)).select_related(
         "encounter", "encounter__service_session",
     ).get(pk=financial_record.pk)
     encounter = record.encounter

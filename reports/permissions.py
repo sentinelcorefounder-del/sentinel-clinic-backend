@@ -1,7 +1,7 @@
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
-CLINICAL_REPORT_ROLES = {"optometrist", "reviewer"}
+CLINICAL_REPORT_ROLES = {"optometrist", "reviewer", "clinic_owner_optometrist"}
 OPS_REVIEW_ROLES = {"ops_admin", "sentinel_ops"}
 
 
@@ -51,7 +51,7 @@ class CanReviewOpsReports(BasePermission):
 class CanUploadHistoricalReports(BasePermission):
     """Historical document ingestion is clinical/admin work, not a superuser shortcut."""
 
-    ALLOWED_CLINIC_ROLES = {"optometrist", "reviewer", "clinic_admin"}
+    ALLOWED_CLINIC_ROLES = {"optometrist", "reviewer", "clinic_admin", "clinic_owner_optometrist"}
 
     def has_permission(self, request, view):
         user = request.user

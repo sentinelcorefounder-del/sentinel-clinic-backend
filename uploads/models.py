@@ -88,8 +88,10 @@ class ImageUpload(models.Model):
         # refresh dataset labels. Consent rules are still enforced by the pipeline.
         try:
             from uploads.dataset_pipeline import sync_dataset_from_report
-            ready_reports = self.encounter.reports.filter(
-                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"]
+
+            ready_reports = self.encounter.patient.reports.filter(
+                encounter=self.encounter,
+                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"],
             )
             for report in ready_reports:
                 sync_dataset_from_report(report)
@@ -436,16 +438,20 @@ class AIAnalysis(models.Model):
         # Re-sync ready reports so DatasetLabel gets AI fields updated.
         try:
             from uploads.dataset_pipeline import sync_dataset_from_report
-            ready_reports = self.encounter.reports.filter(
-                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"]
+
+            ready_reports = self.encounter.patient.reports.filter(
+                encounter=self.encounter,
+                report_status__in=["signed_off", "submitted_to_ops", "ops_approved", "issued"],
             )
+
             for report in ready_reports:
                 sync_dataset_from_report(report)
+
         except Exception as exc:
             print("AIAnalysis dataset refresh failed:", exc)
 
-    def __str__(self):
-        return f"{self.analysis_id} - {self.provider}"
+        def __str__(self):
+            return f"{self.analysis_id} - {self.provider}"
 
 
 class DatasetLabel(models.Model):

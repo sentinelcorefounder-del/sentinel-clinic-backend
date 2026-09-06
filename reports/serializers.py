@@ -121,6 +121,7 @@ class ReportStatusEventSerializer(serializers.ModelSerializer):
 
 
 class StructuredReportSerializer(serializers.ModelSerializer):
+    report_type = serializers.SerializerMethodField()
     expected_version = serializers.IntegerField(write_only=True, required=False)
     patient_name = serializers.SerializerMethodField()
     sentinel_patient_id = serializers.SerializerMethodField()
@@ -147,6 +148,7 @@ class StructuredReportSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "report_id",
+            "report_type",
             "encounter",
             "patient",
             "patient_id",
@@ -279,6 +281,9 @@ class StructuredReportSerializer(serializers.ModelSerializer):
             "takeover_reason": responsibility.takeover_reason,
         }
 
+
+    def get_report_type(self, obj):
+        return "structured"
 
     def get_patient_name(self, obj):
         patient = obj.patient

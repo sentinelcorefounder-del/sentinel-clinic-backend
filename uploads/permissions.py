@@ -1,7 +1,7 @@
 from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
-ALLOWED_UPLOAD_WRITE_ROLES = {"clinic_screener", "clinic_admin", "super_admin"}
+ALLOWED_UPLOAD_WRITE_ROLES = {"clinic_screener", "clinic_admin", "clinic_owner_optometrist", "super_admin"}
 
 
 class CanManageUploads(BasePermission):

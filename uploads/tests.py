@@ -164,3 +164,18 @@ class PrivateNormalUploadTests(TestCase):
         )
 
 # Create your tests here.
+
+
+class SplitClinicAssetAccessRegressionTests(TestCase):
+    def test_clinic_user_can_access_asset_with_stale_treasury_asset_organization(self):
+        from uploads.access import can_access_clinical_asset
+        treasury = Organization.objects.create(clinic_id="SNT-TREASURY-T", name="Treasury", organization_type="sentinel")
+        clinic = Organization.objects.create(clinic_id="SNT-CLINIC-T", name="Clinic", organization_type="clinic")
+        branch = OrganizationBranch.objects.create(organization=clinic, branch_code="MAIN", name="Main")
+        patient = Patient.objects.create(patient_id="ASSET-SPLIT-P", first_name="A", last_name="Patient", date_of_birth=date(1980,1,1), sex="female", assigned_clinic=clinic, assigned_branch=branch)
+        encounter = ScreeningEncounter.objects.create(encounter_id="ASSET-SPLIT-E", patient=patient, encounter_date=date(2026,8,28), originating_organization=treasury, service_branch=branch, programme="ocular_diagnostics", service_package="comprehensive_ocular_assessment")
+        user = User.objects.create_user("asset-split-admin")
+        user.groups.add(Group.objects.get_or_create(name="clinic_admin")[0])
+        UserOrganization.objects.create(user=user, organization=clinic)
+        UserBranchAccess.objects.create(user=user, branch=branch, has_all_branch_access=True)
+        self.assertTrue(can_access_clinical_asset(user, encounter=encounter, organization=treasury, branch=branch))

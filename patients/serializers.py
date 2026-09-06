@@ -19,6 +19,9 @@ class PatientSerializer(serializers.ModelSerializer):
         source="master_patient.sentinel_patient_id",
         read_only=True,
     )
+    is_diabetic = serializers.SerializerMethodField()
+    next_diabetic_recall_due_date = serializers.SerializerMethodField()
+    diabetic_recall_status = serializers.SerializerMethodField()
     master_patient_id = serializers.IntegerField(
         source="master_patient.id",
         read_only=True,
@@ -34,10 +37,31 @@ class PatientSerializer(serializers.ModelSerializer):
             "referring_hospital_id", "referring_hospital_name",
             "referral_id_display", "referring_hospitals",
             "sentinel_patient_id", "master_patient_id",
+            "is_diabetic", "next_diabetic_recall_due_date", "diabetic_recall_status",
             "assigned_branch",
             "created_at", "updated_at",
         ]
         read_only_fields = ["assigned_branch"]
+
+    def _latest_recall(self, obj):
+        prefetched = getattr(obj, "active_diabetic_recalls", None)
+        if prefetched is not None:
+            return sorted(prefetched, key=lambda item: item.due_date)[0] if prefetched else None
+        return obj.diabetic_recalls.exclude(status="completed").order_by("due_date").first()
+
+    def get_is_diabetic(self, obj):
+        return obj.encounters.filter(is_diabetic=True).exists()
+
+    def get_next_diabetic_recall_due_date(self, obj):
+        recall = self._latest_recall(obj)
+        return recall.due_date if recall else None
+
+    def get_diabetic_recall_status(self, obj):
+        recall = self._latest_recall(obj)
+        if not recall:
+            return ""
+        from reports.recall_services import calculate_diabetic_recall_live_status
+        return calculate_diabetic_recall_live_status(recall)
 
     def _clinic_referrals(self, obj):
         prefetched = getattr(obj, "clinic_source_referrals", None)

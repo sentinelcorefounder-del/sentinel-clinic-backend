@@ -52,6 +52,7 @@ from .serializers import (
 
 CLOSED_REFERRAL_STATUSES = {"completed", "cancelled"}
 CLINICAL_INTAKE_FIELDS = frozenset({
+    "is_diabetic",
     "diabetes_duration",
     "symptoms_notes",
     "clinical_notes",
@@ -150,7 +151,7 @@ def user_can_override_source(user):
     if user.is_superuser:
         return True
     roles = set(user.groups.values_list("name", flat=True))
-    return bool({"clinic_admin", "reviewer", "optometrist"} & roles)
+    return bool({"clinic_admin", "reviewer", "optometrist", "clinic_owner_optometrist"} & roles)
 
 
 class PatientActiveReferralListView(APIView):

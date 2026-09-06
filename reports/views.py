@@ -18,6 +18,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from audit.services import record_patient_event
 from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
@@ -137,6 +138,18 @@ class EncounterHistoricalReportListCreateView(HistoricalReportAccessMixin, APIVi
         try:
             item.full_clean()
             item.save()
+            record_patient_event(
+                patient=item.patient,
+                event_key=f"historical-report:{item.pk}:uploaded",
+                category="report", event_type="historical_report_uploaded",
+                title="Historical uploaded report",
+                description=f"Historical report dated {item.report_date} was uploaded for {item.encounter.encounter_id}.",
+                source_type="historical_report", source_id=item.pk,
+                encounter_id=item.encounter.encounter_id, report_id=item.historical_report_id,
+                actor=request.user, organization=item.patient.assigned_clinic, visibility="clinic_ops",
+                metadata={"original_filename": item.original_filename, "source_organization_name": item.source_organization_name},
+                occurred_at=item.created_at,
+            )
 
             create_finance = str(request.data.get("create_finance_record", "")).lower() in {"1", "true", "yes", "on"}
             if create_finance and not hasattr(encounter, "historical_finance"):
@@ -556,44 +569,63 @@ class StructuredReportDetailView(
         return Response(self.get_serializer(report).data)
 
 
-class ClinicReportListView(generics.ListAPIView):
-    serializer_class = StructuredReportSerializer
+class ClinicReportListView(APIView):
     permission_classes = [CanManageReports]
 
-    def get_queryset(self):
-        queryset = StructuredReport.objects.select_related(
-            "patient",
-            "patient__assigned_clinic",
-            "encounter",
-            "submitted_to_ops_by",
-            "ops_reviewed_by",
+    def get(self, request):
+        structured = StructuredReport.objects.select_related(
+            "patient", "patient__assigned_clinic", "encounter",
+            "submitted_to_ops_by", "ops_reviewed_by",
         ).prefetch_related("status_events").all()
+        historical = HistoricalReportDocument.objects.select_related(
+            "patient", "patient__assigned_clinic", "encounter",
+            "hospital_referral__source_hospital", "uploaded_by",
+        ).all()
 
-        user = self.request.user
+        user = request.user
         if not user.is_superuser:
             user_groups = set(user.groups.values_list("name", flat=True))
             if "ops_admin" not in user_groups:
                 org = get_user_organization(user)
                 if not org:
-                    return StructuredReport.objects.none()
-                queryset = queryset.filter(patient__assigned_clinic=org)
+                    return Response([])
+                structured = structured.filter(patient__assigned_clinic=org)
+                historical = historical.filter(patient__assigned_clinic=org)
 
-        report_status = (self.request.query_params.get("status") or "").strip()
-        if report_status and report_status != "all":
-            queryset = queryset.filter(report_status=report_status)
+        status_filter = (request.query_params.get("status") or "").strip()
+        if status_filter and status_filter != "all":
+            if status_filter == "historical":
+                structured = structured.none()
+            else:
+                structured = structured.filter(report_status=status_filter)
+                historical = historical.none()
 
-        search = (self.request.query_params.get("search") or "").strip()
+        search = (request.query_params.get("search") or "").strip()
         if search:
             from django.db import models as db_models
-            queryset = queryset.filter(
-                db_models.Q(report_id__icontains=search)
-                | db_models.Q(patient__patient_id__icontains=search)
-                | db_models.Q(patient__first_name__icontains=search)
-                | db_models.Q(patient__last_name__icontains=search)
-                | db_models.Q(encounter__encounter_id__icontains=search)
-            )
+            sq = (db_models.Q(report_id__icontains=search) | db_models.Q(patient__patient_id__icontains=search) |
+                  db_models.Q(patient__first_name__icontains=search) | db_models.Q(patient__last_name__icontains=search) |
+                  db_models.Q(encounter__encounter_id__icontains=search))
+            hq = (db_models.Q(historical_report_id__icontains=search) | db_models.Q(patient__patient_id__icontains=search) |
+                  db_models.Q(patient__first_name__icontains=search) | db_models.Q(patient__last_name__icontains=search) |
+                  db_models.Q(encounter__encounter_id__icontains=search) | db_models.Q(original_filename__icontains=search))
+            structured = structured.filter(sq)
+            historical = historical.filter(hq)
 
-        return queryset.order_by("-updated_at")
+        data = list(StructuredReportSerializer(structured, many=True, context={"request": request}).data)
+        for item in HistoricalReportDocumentSerializer(historical, many=True, context={"request": request}).data:
+            item = dict(item)
+            item.update({
+                "report_id": item.get("historical_report_id"),
+                "report_status": "historical",
+                "return_reason": "",
+                "ops_review_note": "",
+                "sentinel_patient_id": None,
+                "patient_id": item.get("patient_reference"),
+            })
+            data.append(item)
+        data.sort(key=lambda row: str(row.get("updated_at") or row.get("report_date") or ""), reverse=True)
+        return Response(data)
 
 
 class EncounterReportListView(generics.ListAPIView):

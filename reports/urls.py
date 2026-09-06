@@ -6,6 +6,7 @@ from .delivery_views import (
 from .recall_views import (
     RecallActionView,
     RecallQueueView,
+    EncounterRecallView,
 )
 from .views import (
     StructuredReportListCreateView,
@@ -46,6 +47,7 @@ urlpatterns = [
         RecallQueueView.as_view(),
         name="recall-queue",
     ),
+    path("recalls/encounter/<int:encounter_id>/", EncounterRecallView.as_view(), name="encounter-diabetic-recall"),
     path(
         "recalls/<int:pk>/action/",
         RecallActionView.as_view(),
