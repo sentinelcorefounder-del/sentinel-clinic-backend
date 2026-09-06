@@ -212,6 +212,12 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
             "created_by", "activated_by", "completed_by", "cancelled_by",
         ).annotate(linked_encounter_count=Count("encounters"))
 
+    def get_lock_queryset(self):
+        return AssessmentServiceSession.objects.select_related(
+            "participating_organization", "service_branch", "service_partner",
+            "created_by", "activated_by", "completed_by", "cancelled_by",
+        )
+
     def perform_create(self, serializer):
         with transaction.atomic():
             try:
@@ -227,7 +233,7 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         with transaction.atomic():
             session = get_object_or_404(
-                self.get_queryset().select_for_update(of=("self",)), pk=serializer.instance.pk
+                self.get_lock_queryset().select_for_update(of=("self",)), pk=serializer.instance.pk
             )
             self.check_object_permissions(self.request, session)
             if session.status != AssessmentServiceSession.Status.DRAFT:
@@ -242,6 +248,8 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
             before = {"session_reference": session.session_reference, "configuration_version": session.configuration_version}
             try:
                 session = serializer.save(configuration_version=session.configuration_version + 1)
+                session.linked_encounter_count = session.encounters.count()
+                serializer.instance = session
             except DjangoValidationError as exc:
                 raise DRFValidationError(getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or "Session terms are invalid.") from exc
             _audit_internal(
@@ -254,7 +262,7 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
         with transaction.atomic():
-            session = get_object_or_404(self.get_queryset().select_for_update(of=("self",)), pk=pk)
+            session = get_object_or_404(self.get_lock_queryset().select_for_update(of=("self",)), pk=pk)
             self.check_object_permissions(request, session)
             if session.status == AssessmentServiceSession.Status.ACTIVE:
                 return Response(self.get_serializer(session).data)
@@ -275,7 +283,7 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         with transaction.atomic():
-            session = get_object_or_404(self.get_queryset().select_for_update(of=("self",)), pk=pk)
+            session = get_object_or_404(self.get_lock_queryset().select_for_update(of=("self",)), pk=pk)
             self.check_object_permissions(request, session)
             if session.status != AssessmentServiceSession.Status.ACTIVE:
                 return Response({"detail": "Only an active session can be completed."}, status=status.HTTP_409_CONFLICT)
@@ -297,7 +305,7 @@ class AssessmentServiceSessionViewSet(viewsets.ModelViewSet):
         if not reason:
             return Response({"reason": ["A cancellation reason is required."]}, status=status.HTTP_400_BAD_REQUEST)
         with transaction.atomic():
-            session = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            session = get_object_or_404(self.get_lock_queryset().select_for_update(of=("self",)), pk=pk)
             self.check_object_permissions(request, session)
             if session.status not in {AssessmentServiceSession.Status.DRAFT, AssessmentServiceSession.Status.ACTIVE}:
                 return Response({"detail": "Only a draft or active session can be cancelled."}, status=status.HTTP_409_CONFLICT)

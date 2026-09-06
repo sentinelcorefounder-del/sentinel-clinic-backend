@@ -402,6 +402,16 @@ class InternalFinanceFoundationTests(TestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def test_service_session_lock_queryset_has_no_aggregate_annotations(self):
+        from finance.views import AssessmentServiceSessionViewSet
+
+        view = AssessmentServiceSessionViewSet()
+        read_queryset = view.get_queryset()
+        lock_queryset = view.get_lock_queryset()
+
+        self.assertIn("linked_encounter_count", read_queryset.query.annotations)
+        self.assertEqual(lock_queryset.query.annotations, {})
+
     def test_session_api_denies_operator_approver_and_clinical_users(self):
         url = "/api/finance/internal/service-sessions/"
         finance_users = []
