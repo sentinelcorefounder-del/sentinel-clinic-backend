@@ -546,7 +546,7 @@ def create_finance_action_request(
 def approve_finance_action_request(action_request, *, decided_by):
     from .models import FinanceActionRequest, FinanceControlAudit, OrganizationWallet, WalletLedgerEntry
 
-    request = FinanceActionRequest.objects.select_for_update().select_related(
+    request = FinanceActionRequest.objects.select_for_update(of=("self",)).select_related(
         "wallet", "financial_record", "related_entry"
     ).get(pk=action_request.pk)
     if request.status == FinanceActionRequest.Status.APPROVED:
