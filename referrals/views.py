@@ -13,7 +13,7 @@ from organizations.models import Organization
 from organizations.services.branches import get_user_default_branch
 from patients.models import Patient
 from patients.identity_services import ensure_master_identity
-from reports.models import StructuredReport, ReportStatusEvent
+from reports.models import HistoricalReportDocument, StructuredReport, ReportStatusEvent
 from reports.release_control import (
     hospital_released_referral_q,
     hospital_visible_referral_status,
@@ -128,6 +128,7 @@ class HospitalIssuedReportListView(APIView):
             data.append(
                 {
                     "id": report.id,
+                    "report_type": "structured",
                     "report_id": report.report_id,
                     "referral_id": referral.referral_id,
                     "referral_pk": referral.id,
@@ -143,6 +144,33 @@ class HospitalIssuedReportListView(APIView):
                 }
             )
 
+        historical = HistoricalReportDocument.objects.select_related(
+            "patient", "encounter__originating_organization", "hospital_referral__source_hospital"
+        ).filter(hospital_visible=True, hospital_referral__isnull=False)
+        if not request.user.is_superuser:
+            historical = historical.filter(hospital_referral__source_hospital=org)
+        if search:
+            historical = historical.filter(
+                Q(historical_report_id__icontains=search)
+                | Q(hospital_referral__referral_id__icontains=search)
+                | Q(patient__patient_id__icontains=search)
+                | Q(patient__first_name__icontains=search)
+                | Q(patient__last_name__icontains=search)
+            )
+        for item in historical:
+            referral = item.hospital_referral
+            data.append({
+                "id": item.id, "report_type": "historical",
+                "report_id": item.historical_report_id, "referral_id": referral.referral_id,
+                "referral_pk": referral.id, "patient_id": item.patient.patient_id,
+                "patient_name": f"{item.patient.first_name} {item.patient.last_name}".strip(),
+                "clinic_name": (item.encounter.originating_organization.name if item.encounter.originating_organization_id else ""),
+                "issued_at": item.report_date, "review_date": item.report_date,
+                "report_status": "historical_uploaded", "historical_title": item.title,
+                "source_organization_name": item.source_organization_name,
+                "document_url": request.build_absolute_uri(f"/api/reports/historical/{item.id}/content/"),
+            })
+        data.sort(key=lambda row: str(row.get("issued_at") or ""), reverse=True)
         return Response(data)
 
 
@@ -893,3 +921,32 @@ class MatchClinicView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class HospitalHistoricalReportDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsHospitalUser]
+
+    def get(self, request, pk):
+        org = get_user_organization(request.user)
+        qs = HistoricalReportDocument.objects.select_related(
+            "patient", "encounter__originating_organization", "hospital_referral__source_hospital"
+        ).filter(pk=pk, hospital_visible=True, hospital_referral__isnull=False)
+        if not request.user.is_superuser:
+            if not org:
+                raise PermissionDenied("You are not linked to a hospital organization.")
+            qs = qs.filter(hospital_referral__source_hospital=org)
+        item = qs.first()
+        if not item:
+            return Response({"detail": "Historical report not found."}, status=404)
+        referral = item.hospital_referral
+        return Response({
+            "id": item.id, "report_type": "historical", "report_id": item.historical_report_id,
+            "title": item.title, "report_date": item.report_date, "issued_at": item.report_date,
+            "referral_id": referral.referral_id, "referral_pk": referral.id,
+            "patient_id": item.patient.patient_id,
+            "patient_name": f"{item.patient.first_name} {item.patient.last_name}".strip(),
+            "clinic_name": (item.encounter.originating_organization.name if item.encounter.originating_organization_id else ""),
+            "source_organization_name": item.source_organization_name, "source_note": item.source_note,
+            "original_filename": item.original_filename,
+            "document_url": request.build_absolute_uri(f"/api/reports/historical/{item.id}/content/"),
+        })

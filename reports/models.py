@@ -1,7 +1,7 @@
 from django.db import models
 import uuid
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator
 from django.conf import settings
 from patients.models import Patient
 from encounters.models import ScreeningEncounter
@@ -574,3 +574,77 @@ class EyeHealthScreeningReportVersion(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("Targeted screening report versions cannot be deleted.")
+
+
+def generate_historical_report_id():
+    return f"HIST-RPT-{uuid.uuid4().hex.upper()[:20]}"
+
+
+def historical_report_upload_path(instance, filename):
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "pdf"
+    return f"reports/historical/{instance.encounter_id}/{uuid.uuid4().hex}.{suffix}"
+
+
+class HistoricalReportDocument(models.Model):
+    """Externally produced historical report preserved with its original provenance.
+
+    This is deliberately separate from StructuredReport: uploading an old PDF must never
+    make it look as though Sentinel clinically authored, issued or signed that report.
+    """
+
+    historical_report_id = models.CharField(
+        max_length=32, unique=True, default=generate_historical_report_id, editable=False
+    )
+    encounter = models.ForeignKey(
+        ScreeningEncounter, on_delete=models.PROTECT, related_name="historical_reports"
+    )
+    patient = models.ForeignKey(
+        Patient, on_delete=models.PROTECT, related_name="historical_report_documents"
+    )
+    hospital_referral = models.ForeignKey(
+        "referrals.HospitalReferral", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="historical_reports",
+    )
+    title = models.CharField(max_length=180, default="Historical uploaded report")
+    report_date = models.DateField()
+    source_organization_name = models.CharField(max_length=255, blank=True, default="")
+    source_note = models.TextField(blank=True, default="")
+    document = models.FileField(
+        upload_to=historical_report_upload_path,
+        validators=[FileExtensionValidator(allowed_extensions=["pdf"])],
+    )
+    original_filename = models.CharField(max_length=255, blank=True, default="")
+    hospital_visible = models.BooleanField(default=False)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="uploaded_historical_reports"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-report_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["encounter", "report_date"], name="rpt_hist_enc_date_idx"),
+            models.Index(fields=["hospital_referral", "hospital_visible"], name="rpt_hist_ref_vis_idx"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.encounter_id and self.patient_id and self.encounter.patient_id != self.patient_id:
+            errors["patient"] = "Historical report patient must match the encounter patient."
+        if self.hospital_referral_id:
+            if self.encounter_id and self.encounter.hospital_referral_id != self.hospital_referral_id:
+                errors["hospital_referral"] = "Historical report referral must be the encounter referral."
+            if self.patient_id and self.hospital_referral.patient_id and self.hospital_referral.patient_id != self.patient_id:
+                errors["hospital_referral"] = "Referral patient does not match the historical report patient."
+        if self.hospital_visible and not self.hospital_referral_id:
+            errors["hospital_visible"] = "Hospital visibility requires a hospital-referred encounter."
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.historical_report_id} - {self.encounter.encounter_id}"

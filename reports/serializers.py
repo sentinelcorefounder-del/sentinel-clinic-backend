@@ -6,6 +6,7 @@ from .models import (
     StructuredReportVersion,
     EyeHealthScreeningReport,
     EyeHealthScreeningReportVersion,
+    HistoricalReportDocument,
 )
 
 
@@ -453,3 +454,59 @@ class PatientReportDeliverySerializer(serializers.ModelSerializer):
             if user
             else ""
         )
+
+
+class HistoricalReportDocumentSerializer(serializers.ModelSerializer):
+    report_type = serializers.SerializerMethodField()
+    encounter_reference = serializers.CharField(source="encounter.encounter_id", read_only=True)
+    patient_reference = serializers.CharField(source="patient.patient_id", read_only=True)
+    patient_name = serializers.SerializerMethodField()
+    referral_id = serializers.CharField(source="hospital_referral.referral_id", read_only=True, allow_null=True)
+    referring_hospital_name = serializers.CharField(
+        source="hospital_referral.source_hospital.name", read_only=True, allow_null=True
+    )
+    uploaded_by_name = serializers.CharField(source="uploaded_by.username", read_only=True)
+    document_url = serializers.SerializerMethodField()
+    historical_finance = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HistoricalReportDocument
+        fields = [
+            "id", "historical_report_id", "report_type", "encounter", "encounter_reference",
+            "patient", "patient_reference", "patient_name", "hospital_referral", "referral_id",
+            "referring_hospital_name", "title", "report_date", "source_organization_name",
+            "source_note", "original_filename", "hospital_visible", "uploaded_by_name",
+            "document_url", "historical_finance", "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_report_type(self, obj):
+        return "historical"
+
+    def get_patient_name(self, obj):
+        return f"{obj.patient.first_name} {obj.patient.last_name}".strip()
+
+    def get_document_url(self, obj):
+        request = self.context.get("request")
+        path = f"/api/reports/historical/{obj.pk}/content/"
+        return request.build_absolute_uri(path) if request else path
+
+    def get_historical_finance(self, obj):
+        from finance.models import HistoricalAssessmentFinance
+        item = HistoricalAssessmentFinance.objects.select_related(
+            "collecting_organization"
+        ).filter(encounter_id=obj.encounter_id).first()
+        if not item:
+            return None
+        return {
+            "payment_state": item.payment_state,
+            "amount": str(item.amount),
+            "amount_paid": str(item.amount_paid),
+            "currency": item.currency,
+            "payment_method": item.payment_method,
+            "payment_reference": item.payment_reference,
+            "collecting_organization_id": item.collecting_organization_id,
+            "collecting_organization_name": (
+                item.collecting_organization.name if item.collecting_organization_id else ""
+            ),
+        }

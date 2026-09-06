@@ -2,7 +2,7 @@ from io import BytesIO
 import os
 import hashlib
 
-from django.http import Http404, HttpResponse
+from django.http import FileResponse, Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
@@ -22,7 +22,7 @@ from common.tenant import get_user_organization
 from organizations.models import OrganizationProfile
 from uploads.models import ImageUpload
 from .models import (
-    EyeHealthScreeningReport, ReportClinicalResponsibility,
+    EyeHealthScreeningReport, HistoricalReportDocument, ReportClinicalResponsibility,
     StructuredReport, ReportStatusEvent,
 )
 from .clinical_integrity import (
@@ -43,8 +43,11 @@ from .permissions import (
     CanManageReports,
     CanReviewOpsReports,
     CanSubmitReportToOps,
+    CanUploadHistoricalReports,
 )
-from .serializers import EyeHealthScreeningReportSerializer, StructuredReportSerializer
+from .serializers import (
+    EyeHealthScreeningReportSerializer, HistoricalReportDocumentSerializer, StructuredReportSerializer,
+)
 from .eye_health import (
     build_complete_pdf, finalize_screening_report, generate_suggested_wording,
     normalise_structured_findings, professional_snapshot, require_eye_health_authority,
@@ -57,6 +60,170 @@ from .referral_linking import (
 from .release_control import is_report_released_to_hospital
 from .distribution import audit_clean_pdf_access, structured_clean_pdf_ready, targeted_clean_pdf_ready
 from .permissions import has_internal_ops_authority
+
+
+
+class HistoricalReportAccessMixin:
+    def _can_read_encounter(self, user, encounter):
+        if user.is_superuser or has_internal_ops_authority(user):
+            return True
+        org = get_user_organization(user)
+        return bool(
+            org and (
+                encounter.originating_organization_id == org.id
+                or encounter.patient.assigned_clinic_id == org.id
+            )
+        )
+
+    def _encounter(self, request, encounter_id):
+        from encounters.models import ScreeningEncounter
+        encounter = get_object_or_404(
+            ScreeningEncounter.objects.select_related(
+                "patient__assigned_clinic", "originating_organization",
+                "hospital_referral__source_hospital",
+            ),
+            pk=encounter_id,
+        )
+        if not self._can_read_encounter(request.user, encounter):
+            raise PermissionDenied("You do not have access to this encounter.")
+        return encounter
+
+
+class EncounterHistoricalReportListCreateView(HistoricalReportAccessMixin, APIView):
+    permission_classes = [IsAuthenticated, CanUploadHistoricalReports]
+
+    def get(self, request, encounter_id):
+        encounter = self._encounter(request, encounter_id)
+        items = HistoricalReportDocument.objects.select_related(
+            "encounter__historical_finance__collecting_organization",
+            "patient", "hospital_referral__source_hospital", "uploaded_by",
+        ).filter(encounter=encounter)
+        return Response(HistoricalReportDocumentSerializer(items, many=True, context={"request": request}).data)
+
+    @transaction.atomic
+    def post(self, request, encounter_id):
+        encounter = self._encounter(request, encounter_id)
+        document = request.FILES.get("document")
+        if document is None:
+            return Response({"detail": "A PDF report is required."}, status=400)
+        if not str(document.name or "").lower().endswith(".pdf"):
+            return Response({"detail": "Historical reports must be uploaded as PDF files."}, status=400)
+        if getattr(document, "size", 0) > 20 * 1024 * 1024:
+            return Response({"detail": "Historical report PDF must not exceed 20 MB."}, status=400)
+        header = document.read(5)
+        document.seek(0)
+        if header != b"%PDF-":
+            return Response({"detail": "The uploaded file is not a valid PDF document."}, status=400)
+
+        report_date = request.data.get("report_date")
+        if not report_date:
+            return Response({"detail": "Historical report date is required."}, status=400)
+
+        requested_hospital_visibility = str(request.data.get("hospital_visible", "")).lower() in {"1", "true", "yes", "on"}
+        referral = encounter.hospital_referral
+        if requested_hospital_visibility and not referral:
+            return Response({"detail": "Hospital visibility is only available for a hospital-referred encounter."}, status=400)
+
+        item = HistoricalReportDocument(
+            encounter=encounter, patient=encounter.patient, hospital_referral=referral,
+            title=(request.data.get("title") or "Historical uploaded report").strip(),
+            report_date=report_date,
+            source_organization_name=(request.data.get("source_organization_name") or "").strip(),
+            source_note=(request.data.get("source_note") or "").strip(),
+            document=document, original_filename=str(document.name or "")[:255],
+            hospital_visible=bool(referral and requested_hospital_visibility),
+            uploaded_by=request.user,
+        )
+        try:
+            item.full_clean()
+            item.save()
+
+            create_finance = str(request.data.get("create_finance_record", "")).lower() in {"1", "true", "yes", "on"}
+            if create_finance and not hasattr(encounter, "historical_finance"):
+                from finance.models import FinanceServiceCode
+                from finance.services import record_historical_assessment_finance
+                from organizations.models import Organization
+
+                collector = None
+                collector_id = request.data.get("collecting_organization")
+                if collector_id not in (None, ""):
+                    collector = Organization.objects.get(pk=collector_id)
+                service_code = request.data.get("service_code") or getattr(encounter, "service_package", "")
+                if service_code not in FinanceServiceCode.values:
+                    from finance.models import canonical_finance_service_code
+                    service_code = canonical_finance_service_code(encounter)
+                record_historical_assessment_finance(
+                    encounter=encounter, service_code=service_code, assessment_date=report_date,
+                    payment_state=request.data.get("payment_state", "historical_unknown"),
+                    amount=request.data.get("amount", "0"), amount_paid=request.data.get("amount_paid", "0"),
+                    collecting_organization=collector, payment_method=request.data.get("payment_method", ""),
+                    payment_reference=request.data.get("payment_reference", ""),
+                    source_note=(request.data.get("finance_source_note") or request.data.get("source_note") or "Historical report upload").strip(),
+                    idempotency_key=request.data.get("finance_idempotency_key") or f"historical-report:{item.historical_report_id}:finance",
+                    actor=request.user,
+                )
+        except DjangoValidationError as exc:
+            transaction.set_rollback(True)
+            detail = getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or str(exc)
+            return Response({"detail": detail}, status=400)
+        except Exception as exc:
+            from django.core.exceptions import ObjectDoesNotExist
+            if isinstance(exc, ObjectDoesNotExist):
+                transaction.set_rollback(True)
+                return Response({"detail": "Collecting organisation not found."}, status=404)
+            raise
+
+        item = HistoricalReportDocument.objects.select_related(
+            "encounter__historical_finance__collecting_organization", "patient",
+            "hospital_referral__source_hospital", "uploaded_by",
+        ).get(pk=item.pk)
+        return Response(HistoricalReportDocumentSerializer(item, context={"request": request}).data, status=201)
+
+
+class PatientHistoricalReportListView(HistoricalReportAccessMixin, APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, patient_id):
+        from patients.models import Patient
+        patient = get_object_or_404(Patient.objects.select_related("assigned_clinic"), pk=patient_id)
+        if not (request.user.is_superuser or has_internal_ops_authority(request.user)):
+            org = get_user_organization(request.user)
+            if not org or patient.assigned_clinic_id != org.id:
+                raise PermissionDenied("You do not have access to this patient.")
+        items = HistoricalReportDocument.objects.select_related(
+            "encounter__historical_finance__collecting_organization", "patient",
+            "hospital_referral__source_hospital", "uploaded_by",
+        ).filter(patient=patient)
+        return Response(HistoricalReportDocumentSerializer(items, many=True, context={"request": request}).data)
+
+
+class HistoricalReportContentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        item = get_object_or_404(
+            HistoricalReportDocument.objects.select_related(
+                "encounter__patient__assigned_clinic", "encounter__originating_organization",
+                "hospital_referral__source_hospital",
+            ), pk=pk,
+        )
+        allowed = request.user.is_superuser or has_internal_ops_authority(request.user)
+        org = get_user_organization(request.user)
+        if org and (
+            item.encounter.originating_organization_id == org.id
+            or item.encounter.patient.assigned_clinic_id == org.id
+        ):
+            allowed = True
+        if (
+            org and org.organization_type == "hospital" and item.hospital_visible
+            and item.hospital_referral_id and item.hospital_referral.source_hospital_id == org.id
+        ):
+            allowed = True
+        if not allowed:
+            raise PermissionDenied("You do not have access to this historical report.")
+        response = FileResponse(item.document.open("rb"), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{item.original_filename or item.historical_report_id + ".pdf"}"'
+        return response
 
 
 class StructuredReportRulesMixin:

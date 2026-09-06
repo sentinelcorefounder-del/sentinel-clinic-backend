@@ -25,6 +25,9 @@ from .views import (
     EyeHealthScreeningPDFView,
     EyeHealthScreeningReleaseView,
     CombinedScreeningBundleView,
+    EncounterHistoricalReportListCreateView,
+    PatientHistoricalReportListView,
+    HistoricalReportContentView,
 )
 
 urlpatterns = [
@@ -48,6 +51,11 @@ urlpatterns = [
         RecallActionView.as_view(),
         name="recall-action",
     ),
+
+
+    path("historical/encounter/<int:encounter_id>/", EncounterHistoricalReportListCreateView.as_view(), name="historical-report-encounter"),
+    path("historical/patient/<int:patient_id>/", PatientHistoricalReportListView.as_view(), name="historical-report-patient"),
+    path("historical/<int:pk>/content/", HistoricalReportContentView.as_view(), name="historical-report-content"),
 
     path("", StructuredReportListCreateView.as_view(), name="report-list-create"),
     path("<int:pk>/", StructuredReportDetailView.as_view(), name="report-detail"),

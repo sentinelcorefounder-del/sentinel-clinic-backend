@@ -9,6 +9,7 @@ from .views import (
     MatchClinicView,
     HospitalIssuedReportListView,
     HospitalIssuedReportDetailView,
+    HospitalHistoricalReportDetailView,
     HospitalPatientListView,
     HospitalPatientDetailView,
 )
@@ -22,6 +23,7 @@ urlpatterns = [
     path("hospital/payouts/", HospitalPayoutListView.as_view(), name="hospital-payouts"),
     path("hospital/reports/", HospitalIssuedReportListView.as_view(), name="hospital-reports"),
     path("hospital/reports/<int:pk>/", HospitalIssuedReportDetailView.as_view(), name="hospital-report-detail"),
+    path("hospital/historical-reports/<int:pk>/", HospitalHistoricalReportDetailView.as_view(), name="hospital-historical-report-detail"),
     path("hospital/submit/", HospitalReferralSubmitView.as_view(), name="hospital-submit-referral"),
 
     # 🔥 NEW OPS ENDPOINT

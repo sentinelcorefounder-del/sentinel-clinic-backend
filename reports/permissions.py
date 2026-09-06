@@ -46,3 +46,17 @@ class CanSubmitReportToOps(BasePermission):
 class CanReviewOpsReports(BasePermission):
     def has_permission(self, request, view):
         return has_internal_ops_authority(request.user)
+
+
+class CanUploadHistoricalReports(BasePermission):
+    """Historical document ingestion is clinical/admin work, not a superuser shortcut."""
+
+    ALLOWED_CLINIC_ROLES = {"optometrist", "reviewer", "clinic_admin"}
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return bool(_roles(user) & self.ALLOWED_CLINIC_ROLES or has_internal_ops_authority(user))

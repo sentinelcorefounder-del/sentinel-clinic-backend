@@ -26,6 +26,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
     targeted_clinician_report_url = serializers.SerializerMethodField()
     combined_patient_bundle_url = serializers.SerializerMethodField()
     combined_clinician_bundle_url = serializers.SerializerMethodField()
+    historical_reports = serializers.SerializerMethodField()
 
     class Meta:
         model = HospitalReferral
@@ -60,7 +61,7 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
             "report_status",
             "report_issued_at",
             "targeted_patient_report_url", "targeted_clinician_report_url",
-            "combined_patient_bundle_url", "combined_clinician_bundle_url",
+            "combined_patient_bundle_url", "combined_clinician_bundle_url", "historical_reports",
             "hospital_commission_amount",
             "payout_status",
             "payout_date",
@@ -172,6 +173,17 @@ class HospitalReferralSerializer(serializers.ModelSerializer):
 
     def get_combined_clinician_bundle_url(self, obj):
         return self._combined_url(obj, "clinician")
+
+
+    def get_historical_reports(self, obj):
+        from reports.serializers import HistoricalReportDocumentSerializer
+        items = obj.historical_reports.select_related(
+            "encounter__historical_finance__collecting_organization", "patient",
+            "hospital_referral__source_hospital", "uploaded_by",
+        ).filter(hospital_visible=True)
+        return HistoricalReportDocumentSerializer(
+            items, many=True, context={"request": self.context.get("request")}
+        ).data
 
     def get_latest_payment(self, obj):
         try:
