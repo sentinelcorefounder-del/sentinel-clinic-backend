@@ -2074,7 +2074,7 @@ def capture_encounter_sponsorship(sponsorship, *, actor):
 
 @transaction.atomic
 def cancel_encounter_sponsorship(sponsorship, *, actor, reason):
-    sponsorship = EncounterSponsorship.objects.select_for_update().select_related("reservation").get(pk=sponsorship.pk)
+    sponsorship = EncounterSponsorship.objects.select_for_update(of=("self",)).select_related("reservation").get(pk=sponsorship.pk)
     if sponsorship.status == EncounterSponsorship.Status.CANCELLED:
         return sponsorship
     if sponsorship.status not in {
