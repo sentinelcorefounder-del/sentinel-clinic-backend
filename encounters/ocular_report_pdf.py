@@ -18,6 +18,17 @@ def _text(value, fallback="-"):
 
 
 
+def _signed_version(assessment):
+    return getattr(assessment, "current_version", None) if getattr(assessment, "current_version_id", None) else None
+
+
+def _clinical_value(assessment, key, fallback=""):
+    version = _signed_version(assessment)
+    if version and version.clinical_snapshot:
+        return version.clinical_snapshot.get(key, fallback)
+    return getattr(assessment, key, fallback)
+
+
 def _signer_snapshot_details(assessment):
     """Return immutable clinician sign-off details for finalized ocular reports.
 
@@ -25,7 +36,8 @@ def _signer_snapshot_details(assessment):
     keeps legacy/draft records readable without making live profile data authoritative
     for newly signed reports.
     """
-    snapshot = dict(getattr(assessment, "signer_snapshot", None) or {})
+    version = _signed_version(assessment)
+    snapshot = dict((version.clinician_snapshot if version else None) or getattr(assessment, "signer_snapshot", None) or {})
     if snapshot:
         name = (snapshot.get("signature_name") or snapshot.get("display_name") or "").strip()
         role = (snapshot.get("professional_role") or "").strip()
@@ -124,16 +136,18 @@ def build_ocular_report_pdf(assessment):
     ]))
     story.extend([details_table, Spacer(1, 9)])
 
+    management_outcome = _clinical_value(assessment, "management_outcome")
+    management_labels = dict(getattr(assessment, "MANAGEMENT_CHOICES", []))
     sections = [
-        ("Presenting complaint", assessment.presenting_complaint),
-        ("Ocular and relevant history", assessment.ocular_history),
-        ("Anterior eye findings", assessment.anterior_eye_findings),
-        ("Fundus findings", assessment.fundus_findings),
-        ("Visual-field interpretation", assessment.visual_field_summary),
-        ("Tonometry interpretation", assessment.tonometry_summary),
-        ("Clinical impression / diagnosis", assessment.impression),
-        ("Management and referral plan", assessment.management_plan),
-        ("Outcome", assessment.get_management_outcome_display()),
+        ("Presenting complaint", _clinical_value(assessment, "presenting_complaint")),
+        ("Ocular and relevant history", _clinical_value(assessment, "ocular_history")),
+        ("Anterior eye findings", _clinical_value(assessment, "anterior_eye_findings")),
+        ("Fundus findings", _clinical_value(assessment, "fundus_findings")),
+        ("Visual-field interpretation", _clinical_value(assessment, "visual_field_summary")),
+        ("Tonometry interpretation", _clinical_value(assessment, "tonometry_summary")),
+        ("Clinical impression / diagnosis", _clinical_value(assessment, "impression")),
+        ("Management and referral plan", _clinical_value(assessment, "management_plan")),
+        ("Outcome", management_labels.get(management_outcome, management_outcome)),
     ]
     for heading, value in sections:
         if value:
@@ -158,8 +172,8 @@ def build_ocular_report_pdf(assessment):
     if credentials:
         signoff_lines.append(_text(credentials))
     signoff_lines.append(
-        "Electronically signed: " + _text(assessment.signed_at or assessment.completed_at)
-        if (assessment.signed_at or assessment.completed_at)
+        "Electronically signed: " + _text((_signed_version(assessment).signed_at if _signed_version(assessment) else None) or assessment.signed_at or assessment.completed_at)
+        if ((_signed_version(assessment).signed_at if _signed_version(assessment) else None) or assessment.signed_at or assessment.completed_at)
         else "Draft report"
     )
     story.extend([
@@ -171,9 +185,10 @@ def build_ocular_report_pdf(assessment):
     if footer:
         story.extend([Spacer(1, 10), Paragraph(_text(footer), styles["BodyText"])])
 
-    if assessment.report_layout == "with_investigations":
-        fundus_ids = list(assessment.selected_fundus_upload_ids or [])
-        investigation_ids = list(assessment.selected_ocular_investigation_ids or [])
+    report_layout = _clinical_value(assessment, "report_layout", "text_only")
+    if report_layout == "with_investigations":
+        fundus_ids = list(_clinical_value(assessment, "selected_fundus_upload_ids", []) or [])
+        investigation_ids = list(_clinical_value(assessment, "selected_ocular_investigation_ids", []) or [])
         fundus = {
             item.id: item for item in encounter.image_uploads.filter(id__in=fundus_ids)
         }
@@ -186,7 +201,7 @@ def build_ocular_report_pdf(assessment):
         )
         if items:
             story.extend([PageBreak(), Paragraph("Selected Clinical Investigations", styles["Title"])])
-        captions = assessment.attachment_captions or {}
+        captions = _clinical_value(assessment, "attachment_captions", {}) or {}
         for kind, item in items:
             if kind == "fundus":
                 from uploads.clinical_assets import open_image_upload

@@ -7,6 +7,7 @@ from .identity_views import (
     OpsIdentityReviewListView,
     OpsMasterPatientListView,
 )
+from .clinical_reports import OpsClinicalReportQueueView, OpsEyeHealthReportDetailView, OpsOcularReportDetailView
 from .views import (
     OpsDashboardView,
     OpsReferralListView,
@@ -55,6 +56,9 @@ urlpatterns = [
     path("payments/webhook/", PaystackOpsWebhookView.as_view()),
 
     path("reports/approval-queue/", OpsReportApprovalQueueView.as_view()),
+    path("clinical-reports/", OpsClinicalReportQueueView.as_view()),
+    path("clinical-reports/eye-health/<int:pk>/", OpsEyeHealthReportDetailView.as_view()),
+    path("clinical-reports/ocular/<int:encounter_id>/", OpsOcularReportDetailView.as_view()),
     path("reports/<int:pk>/", OpsReportDetailView.as_view()),
     path("reports/<int:pk>/return/", OpsReportReturnView.as_view()),
     path("reports/<int:pk>/approve/", OpsReportApproveView.as_view()),
