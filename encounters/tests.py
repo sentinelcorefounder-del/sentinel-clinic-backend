@@ -461,7 +461,7 @@ class OcularDiagnosticWorkflowTests(TestCase):
         )
         self.assertEqual(content.status_code, 200)
         self.assertNotIn(investigation.private_object_key, str(content.headers))
-        content.close()
+        b"".join(content.streaming_content)
 
         unauthorized = User.objects.create_user("ocular-wrong-branch")
         unauthorized.groups.add(Group.objects.get(name="optometrist"))

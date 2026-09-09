@@ -1093,7 +1093,7 @@ class OpsReleaseReportToHospitalView(OpsOnlyMixin, APIView):
         authority = ops_report_authority(request.user)
 
         report = (
-            StructuredReport.objects.select_for_update().select_related(
+            StructuredReport.objects.select_for_update(of=("self",)).select_related(
                 "patient",
                 "patient__assigned_clinic",
                 "encounter",

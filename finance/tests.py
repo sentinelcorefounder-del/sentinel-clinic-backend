@@ -667,6 +667,14 @@ class BankTransferFundingTests(WalletEngineTests):
 
 
 class VersionedPricingAndSettlementTests(WalletEngineTests):
+    def setUp(self):
+        super().setUp()
+        self.operator = get_user_model().objects.create_user(username="settlement-operator")
+        self.approver = get_user_model().objects.create_user(username="settlement-approver")
+        for user, role in [(self.operator, "finance_operator"), (self.approver, "finance_approver")]:
+            user.groups.add(Group.objects.get_or_create(name=role)[0])
+            UserSecurityProfile.objects.update_or_create(user=user, defaults={"is_internal_sentinel_staff": True})
+
     def test_volume_tier_is_applied_and_frozen_in_snapshot(self):
         self.rule.max_monthly_volume = 1
         self.rule.save(update_fields=["max_monthly_volume", "updated_at"])
@@ -712,26 +720,26 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
     def test_settlement_requires_evidence_and_prevents_duplicate_reference(self):
         self._earned_allocations()
         batch = create_settlement_batch(
-            self.organization, date.today(), date.today(), actor=None
+            self.organization, date.today(), date.today(), actor=self.operator
         )
-        approve_settlement_batch(batch)
+        approve_settlement_batch(batch, actor=self.approver)
         with self.assertRaisesMessage(ValidationError, "Payment evidence"):
-            mark_settlement_batch_paid(batch, "PAY-001")
+            mark_settlement_batch_paid(batch, "PAY-001", actor=self.operator)
         evidence = SimpleUploadedFile("payment.pdf", b"paid", content_type="application/pdf")
-        paid = mark_settlement_batch_paid(batch, "PAY-001", payment_evidence=evidence)
+        paid = mark_settlement_batch_paid(batch, "PAY-001", actor=self.operator, payment_evidence=evidence)
         self.assertEqual(paid.status, SettlementBatch.Status.PAID)
         self.assertTrue(paid.payment_evidence.name)
 
     def test_cancel_draft_settlement_releases_allocations_for_one_replacement(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
         self.assertEqual(
             EncounterAllocation.objects.filter(
                 settlement_items__batch=batch,
                 status=EncounterAllocation.Status.EARNED,
             ).count(), 1,
         )
-        cancel_settlement_batch(batch, "Payment details need correction")
+        cancel_settlement_batch(batch, "Payment details need correction", actor=self.operator)
         batch.refresh_from_db()
         self.assertEqual(batch.status, SettlementBatch.Status.CANCELLED)
         self.assertEqual(
@@ -740,21 +748,21 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
             ).count(), 1,
         )
         replacement = create_settlement_batch(
-            self.organization, date.today(), date.today()
+            self.organization, date.today(), date.today(), actor=self.operator
         )
         self.assertNotEqual(replacement.pk, batch.pk)
         self.assertEqual(replacement.items.count(), 1)
         with self.assertRaisesMessage(ValidationError, "No unsettled allocations"):
-            create_settlement_batch(self.organization, date.today(), date.today())
+            create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
 
     def test_approved_settlement_cannot_be_cancelled_or_edited(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today())
+        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
         original_total = batch.total_amount
         original_items = list(batch.items.values_list("allocation_id", "amount", "currency"))
-        approve_settlement_batch(batch)
+        approve_settlement_batch(batch, actor=self.approver)
         with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
-            cancel_settlement_batch(batch, "Operator cannot undo approval")
+            cancel_settlement_batch(batch, "Operator cannot undo approval", actor=self.operator)
         batch.refresh_from_db()
         self.assertEqual(batch.status, SettlementBatch.Status.APPROVED)
         self.assertEqual(batch.total_amount, original_total)
@@ -765,19 +773,19 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
 
     def test_paid_settlement_cannot_be_cancelled(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today())
-        approve_settlement_batch(batch)
+        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        approve_settlement_batch(batch, actor=self.approver)
         evidence = SimpleUploadedFile("paid.pdf", b"paid", content_type="application/pdf")
-        mark_settlement_batch_paid(batch, "PAY-CANCEL-GUARD", payment_evidence=evidence)
+        mark_settlement_batch_paid(batch, "PAY-CANCEL-GUARD", actor=self.operator, payment_evidence=evidence)
         with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
-            cancel_settlement_batch(batch, "Paid history is immutable")
+            cancel_settlement_batch(batch, "Paid history is immutable", actor=self.operator)
 
     def test_repeated_draft_cancellation_is_rejected(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today())
-        cancel_settlement_batch(batch, "First cancellation")
+        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        cancel_settlement_batch(batch, "First cancellation", actor=self.operator)
         with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
-            cancel_settlement_batch(batch, "Second cancellation")
+            cancel_settlement_batch(batch, "Second cancellation", actor=self.operator)
 
 
 class ServiceAllowanceTests(TestCase):

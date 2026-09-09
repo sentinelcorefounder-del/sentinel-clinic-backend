@@ -271,7 +271,8 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
         self.client.force_authenticate(user=user)
         response = self.client.get(self.url)
         if response.status_code == 200:
-            response.close()
+            if getattr(response, "streaming", False):
+                b"".join(response.streaming_content)
         return response.status_code
 
     def test_unauthenticated_access_is_denied(self):
@@ -283,8 +284,8 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(self.object_key, " ".join(response.headers.values()))
-        response.close()
-
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
     def test_same_clinic_operational_roles_with_correct_branch_are_allowed(self):
         for role in ("clinic_admin", "clinic_screener"):
             with self.subTest(role=role):
@@ -310,8 +311,8 @@ class PrivateClinicalAssetAuthorizationTests(TestCase):
             reverse("image-upload-content", args=[legacy_upload.pk])
         )
         self.assertEqual(response.status_code, 200)
-        response.close()
-
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
     def test_same_clinic_clinician_with_wrong_branch_is_denied(self):
         user = self.user("wrong-branch", ("optometrist", "ops_admin"), self.clinic, self.other_branch)
         self.assertEqual(self.status_for(user), 403)
@@ -423,8 +424,8 @@ class BulkImportWorkflowTests(TestCase):
         response = self.client.get(preview)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Cache-Control"], "private, no-store, max-age=0")
-        response.close()
-
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
     def test_losing_upload_role_revokes_preview_access(self):
         created = self.create_import().data
         item = created["groups"][0]["items"][0]
@@ -450,7 +451,8 @@ class BulkImportWorkflowTests(TestCase):
         content = self.client.get(reverse("image-upload-content", args=[upload.pk]))
         self.assertEqual(content.status_code, 200)
         self.assertEqual(content["Cache-Control"], "private, no-store, max-age=0")
-        content.close()
+        if getattr(content, "streaming", False):
+            b"".join(content.streaming_content)
         self.assertEqual(self.client.post(confirm_url, {}, format="json").status_code, 200)
         self.assertEqual(BulkImageAttachment.objects.count(), 2)
 

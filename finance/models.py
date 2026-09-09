@@ -271,6 +271,11 @@ class AllocationRule(TimeStampedModel):
 
 
 class EncounterFinancialRecord(TimeStampedModel):
+    class Disposition(models.TextChoices):
+        STANDARD = "standard", "Standard"
+        COMPLIMENTARY = "complimentary_non_cash", "Complimentary (non-cash)"
+
+    disposition = models.CharField(max_length=30, choices=Disposition.choices, default=Disposition.STANDARD)
     class ServicePathway(models.TextChoices):
         HOSPITAL_REFERRED = "hospital_referred", "Hospital referred"
         CLINIC_DIRECT = "clinic_direct", "Clinic direct"
@@ -381,6 +386,14 @@ class EncounterFinancialRecord(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [models.CheckConstraint(
+            condition=~models.Q(disposition="complimentary_non_cash") | models.Q(
+                gross_amount__gt=0, outstanding_amount=0, allocated_amount=0,
+                financially_releasable=True, captured_at__isnull=True,
+                payer_type="waived", payer_organization__isnull=True,
+                collecting_organization__isnull=True, collector_type="none", payment_method="waived",
+                status="ready_for_release",
+            ), name="fin_complimentary_non_cash")]
         indexes = [
             models.Index(fields=["status", "financially_releasable"]),
             models.Index(fields=["created_at"]),
@@ -1071,6 +1084,9 @@ class SettlementItem(TimeStampedModel):
 
     class Meta:
         ordering = ["id"]
+        constraints = [models.UniqueConstraint(
+            fields=["batch", "allocation"], name="fin_unique_batch_allocation",
+        )]
 
     def clean(self):
         if self.amount <= 0:
@@ -1361,14 +1377,27 @@ class FinanceActionRequest(TimeStampedModel):
         REFUND = "refund", "Refund"
         REVERSAL = "reversal", "Reversal"
         ADJUSTMENT = "adjustment", "Adjustment"
+        TREASURY_REVERSAL = "treasury_reversal", "Treasury reversal"
 
     class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        AUTHORIZED = "authorized", "Approved, awaiting execution"
+        EXECUTED = "executed", "Executed"
         PENDING = "pending", "Pending approval"
         APPROVED = "approved", "Approved and posted"
         REJECTED = "rejected", "Rejected"
         CANCELLED = "cancelled", "Cancelled"
 
     action_type = models.CharField(max_length=20, choices=ActionType.choices)
+    treasury_transfer = models.ForeignKey("TreasuryTransfer", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="reversal_requests")
+    reversal_kind = models.CharField(max_length=30, blank=True, default="", choices=[
+        ("returned_funds", "Returned funds"), ("bookkeeping_correction", "Incorrect debit correction"),
+    ])
+    approved_snapshot = models.JSONField(default=dict, blank=True)
+    executed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="executed_finance_actions")
+    executed_at = models.DateTimeField(null=True, blank=True)
     wallet = models.ForeignKey(
         OrganizationWallet, on_delete=models.PROTECT, related_name="finance_action_requests"
     )
@@ -1408,6 +1437,32 @@ class FinanceActionRequest(TimeStampedModel):
             models.Index(fields=["status", "action_type"], name="fin_action_status_type_idx"),
             models.Index(fields=["wallet", "status"], name="fin_action_wallet_status_idx"),
         ]
+        constraints = [
+            models.UniqueConstraint(fields=["treasury_transfer"],
+                condition=models.Q(action_type="treasury_reversal", status__in=["draft", "pending", "authorized", "executed"]),
+                name="fin_one_active_transfer_reversal"),
+            models.UniqueConstraint(fields=["external_reference"],
+                condition=models.Q(action_type="treasury_reversal", status__in=["draft", "pending", "authorized", "executed"]),
+                name="fin_unique_active_reversal_ref"),
+            models.CheckConstraint(
+                condition=~models.Q(action_type="treasury_reversal") | models.Q(treasury_transfer__isnull=False, amount__gt=0),
+                name="fin_reversal_transfer_required"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = type(self).objects.get(pk=self.pk)
+            if previous.action_type == self.ActionType.TREASURY_REVERSAL:
+                protected = ("action_type", "treasury_transfer_id", "wallet_id", "financial_record_id",
+                    "related_entry_id", "amount", "currency", "reason", "external_reference",
+                    "evidence", "idempotency_key", "requested_by_id", "reversal_kind")
+                if previous.status in {self.Status.AUTHORIZED, self.Status.EXECUTED}:
+                    protected += ("approved_snapshot", "decided_by_id", "decided_at")
+                if previous.status in {self.Status.EXECUTED, self.Status.REJECTED, self.Status.CANCELLED}:
+                    protected += ("status", "posted_entry_id", "executed_by_id", "executed_at", "decision_reason")
+                if any(getattr(previous, name) != getattr(self, name) for name in protected):
+                    raise ValidationError("Treasury reversal request details are immutable; reject and replace the request.")
+        return super().save(*args, **kwargs)
 
     def clean(self):
         if self.amount == 0:
@@ -1559,6 +1614,56 @@ class EncounterSponsorship(TimeStampedModel):
             raise ValidationError({"reason": "A sponsorship reason is required."})
 
 
+class ComplimentaryRequest(TimeStampedModel):
+    from django.core.serializers.json import DjangoJSONEncoder
+
+    financial_record = models.ForeignKey(EncounterFinancialRecord, on_delete=models.PROTECT, related_name="complimentary_requests")
+    status = models.CharField(max_length=20, default="submitted", choices=[
+        ("submitted", "Submitted"), ("approved", "Approved"),
+        ("rejected", "Rejected"), ("cancelled", "Cancelled"),
+    ])
+    reason = models.TextField()
+    gross_service_value = models.DecimalField(max_digits=14, decimal_places=2)
+    currency = models.CharField(max_length=3)
+    pricing_snapshot = models.JSONField(default=dict)
+    allocation_snapshot = models.JSONField(default=list, encoder=DjangoJSONEncoder)
+    idempotency_key = models.CharField(max_length=120, unique=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="complimentary_requests")
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name="complimentary_decisions")
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(fields=["financial_record"], condition=models.Q(status__in=["submitted", "approved"]), name="fin_one_active_complimentary"),
+            models.CheckConstraint(condition=models.Q(gross_service_value__gt=0), name="fin_complimentary_gross_positive"),
+            models.CheckConstraint(condition=~models.Q(status__in=["approved", "rejected"]) | (models.Q(decided_by__isnull=False) & ~models.Q(decided_by=models.F("created_by"))), name="fin_complimentary_checker"),
+        ]
+
+
+class ComplimentaryEvent(models.Model):
+    request = models.ForeignKey(ComplimentaryRequest, on_delete=models.PROTECT, related_name="events")
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    action = models.CharField(max_length=30)
+    source_status = models.CharField(max_length=20, blank=True)
+    target_status = models.CharField(max_length=20)
+    reason = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [models.UniqueConstraint(fields=["request", "action"], name="fin_complimentary_event_once")]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Complimentary events are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Complimentary events are immutable.")
+
+
 class SponsorshipEvent(models.Model):
     sponsorship = models.ForeignKey(
         EncounterSponsorship, on_delete=models.PROTECT, related_name="events"
@@ -1669,6 +1774,11 @@ def treasury_transfer_reference():
 
 
 class TreasuryTransfer(TimeStampedModel):
+    reversal_kind = models.CharField(max_length=30, blank=True, default="", choices=[
+        ("returned_funds", "Returned funds"), ("bookkeeping_correction", "Incorrect debit correction"),
+    ])
+    reversal_reference = models.CharField(max_length=120, blank=True, default="")
+    reversal_evidence = models.FileField(upload_to=finance_action_evidence_path, null=True, blank=True)
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
         SUBMITTED = "submitted", "Submitted"
@@ -1735,6 +1845,7 @@ class TreasuryTransfer(TimeStampedModel):
             models.CheckConstraint(
                 condition=models.Q(amount__gt=0), name="fin_transfer_amount_positive"
             ),
+            models.UniqueConstraint(fields=["reversal_reference"], condition=~models.Q(reversal_reference=""), name="fin_unique_reversal_reference"),
         ]
 
     def clean(self):

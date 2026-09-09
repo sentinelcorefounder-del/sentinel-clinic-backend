@@ -606,7 +606,7 @@ def build_complete_pdf(report, snapshot, audience="patient", draft=False, manife
 
 @transaction.atomic
 def finalize_screening_report(report, *, user, expected_version, signoff_confirmed):
-    report = EyeHealthScreeningReport.objects.select_for_update().select_related(
+    report = EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
         "encounter__patient__assigned_clinic", "encounter__service_branch"
     ).get(pk=report.pk)
     authority, clinic, branch = require_eye_health_authority(user, report.encounter)

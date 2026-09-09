@@ -369,9 +369,15 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.assertEqual(repeated.ledger_entry_id, transfer.ledger_entry_id)
         self.assertEqual(transfer.events.filter(action="execution_recorded").count(), 1)
         self.assertEqual(sentinel_treasury_summary()["transferable_surplus"], Decimal("20000.00"))
-        reversed_transfer = reverse_treasury_transfer(transfer, actor=self.approver, reason="Synthetic correction")
-        reverse_treasury_transfer(reversed_transfer, actor=self.approver, reason="Repeated reversal")
-        self.assertEqual(reversed_transfer.events.filter(action="reversed").count(), 1)
+        from .treasury_reversals import request_reversal, submit_reversal, approve_reversal, execute_reversal
+        reversal = request_reversal(transfer, actor=self.operator, reason="Synthetic correction",
+            reversal_kind="returned_funds", reversal_reference="SYNTHETIC-RETURN", idempotency_key="synthetic-reversal",
+            evidence=SimpleUploadedFile("return.pdf", b"%PDF-1.4 synthetic return"))
+        submit_reversal(reversal, actor=self.operator)
+        approve_reversal(reversal, actor=self.approver)
+        execute_reversal(reversal, actor=self.operator)
+        execute_reversal(reversal, actor=self.operator)
+        self.assertEqual(transfer.events.filter(action="reversed").count(), 1)
         self.assertEqual(self.wallet.available_balance, Decimal("25000.00"))
 
     def test_transfer_approval_enforces_checker_and_wallet_specific_surplus(self):
@@ -467,8 +473,8 @@ class SponsorshipAndTreasuryTests(TestCase):
         client.force_authenticate(self.viewer)
         response = client.get(path)
         self.assertEqual(response.status_code, 200)
-        response.close()
-
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
     def test_dashboard_counts_only_verified_sentinel_sources(self):
         self.fund()
         top_up_wallet(

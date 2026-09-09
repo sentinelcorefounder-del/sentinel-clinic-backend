@@ -1257,11 +1257,37 @@ class FinanceActionRequestViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_permissions(self):
         role = IsFinanceViewer
-        if self.action == "create":
+        if self.action in {"create", "submit", "execute", "cancel"}:
             role = IsInternalFinanceOperator
         elif self.action in {"approve", "reject"}:
             role = IsInternalFinanceApprover
         return [IsAuthenticated(), role()]
+
+    def _reversal_transition(self, request, operation):
+        from . import treasury_reversals
+        item = self.get_object()
+        if item.action_type != "treasury_reversal":
+            return Response({"detail": "This action is only for Treasury reversals."}, status=400)
+        kwargs = {"actor": request.user}
+        if operation == "cancel":
+            kwargs["reason"] = request.data.get("reason", "")
+        try:
+            item = getattr(treasury_reversals, operation + "_reversal")(item, **kwargs)
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        return self._reversal_transition(request, "submit")
+
+    @action(detail=True, methods=["post"])
+    def execute(self, request, pk=None):
+        return self._reversal_transition(request, "execute")
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        return self._reversal_transition(request, "cancel")
 
     def create(self, request, *args, **kwargs):
         try:
@@ -1524,10 +1550,23 @@ class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = TreasuryTransfer.objects.select_related(
         "wallet__organization", "created_by", "decided_by", "executed_by",
         "ledger_entry", "reversal_entry",
-    ).prefetch_related("events", "events__actor")
+    ).prefetch_related("events", "events__actor", "reversal_requests")
+
+    @action(detail=True, methods=["post"], url_path="reversal-requests", parser_classes=[MultiPartParser, FormParser])
+    def reversal_requests(self, request, pk=None):
+        from .treasury_reversals import request_reversal
+        try:
+            item = request_reversal(self.get_object(), actor=request.user,
+                reversal_kind=request.data.get("reversal_kind", ""),
+                reversal_reference=request.data.get("reversal_reference", ""),
+                reason=request.data.get("reason", ""), evidence=request.FILES.get("evidence"),
+                idempotency_key=request.data.get("idempotency_key", ""))
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(FinanceActionRequestSerializer(item).data, status=201)
 
     def get_permissions(self):
-        if self.action in {"list", "retrieve", "evidence"}:
+        if self.action in {"list", "retrieve", "evidence", "reversal_evidence"}:
             role = IsFinanceViewer
         elif self.action in {"approve", "reject", "reverse"}:
             role = IsInternalFinanceApprover
@@ -1611,15 +1650,22 @@ class TreasuryTransferViewSet(viewsets.ReadOnlyModelViewSet):
             return _finance_error(exc)
         return Response(self.get_serializer(item).data)
 
-    @action(detail=True, methods=["post"])
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser])
     def reverse(self, request, pk=None):
         try:
             item = reverse_treasury_transfer(
-                self.get_object(), actor=request.user, reason=request.data.get("reason", "")
+                self.get_object(), actor=request.user, reason=request.data.get("reason", ""),
+                reversal_kind=request.data.get("reversal_kind", ""),
+                reversal_reference=request.data.get("reversal_reference", ""),
+                evidence=request.FILES.get("evidence"),
             )
         except DjangoValidationError as exc:
             return _finance_error(exc)
         return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["get"], url_path="reversal-evidence")
+    def reversal_evidence(self, request, pk=None):
+        return _evidence_response(self.get_object().reversal_evidence)
 
     @action(detail=True, methods=["get"])
     def evidence(self, request, pk=None):
@@ -1801,3 +1847,48 @@ class SentinelTreasuryDashboardView(APIView):
                 "transfers": "/api/finance/treasury-transfers/", "corrections": "/api/finance/action-requests/",
             },
         })
+
+
+from .models import ComplimentaryRequest
+from .serializers import ComplimentaryRequestSerializer
+from .complimentary import request_complimentary, decide_complimentary
+
+
+class ComplimentaryRequestViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ComplimentaryRequestSerializer
+    queryset = ComplimentaryRequest.objects.select_related("financial_record__encounter").prefetch_related("events")
+
+    def get_permissions(self):
+        role = IsFinanceViewer if self.action in {"list", "retrieve"} else (
+            IsInternalFinanceApprover if self.action in {"approve", "reject"} else IsInternalFinanceOperator
+        )
+        return [IsAuthenticated(), role()]
+
+    def create(self, request):
+        from django.shortcuts import get_object_or_404
+        record = get_object_or_404(EncounterFinancialRecord, pk=request.data.get("financial_record"))
+        try:
+            item = request_complimentary(financial_record=record, actor=request.user,
+                reason=request.data.get("reason"), idempotency_key=request.data.get("idempotency_key"))
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data, status=201)
+
+    def _decide(self, request, action):
+        try:
+            item = decide_complimentary(self.get_object(), actor=request.user, action=action, reason=request.data.get("reason", ""))
+        except DjangoValidationError as exc:
+            return _finance_error(exc)
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        return self._decide(request, "approve")
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        return self._decide(request, "reject")
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        return self._decide(request, "cancel")

@@ -90,6 +90,16 @@ class TreasuryTransferEventSerializer(serializers.ModelSerializer):
 
 
 class TreasuryTransferSerializer(serializers.ModelSerializer):
+    reversal_requests = serializers.SerializerMethodField()
+
+    def get_reversal_requests(self, obj):
+        return FinanceActionRequestSerializer(obj.reversal_requests.all(), many=True).data
+
+    reversal_evidence_available = serializers.SerializerMethodField()
+
+    def get_reversal_evidence_available(self, obj):
+        return bool(obj.reversal_evidence)
+
     wallet_name = serializers.CharField(source="wallet.organization.name", read_only=True)
     created_by_name = serializers.CharField(source="created_by.username", read_only=True)
     decided_by_name = serializers.CharField(source="decided_by.username", read_only=True, allow_null=True)
@@ -105,6 +115,7 @@ class TreasuryTransferSerializer(serializers.ModelSerializer):
             "available_surplus_snapshot", "idempotency_key", "created_by_name",
             "submitted_at", "decided_by_name", "decided_at", "decision_reason",
             "executed_by_name", "executed_at", "execution_date", "ledger_entry", "reversal_entry",
+            "reversal_kind", "reversal_reference", "reversal_evidence_available", "reversal_requests",
             "cancellation_reason", "founder_expense", "evidence_available", "events", "created_at", "updated_at",
         )
         read_only_fields = fields
@@ -415,7 +426,7 @@ class EncounterFinancialRecordSerializer(serializers.ModelSerializer):
         model = EncounterFinancialRecord
         fields = "__all__"
         read_only_fields = (
-            "id", "encounter", "contract", "pricing_rule", "status", "currency",
+            "id", "encounter", "contract", "pricing_rule", "status", "currency", "disposition",
             "service_pathway", "payer_type", "payer_organization", "collector_type",
             "collecting_organization", "payment_method",
             "gross_amount", "allocated_amount", "outstanding_amount",
@@ -655,6 +666,7 @@ class FinanceActionRequestSerializer(serializers.ModelSerializer):
         exclude = ("evidence",)
         read_only_fields = (
             "currency", "status", "requested_by", "decided_by", "decided_at",
+            "treasury_transfer", "reversal_kind", "approved_snapshot", "executed_by", "executed_at",
             "decision_reason", "posted_entry", "created_at", "updated_at",
         )
 
@@ -725,3 +737,22 @@ class AssessmentServiceSessionSerializer(serializers.ModelSerializer):
         )
         session.save()
         return session
+
+
+from .models import ComplimentaryRequest, ComplimentaryEvent
+
+
+class ComplimentaryEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ComplimentaryEvent
+        fields = "__all__"
+
+
+class ComplimentaryRequestSerializer(serializers.ModelSerializer):
+    encounter_reference = serializers.CharField(source="financial_record.encounter.encounter_id", read_only=True)
+    events = ComplimentaryEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ComplimentaryRequest
+        fields = "__all__"
+        read_only_fields = tuple(field.name for field in ComplimentaryRequest._meta.fields)

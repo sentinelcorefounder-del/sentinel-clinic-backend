@@ -511,7 +511,7 @@ class StructuredReportDetailView(
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         with transaction.atomic():
-            report = self.get_queryset().select_for_update().get(pk=kwargs["pk"])
+            report = self.get_queryset().select_for_update(of=("self",)).get(pk=kwargs["pk"])
             assert_expected(report, expected_version(request.data))
             self._validate_report_editable(report, request.user)
             serializer = self.get_serializer(
@@ -692,7 +692,7 @@ class PatientReportListView(generics.ListAPIView):
 @permission_classes([IsAuthenticated, CanSubmitReportToOps])
 def submit_report_to_ops(request, pk):
     with transaction.atomic():
-        report = StructuredReport.objects.select_for_update().select_related(
+        report = StructuredReport.objects.select_for_update(of=("self",)).select_related(
             "patient", "patient__assigned_clinic", "encounter",
         ).filter(pk=pk).first()
         if not report:
@@ -761,7 +761,7 @@ def clinic_issue_report(request, pk):
     issued_version = None
     try:
         with transaction.atomic():
-            report = StructuredReport.objects.select_for_update().select_related(
+            report = StructuredReport.objects.select_for_update(of=("self",)).select_related(
                 "patient", "patient__assigned_clinic", "encounter"
             ).filter(pk=pk).first()
             if not report:
@@ -1047,7 +1047,7 @@ class EyeHealthScreeningPreviewView(APIView):
     @transaction.atomic
     def post(self, request, pk):
         report = get_object_or_404(
-            EyeHealthScreeningReport.objects.select_for_update().select_related(
+            EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
                 "encounter__patient__assigned_clinic", "encounter__patient__assigned_branch",
                 "encounter__service_branch",
             ), pk=pk,
@@ -1097,7 +1097,7 @@ class EyeHealthScreeningCorrectionView(APIView):
     @transaction.atomic
     def post(self, request, pk):
         report = get_object_or_404(
-            EyeHealthScreeningReport.objects.select_for_update().select_related(
+            EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
                 "encounter__patient__assigned_clinic", "encounter__patient__assigned_branch",
                 "encounter__service_branch", "finalized_version",
             ), pk=pk,
@@ -1194,7 +1194,7 @@ class EyeHealthScreeningReleaseView(APIView):
         if not has_internal_ops_authority(request.user):
             raise PermissionDenied("Exact Sentinel Ops authority is required.")
         report = get_object_or_404(
-            EyeHealthScreeningReport.objects.select_for_update().select_related(
+            EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
                 "encounter__hospital_referral__source_hospital", "finalized_version",
             ), pk=pk,
         )

@@ -5,3 +5,4 @@ media/
 .bulk_staging/
 .clinical_assets/
 *.log 
+config/settings/postgres_test.py

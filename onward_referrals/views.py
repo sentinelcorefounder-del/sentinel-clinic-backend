@@ -181,7 +181,7 @@ class OnwardReferralDetailView(APIView):
 
     @transaction.atomic
     def patch(self, request, referral_uuid):
-        referral = OnwardReferral.objects.select_for_update().select_related("current_version", "encounter", "originating_clinic", "branch").get(referral_uuid=referral_uuid)
+        referral = OnwardReferral.objects.select_for_update(of=("self",)).select_related("current_version", "encounter", "originating_clinic", "branch").get(referral_uuid=referral_uuid)
         version = referral.current_version
         if not version or version.status != "draft":
             raise ValidationError("Only a draft version can be edited.")
@@ -259,7 +259,7 @@ class VoidView(APIView):
     permission_classes = [IsAuthenticated]
     @transaction.atomic
     def post(self, request, referral_uuid):
-        referral = OnwardReferral.objects.select_for_update().select_related("current_version", "encounter").get(referral_uuid=referral_uuid)
+        referral = OnwardReferral.objects.select_for_update(of=("self",)).select_related("current_version", "encounter").get(referral_uuid=referral_uuid)
         require_current_author(request.user, referral)
         version = referral.current_version
         reason = (request.data.get("reason") or "").strip()

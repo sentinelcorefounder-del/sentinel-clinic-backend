@@ -301,12 +301,12 @@ def render_draft_preview(*, user, referral):
 
 @transaction.atomic
 def finalize_referral(*, user, referral):
-    referral = OnwardReferral.objects.select_for_update().select_related(
+    referral = OnwardReferral.objects.select_for_update(of=("self",)).select_related(
         "current_version", "encounter", "patient", "patient__master_patient",
         "originating_clinic", "branch", "original_hospital_referral",
         "retinal_report", "ocular_assessment",
     ).get(pk=referral.pk)
-    version = OnwardReferralVersion.objects.select_for_update().select_related("recipient_organization").get(pk=referral.current_version_id)
+    version = OnwardReferralVersion.objects.select_for_update(of=("self",)).select_related("recipient_organization").get(pk=referral.current_version_id)
     if version.status == "finalized":
         return version
     if version.status != "draft":
@@ -391,7 +391,7 @@ def source_is_stale(version):
 
 @transaction.atomic
 def supersede_referral(*, user, referral, reason):
-    referral = OnwardReferral.objects.select_for_update().select_related("current_version", "encounter").get(pk=referral.pk)
+    referral = OnwardReferral.objects.select_for_update(of=("self",)).select_related("current_version", "encounter").get(pk=referral.pk)
     require_current_author(user, referral)
     previous = referral.current_version
     reason = (reason or "").strip()
@@ -424,7 +424,7 @@ def supersede_referral(*, user, referral, reason):
 
 @transaction.atomic
 def make_available(*, user, referral, idempotency_key):
-    referral = OnwardReferral.objects.select_for_update().select_related("current_version", "encounter").get(pk=referral.pk)
+    referral = OnwardReferral.objects.select_for_update(of=("self",)).select_related("current_version", "encounter").get(pk=referral.pk)
     if not can_distribute(user, referral):
         raise PermissionDenied("Exact onward-referral distribution authority is required.")
     version = referral.current_version

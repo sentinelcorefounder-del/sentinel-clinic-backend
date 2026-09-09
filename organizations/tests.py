@@ -83,7 +83,8 @@ class PrivateLogoAccessTests(TestCase):
             f"/api/organizations/{self.organization.pk}/logo/"
         )
         self.assertEqual(response.status_code, 200)
-        response.close()
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
         self.client.force_authenticate(self.other_user)
         self.assertEqual(
             self.client.get(

@@ -24,7 +24,10 @@ from .views import (
     HistoricalAssessmentFinanceViewSet,
 )
 
+from .views import ComplimentaryRequestViewSet
+
 router = DefaultRouter()
+router.register("complimentary", ComplimentaryRequestViewSet, basename="finance-complimentary")
 router.register("contracts", PartnerContractViewSet, basename="finance-contract")
 router.register("pricing-rules", PricingRuleViewSet, basename="finance-pricing-rule")
 router.register("allocation-rules", AllocationRuleViewSet, basename="finance-allocation-rule")

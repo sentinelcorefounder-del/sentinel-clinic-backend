@@ -91,9 +91,8 @@ class PrivateNormalUploadTests(TestCase):
         self.assertTrue(image_file_to_data_url(upload).startswith("data:image/jpeg;base64,"))
         content = self.client.get(reverse("image-upload-content", args=[upload.pk]))
         self.assertEqual(content.status_code, 200)
-        content.close()
-
-
+        if getattr(content, "streaming", False):
+            b"".join(content.streaming_content)
     def test_identifier_is_generated_server_side(self):
         response = self.client.post(
             reverse("image-upload-list-create"),
@@ -138,8 +137,8 @@ class PrivateNormalUploadTests(TestCase):
         )
         response = self.client.get(reverse("image-upload-content", args=[upload.pk]))
         self.assertEqual(response.status_code, 200)
-        response.close()
-
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
     @patch("uploads.models.ImageUpload.save", side_effect=RuntimeError("database failure"))
     def test_database_failure_removes_prepared_private_object(self, mocked_save):
         self.client.raise_request_exception = False

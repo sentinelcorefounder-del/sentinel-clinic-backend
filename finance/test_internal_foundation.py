@@ -828,7 +828,8 @@ class InternalFinanceFoundationTests(TestCase):
         self.client.force_authenticate(clinic_user)
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
-        response.close()
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
         other_user = get_user_model().objects.create_user("proof-other")
         UserOrganization.objects.create(user=other_user, organization=self.hospital)
         self.client.force_authenticate(other_user)
@@ -840,7 +841,8 @@ class InternalFinanceFoundationTests(TestCase):
         self.authenticate()
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
-        response.close()
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
         self.assertEqual(self.client.get(request.proof.url).status_code, 404)
 
     def test_protected_settlement_evidence_and_missing_file(self):
@@ -857,7 +859,8 @@ class InternalFinanceFoundationTests(TestCase):
         self.authenticate()
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
-        response.close()
+        if getattr(response, "streaming", False):
+            b"".join(response.streaming_content)
         batch.payment_evidence.delete(save=False)
         batch.payment_evidence = "finance/settlements/missing.pdf"
         batch.save(update_fields=["payment_evidence"])

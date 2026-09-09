@@ -56,6 +56,8 @@ def recognize_service_partner_earning(financial_record, trigger_source="financia
     record = EncounterFinancialRecord.objects.select_for_update(of=("self",)).select_related(
         "encounter", "encounter__service_session",
     ).get(pk=financial_record.pk)
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        return None
     encounter = record.encounter
     snapshot = encounter.service_delivery_snapshot or {}
     if (
@@ -536,6 +538,10 @@ def create_finance_action_request(
 ):
     from .models import FinanceActionRequest, FinanceControlAudit, OrganizationWallet
 
+    if action_type == FinanceActionRequest.ActionType.TREASURY_REVERSAL or (
+        related_entry and TreasuryTransfer.objects.filter(ledger_entry=related_entry).exists()
+    ):
+        raise ValidationError("Use the controlled Treasury reversal request lifecycle.")
     key = _require_idempotency_key(idempotency_key)
     existing = FinanceActionRequest.objects.filter(idempotency_key=key).first()
     if existing:
@@ -571,9 +577,17 @@ def create_finance_action_request(
 def approve_finance_action_request(action_request, *, decided_by):
     from .models import FinanceActionRequest, FinanceControlAudit, OrganizationWallet, WalletLedgerEntry
 
+    if FinanceActionRequest.objects.filter(pk=action_request.pk, action_type="treasury_reversal").exists():
+        from .treasury_reversals import approve_reversal
+        return approve_reversal(action_request, actor=decided_by)
+    record_id = FinanceActionRequest.objects.values_list("financial_record_id", flat=True).get(pk=action_request.pk)
+    if record_id:
+        EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
     request = FinanceActionRequest.objects.select_for_update(of=("self",)).select_related(
         "wallet", "financial_record", "related_entry"
     ).get(pk=action_request.pk)
+    if request.related_entry_id and TreasuryTransfer.objects.filter(ledger_entry_id=request.related_entry_id).exists():
+        raise ValidationError("Use the controlled Treasury reversal request lifecycle.")
     if request.status == FinanceActionRequest.Status.APPROVED:
         return request
     if request.status != FinanceActionRequest.Status.PENDING:
@@ -634,6 +648,9 @@ def approve_finance_action_request(action_request, *, decided_by):
 def reject_finance_action_request(action_request, *, decided_by, reason):
     from .models import FinanceActionRequest, FinanceControlAudit
 
+    if FinanceActionRequest.objects.filter(pk=action_request.pk, action_type="treasury_reversal").exists():
+        from .treasury_reversals import reject_reversal
+        return reject_reversal(action_request, actor=decided_by, reason=reason)
     request = FinanceActionRequest.objects.select_for_update().select_related("wallet").get(pk=action_request.pk)
     if request.status != FinanceActionRequest.Status.PENDING:
         raise ValidationError("Only a pending request can be rejected.")
@@ -697,6 +714,9 @@ def price_encounter(encounter, actor=None, force=False, contract_override=None):
     record = EncounterFinancialRecord.objects.select_for_update().filter(encounter=encounter).first()
     if record is None:
         record = EncounterFinancialRecord.objects.create(encounter=encounter)
+
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        raise ValidationError("Approved complimentary service cannot be repriced.")
 
     if record.status not in {
         EncounterFinancialRecord.Status.UNPRICED,
@@ -1090,8 +1110,8 @@ def reserve_wallet_funds(wallet, financial_record, amount, idempotency_key, acto
 
     amount = _money(amount)
     idempotency_key = _require_idempotency_key(idempotency_key)
-    wallet = OrganizationWallet.objects.select_for_update().get(pk=wallet.pk)
     financial_record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    wallet = OrganizationWallet.objects.select_for_update().get(pk=wallet.pk)
 
     existing = WalletReservation.objects.filter(idempotency_key=idempotency_key).first()
     if existing:
@@ -1150,9 +1170,12 @@ def reserve_wallet_funds(wallet, financial_record, amount, idempotency_key, acto
 def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, actor=None, reference=""):
     from .models import WalletLedgerEntry, WalletReservation
 
-    reservation = WalletReservation.objects.select_for_update().select_related(
+    record_id = WalletReservation.objects.values_list("financial_record_id", flat=True).get(pk=reservation.pk)
+    EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
+    reservation = WalletReservation.objects.select_for_update(of=("self",)).select_related(
         "wallet", "financial_record"
     ).get(pk=reservation.pk)
+    OrganizationWallet.objects.select_for_update().get(pk=reservation.wallet_id)
     if idempotency_key:
         existing = WalletLedgerEntry.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
@@ -1216,9 +1239,12 @@ def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, a
 def release_wallet_reservation(reservation, amount=None, idempotency_key=None, actor=None, reference=""):
     from .models import WalletLedgerEntry, WalletReservation
 
-    reservation = WalletReservation.objects.select_for_update().select_related(
+    record_id = WalletReservation.objects.values_list("financial_record_id", flat=True).get(pk=reservation.pk)
+    EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
+    reservation = WalletReservation.objects.select_for_update(of=("self",)).select_related(
         "wallet", "financial_record"
     ).get(pk=reservation.pk)
+    OrganizationWallet.objects.select_for_update().get(pk=reservation.wallet_id)
     if idempotency_key:
         existing = WalletLedgerEntry.objects.filter(idempotency_key=idempotency_key).first()
         if existing:
@@ -1364,7 +1390,7 @@ def approve_service_allowance(allowance, actor=None):
 @transaction.atomic
 def reserve_service_allowance(financial_record, actor=None):
     """Reserve non-cash service authority; never mark a record releasable."""
-    record = EncounterFinancialRecord.objects.select_for_update().select_related(
+    record = EncounterFinancialRecord.objects.select_for_update(of=("self",)).select_related(
         "contract", "payer_organization"
     ).get(pk=financial_record.pk)
     existing = ServiceAllowanceReservation.objects.select_for_update().filter(
@@ -1493,6 +1519,8 @@ def capture_financial_record_wallet_reservation(financial_record, actor=None, re
 def earn_financial_record_allocations(financial_record, actor=None):
     """Mark frozen shares as earned exactly once; callers decide the clinical trigger."""
     record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        return record
     if not record.financially_releasable:
         raise ValidationError("This financial record is not covered and cannot earn allocations.")
     pending = record.allocations.select_for_update().filter(
@@ -1564,13 +1592,17 @@ def capture_finance_for_hospital_publication(encounter, actor=None):
 
 @transaction.atomic
 def create_settlement_batch(beneficiary_organization, period_start, period_end, currency="NGN", actor=None):
+    from .complimentary import require_role
+    require_role(actor, "operator")
     from .models import EncounterAllocation, SettlementBatch, SettlementItem
 
     if not period_start or not period_end:
         raise ValidationError("Valid settlement period_start and period_end dates are required.")
     if period_end < period_start:
         raise ValidationError("Settlement period end cannot precede its start.")
-    allocations = EncounterAllocation.objects.select_for_update().filter(
+    from organizations.models import Organization
+    Organization.objects.select_for_update().get(pk=beneficiary_organization.pk)
+    allocations = EncounterAllocation.objects.select_for_update(of=("self",)).filter(
         beneficiary_organization=beneficiary_organization,
         currency=currency,
         status=EncounterAllocation.Status.EARNED,
@@ -1583,8 +1615,9 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
             SettlementBatch.Status.APPROVED,
             SettlementBatch.Status.PAID,
         ]
-    ).distinct()
-    if not allocations.exists():
+    ).order_by("pk")
+    allocations = list(allocations)
+    if not allocations:
         raise ValidationError("No unsettled allocations were found for this beneficiary and period.")
     batch = SettlementBatch.objects.create(
         beneficiary_organization=beneficiary_organization,
@@ -1605,13 +1638,17 @@ def create_settlement_batch(beneficiary_organization, period_start, period_end, 
 
 @transaction.atomic
 def approve_settlement_batch(batch, actor=None):
+    from .complimentary import require_role
+    require_role(actor, "approver")
     from .models import EncounterAllocation, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
-    if batch.status != SettlementBatch.Status.DRAFT:
-        raise ValidationError("Only draft settlement batches can be approved.")
     if actor is not None and batch.prepared_by_id == getattr(actor, "id", None):
         raise ValidationError("Maker-checker control: the preparer cannot approve this settlement.")
+    if batch.status == SettlementBatch.Status.APPROVED:
+        return batch
+    if batch.status != SettlementBatch.Status.DRAFT:
+        raise ValidationError("Only draft settlement batches can be approved.")
     batch.status = SettlementBatch.Status.APPROVED
     batch.approved_by = actor
     batch.approved_at = timezone.now()
@@ -1625,11 +1662,17 @@ def approve_settlement_batch(batch, actor=None):
 
 @transaction.atomic
 def mark_settlement_batch_paid(batch, external_reference, actor=None, payment_evidence=None):
+    from .complimentary import require_role
+    require_role(actor, "operator")
     from .models import EncounterAllocation, EncounterFinancialRecord, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().prefetch_related(
         "items__allocation__financial_record"
     ).get(pk=batch.pk)
+    if batch.status == SettlementBatch.Status.PAID:
+        if str(external_reference or "").strip() == batch.external_reference:
+            return batch
+        raise ValidationError("Settlement was already paid with a different reference.")
     if batch.status != SettlementBatch.Status.APPROVED:
         raise ValidationError("Only approved settlement batches can be marked paid.")
     external_reference = str(external_reference or "").strip()
@@ -1639,6 +1682,9 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None, payment_ev
         raise ValidationError("This external settlement reference has already been used.")
     if payment_evidence is None:
         raise ValidationError("Payment evidence is required before a settlement can be marked paid.")
+    # Match earning/correction paths: financial records before allocation updates.
+    record_ids = {item.allocation.financial_record_id for item in batch.items.all()}
+    records = list(EncounterFinancialRecord.objects.select_for_update().filter(id__in=record_ids).order_by("pk"))
     batch.status = SettlementBatch.Status.PAID
     batch.external_reference = external_reference
     batch.payment_evidence = payment_evidence
@@ -1650,8 +1696,7 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None, payment_ev
         settled_at=batch.paid_at,
     )
 
-    record_ids = {item.allocation.financial_record_id for item in batch.items.all()}
-    for record in EncounterFinancialRecord.objects.select_for_update().filter(id__in=record_ids):
+    for record in records:
         if not record.allocations.exclude(settlement_items__batch__status=SettlementBatch.Status.PAID).exists():
             previous_status = record.status
             record.status = EncounterFinancialRecord.Status.SETTLED
@@ -1669,6 +1714,8 @@ def mark_settlement_batch_paid(batch, external_reference, actor=None, payment_ev
 
 @transaction.atomic
 def cancel_settlement_batch(batch, reason, actor=None):
+    from .complimentary import require_role
+    require_role(actor, "operator")
     from .models import EncounterAllocation, SettlementBatch
 
     batch = SettlementBatch.objects.select_for_update().get(pk=batch.pk)
@@ -1691,9 +1738,11 @@ def cancel_settlement_batch(batch, reason, actor=None):
 
 @transaction.atomic
 def approve_financial_record_credit(financial_record, actor=None):
-    record = EncounterFinancialRecord.objects.select_for_update().select_related("contract").get(
+    record = EncounterFinancialRecord.objects.select_for_update(of=("self",)).select_related("contract").get(
         pk=financial_record.pk
     )
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        raise ValidationError("Complimentary service cannot receive credit.")
     if not record.contract or not record.contract.credit_allowed:
         raise ValidationError("The active contract does not permit credit.")
     previous_status = record.status
@@ -1713,6 +1762,8 @@ def cancel_financial_record(financial_record, actor=None, reason="Encounter canc
     from .models import WalletReservation
 
     record = EncounterFinancialRecord.objects.select_for_update().get(pk=financial_record.pk)
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        raise ValidationError("Approved complimentary disposition cannot be cancelled here.")
     allowance_reservation = ServiceAllowanceReservation.objects.select_for_update().filter(
         financial_record=record, status=ServiceAllowanceReservation.Status.ACTIVE
     ).first()
@@ -1759,6 +1810,9 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
     financial record is placed in exception for Ops follow-up.
     """
     record = ensure_financial_record(encounter)
+
+    if record.disposition == record.Disposition.COMPLIMENTARY:
+        return record
 
     if encounter.screening_status == "cancelled":
         return cancel_financial_record(record, actor=actor)
@@ -1851,7 +1905,7 @@ def attach_encounter_to_service_session(encounter, session, actor):
     from encounters.models import AssessmentServiceSession, ScreeningEncounter
     from .models import FinanceControlAudit
 
-    session = AssessmentServiceSession.objects.select_for_update().select_related(
+    session = AssessmentServiceSession.objects.select_for_update(of=("self",)).select_related(
         "participating_organization", "service_branch", "service_partner"
     ).get(pk=session.pk)
     encounter = ScreeningEncounter.objects.select_for_update().get(pk=encounter.pk)
@@ -1989,7 +2043,9 @@ def submit_encounter_sponsorship(sponsorship, *, actor):
 
 @transaction.atomic
 def decide_encounter_sponsorship(sponsorship, *, actor, approve, reason=""):
-    sponsorship = EncounterSponsorship.objects.select_for_update().select_related(
+    record_id = EncounterSponsorship.objects.values_list("financial_record_id", flat=True).get(pk=sponsorship.pk)
+    EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
+    sponsorship = EncounterSponsorship.objects.select_for_update(of=("self",)).select_related(
         "sponsor_wallet__organization", "financial_record", "encounter"
     ).get(pk=sponsorship.pk)
     if approve and sponsorship.status == EncounterSponsorship.Status.APPROVED:
@@ -2051,7 +2107,9 @@ def decide_encounter_sponsorship(sponsorship, *, actor, approve, reason=""):
 
 @transaction.atomic
 def capture_encounter_sponsorship(sponsorship, *, actor):
-    sponsorship = EncounterSponsorship.objects.select_for_update().select_related(
+    record_id = EncounterSponsorship.objects.values_list("financial_record_id", flat=True).get(pk=sponsorship.pk)
+    EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
+    sponsorship = EncounterSponsorship.objects.select_for_update(of=("self",)).select_related(
         "reservation", "financial_record"
     ).get(pk=sponsorship.pk)
     if sponsorship.status == EncounterSponsorship.Status.CAPTURED:
@@ -2074,6 +2132,8 @@ def capture_encounter_sponsorship(sponsorship, *, actor):
 
 @transaction.atomic
 def cancel_encounter_sponsorship(sponsorship, *, actor, reason):
+    record_id = EncounterSponsorship.objects.values_list("financial_record_id", flat=True).get(pk=sponsorship.pk)
+    EncounterFinancialRecord.objects.select_for_update().get(pk=record_id)
     sponsorship = EncounterSponsorship.objects.select_for_update(of=("self",)).select_related("reservation").get(pk=sponsorship.pk)
     if sponsorship.status == EncounterSponsorship.Status.CANCELLED:
         return sponsorship
@@ -2480,42 +2540,5 @@ def cancel_treasury_transfer(transfer, *, actor, reason):
     return transfer
 
 
-@transaction.atomic
-def reverse_treasury_transfer(transfer, *, actor, reason):
-    transfer = TreasuryTransfer.objects.select_for_update().select_related("wallet", "ledger_entry").get(pk=transfer.pk)
-    if transfer.status == TreasuryTransfer.Status.REVERSED:
-        return transfer
-    if transfer.status != TreasuryTransfer.Status.EXECUTED or not transfer.ledger_entry_id:
-        raise ValidationError("Only an executed transfer can be reversed.")
-    reason = str(reason or "").strip()
-    if not reason:
-        raise ValidationError("A reversal reason is required.")
-    entry = WalletLedgerEntry.objects.create(
-        wallet=transfer.wallet, entry_type=WalletLedgerEntry.EntryType.REVERSAL,
-        available_delta=transfer.amount, reserved_delta=Decimal("0.00"),
-        currency=transfer.currency, related_entry=transfer.ledger_entry,
-        idempotency_key=f"treasury-transfer:{transfer.pk}:reversed",
-        reference=transfer.external_reference,
-        description=f"Treasury transfer reversal: {reason[:170]}",
-        metadata={"treasury_transfer_id": transfer.pk}, actor=actor,
-    )
-    source = transfer.status
-    transfer.status = TreasuryTransfer.Status.REVERSED
-    transfer.reversal_entry = entry
-    transfer.save(update_fields=["status", "reversal_entry", "updated_at"])
-    if transfer.founder_expense_id:
-        expense = FounderFundedExpense.objects.select_for_update().get(pk=transfer.founder_expense_id)
-        if expense.status == FounderFundedExpense.Status.SETTLED:
-            expense.status = FounderFundedExpense.Status.APPROVED
-            expense.settled_at = None
-            expense.save(update_fields=["status", "settled_at", "updated_at"])
-            FounderFundedExpenseEvent.objects.create(
-                expense=expense, action="reimbursement_reversed", actor=actor,
-                source_status=FounderFundedExpense.Status.SETTLED, target_status=expense.status,
-                reason=reason, idempotency_key=f"founder-expense:{expense.pk}:reimbursement-reversed:{transfer.pk}",
-                metadata={"treasury_transfer_id": transfer.pk, "ledger_entry_id": entry.pk},
-            )
-    _transfer_event(transfer, "reversed", actor, source, transfer.status,
-                    f"treasury-transfer:{transfer.pk}:reversed", reason=reason,
-                    metadata={"ledger_entry_id": entry.pk})
-    return transfer
+def reverse_treasury_transfer(transfer, *, actor, reason, reversal_kind="", reversal_reference="", evidence=None):
+    raise ValidationError("Direct reversal is disabled. Request, submit, approve and execute a Treasury reversal.")

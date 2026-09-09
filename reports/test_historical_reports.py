@@ -53,8 +53,8 @@ class HistoricalReportTests(APITestCase):
         self.assertTrue(any(row.get("report_type") == "historical" and row.get("id") == item.id for row in listing.data))
         content = self.client.get(f"/api/reports/historical/{item.pk}/content/")
         self.assertEqual(content.status_code, 200)
-        content.close()
-
+        if getattr(content, "streaming", False):
+            b"".join(content.streaming_content)
     def test_historical_upload_does_not_create_structured_report(self):
         self.client.force_authenticate(self.clinician)
         response = self.client.post(f"/api/reports/historical/encounter/{self.encounter.pk}/", {"document": self.pdf(), "report_date": "2026-08-01", "hospital_visible": "false"}, format="multipart")

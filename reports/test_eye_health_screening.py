@@ -148,6 +148,19 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         report.refresh_from_db()
         return report
 
+    def test_correction_of_draft_without_finalized_version_is_controlled_conflict(self):
+        report = self.save_draft()
+        self.assertIsNone(report.finalized_version_id)
+        response = self.client.post(
+            f"/api/reports/eye-health/{report.pk}/correction/",
+            {"reason": "Correct the clinical summary"}, format="json",
+        )
+        self.assertEqual(response.status_code, 409, response.data)
+        report.refresh_from_db()
+        self.assertEqual(report.status, report.Status.DRAFT)
+        self.assertIsNone(report.finalized_version_id)
+        self.assertFalse(report.versions.exists())
+
     def test_draft_preview_finalization_freezes_outcome_advice_location_and_identity(self):
         report = self.preview_and_finalize(self.save_draft())
         version = report.finalized_version

@@ -15,7 +15,7 @@ def _money_from_kobo(value):
 
 @transaction.atomic
 def post_verified_payment(payment, verify_payload):
-    payment = PaymentTransaction.objects.select_for_update().select_related(
+    payment = PaymentTransaction.objects.select_for_update(of=("self",)).select_related(
         "wallet", "financial_record"
     ).get(pk=payment.pk)
 

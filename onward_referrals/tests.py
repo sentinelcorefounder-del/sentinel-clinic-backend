@@ -479,7 +479,6 @@ class OnwardReferralTests(TestCase):
         with self.assertRaises(DjangoValidationError):
             access_event.delete()
         b"".join(response.streaming_content)
-        response.close()
         version.refresh_from_db()
         self.assertEqual(version.status, "finalized")
 
@@ -515,7 +514,6 @@ class OnwardReferralTests(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         b"".join(response.streaming_content)
-        response.close()
         self.assertFalse(OnwardReferralAvailability.objects.exists())
         self.assertFalse(OnwardReferralEvent.objects.filter(event_type="made_available").exists())
 
