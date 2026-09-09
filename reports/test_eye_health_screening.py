@@ -273,6 +273,17 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         ops = self.make_user("eye-release-ops", {"ops_admin"})
         UserSecurityProfile.objects.create(user=ops, is_internal_sentinel_staff=True)
         self.client.force_authenticate(ops)
+        blocked = self.client.post(f"/api/reports/eye-health/{report.pk}/release-hospital/", {}, format="json")
+        self.assertEqual(blocked.status_code, 409, getattr(blocked, "data", None))
+        approved = self.client.post(
+            f"/api/reports/eye-health/{report.pk}/ops-approve/",
+            {"note": "Synthetic Ops review complete."}, format="json",
+        )
+        self.assertEqual(approved.status_code, 200, getattr(approved, "data", None))
+        report.refresh_from_db()
+        self.assertEqual(report.review_status, report.ReviewStatus.APPROVED)
+        self.assertEqual(report.signed_by, self.optometrist)
+        self.assertEqual(report.ops_reviewed_by, ops)
         first = self.client.post(f"/api/reports/eye-health/{report.pk}/release-hospital/", {}, format="json")
         self.assertEqual(first.status_code, 200, getattr(first, "data", None))
         second = self.client.post(f"/api/reports/eye-health/{report.pk}/release-hospital/", {}, format="json")

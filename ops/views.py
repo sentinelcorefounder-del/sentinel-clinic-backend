@@ -803,17 +803,13 @@ class OpsReportReturnView(OpsOnlyMixin, APIView):
 class OpsReportApproveView(OpsOnlyMixin, APIView):
     def post(self, request, pk):
         authority = ops_report_authority(request.user)
-        signer_name = (request.data.get("signer_name") or "").strip()
-        signer_role = (request.data.get("signer_role") or "").strip()
-        signer_registration_number = (request.data.get("signer_registration_number") or "").strip()
-        missing = [label for label, value in (("clinician name", signer_name), ("professional role", signer_role), ("registration number", signer_registration_number)) if not value]
-        if missing:
-            return Response({"detail": "Clinical sign-off is incomplete. Missing: " + ", ".join(missing) + "."}, status=status.HTTP_400_BAD_REQUEST)
         created_pdf = False
         version = None
         try:
             with transaction.atomic():
-                report = StructuredReport.objects.select_for_update().select_related("encounter").filter(pk=pk).first()
+                report = StructuredReport.objects.select_for_update(of=("self",)).select_related(
+                    "encounter", "signed_by", "submitted_version"
+                ).filter(pk=pk).first()
                 if not report:
                     return Response({"detail": "Report not found."}, status=status.HTTP_404_NOT_FOUND)
                 assert_expected(report, expected_version(request.data))
@@ -821,6 +817,14 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
                     return Response({"detail": "The submitted report version changed. Reload before review."}, status=status.HTTP_409_CONFLICT)
                 if report.report_status != "submitted_to_ops" or not report.submitted_version_id:
                     return Response({"detail": f"Only a valid submitted_to_ops report can be approved. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
+                if not (
+                    report.signed_by_id and report.signed_at and report.signer_name.strip()
+                    and report.signer_role.strip() and report.signer_registration_number.strip()
+                ):
+                    return Response(
+                        {"detail": "The submitted version does not contain a complete clinician sign-off."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
                 version = report.submitted_version
                 previous_status = report.report_status
                 issued_time = timezone.now()
@@ -828,11 +832,6 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
                 report.ops_reviewed_at = issued_time
                 report.ops_reviewed_by = request.user
                 report.ops_review_note = (request.data.get("note") or "").strip()
-                report.signed_by = request.user
-                report.signed_at = issued_time
-                report.signer_name = signer_name
-                report.signer_role = signer_role
-                report.signer_registration_number = signer_registration_number
                 report.issued_by = request.user
                 report.issued_at = issued_time
                 report.issued_version = version
@@ -841,15 +840,14 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
                 created_pdf = bind_issued_pdf(report, version, request)
                 report.save(update_fields=[
                     "report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
-                    "signed_by", "signed_at", "signer_name", "signer_role",
-                    "signer_registration_number", "issued_by", "issued_at", "issued_version",
-                    "distribution_status", "lock_version", "updated_at",
+                    "issued_by", "issued_at", "issued_version", "distribution_status",
+                    "lock_version", "updated_at",
                 ])
                 event_once(
                     report=report, event_type="issued", actor=request.user,
                     from_status=previous_status, to_status="issued", source_version=version,
                     target_version=version, authority_used=authority,
-                    note=report.ops_review_note or "Report reviewed, electronically signed and issued by Sentinel Ops.",
+                    note=report.ops_review_note or "Clinician-signed report reviewed and issued by Sentinel Ops.",
                     idempotency_key=(request.data.get("idempotency_key") or f"issue:{report.lock_version}")[:120],
                 )
                 encounter_referral = getattr(report.encounter, "hospital_referral", None)
@@ -862,17 +860,23 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
                     referral.report_ready = False
                     referral.referral_status = "report_issued"
                     referral.save(update_fields=["report_ready", "referral_status", "updated_at"])
-                event_once(report=report, event_type="queued_for_distribution", actor=request.user,
-                           from_status="issued", to_status="issued", source_version=version,
-                           target_version=version, authority_used=authority,
-                           note="Issued report queued for Sentinel distribution.")
+                event_once(
+                    report=report, event_type="queued_for_distribution", actor=request.user,
+                    from_status="issued", to_status="issued", source_version=version,
+                    target_version=version, authority_used=authority,
+                    note="Issued report queued for Sentinel distribution.",
+                )
                 create_audit_log(
                     actor=request.user, action="report_issued", entity_type="report",
                     entity_id=report.id, entity_label=report.report_id,
-                    message=f"Report {report.report_id} reviewed, signed and issued by Sentinel Ops.",
-                    metadata={"signer_name": signer_name, "signer_role": signer_role,
-                              "signer_registration_number": signer_registration_number,
-                              "issued_version": version.pk},
+                    message=f"Clinician-signed report {report.report_id} reviewed and issued by Sentinel Ops.",
+                    metadata={
+                        "clinical_signer_user_id": report.signed_by_id,
+                        "signer_name": report.signer_name,
+                        "signer_role": report.signer_role,
+                        "signer_registration_number": report.signer_registration_number,
+                        "issued_version": version.pk,
+                    },
                 )
         except Exception:
             if created_pdf:
@@ -881,10 +885,7 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
 
         create_ops_notification(
             title="Report issued",
-            message=(
-                f"Report {report.report_id} was reviewed, "
-                "signed and issued by Sentinel Ops."
-            ),
+            message=f"Clinician-signed report {report.report_id} was reviewed and issued by Sentinel Ops.",
             level="success",
             entity_type="report",
             entity_id=report.id,
@@ -894,14 +895,8 @@ class OpsReportApproveView(OpsOnlyMixin, APIView):
 
         return Response(
             {
-                "message": (
-                    "Report approved, signed and issued "
-                    "by Sentinel Ops."
-                ),
-                "report": OpsReportSerializer(
-                    report,
-                    context={"request": request},
-                ).data,
+                "message": "Report approved and issued by Sentinel Ops. The clinician sign-off was preserved.",
+                "report": OpsReportSerializer(report, context={"request": request}).data,
             }
         )
 

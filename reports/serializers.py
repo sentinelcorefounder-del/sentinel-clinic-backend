@@ -39,6 +39,9 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
             "status", "previewed_at", "lock_version", "finalized_version",
             "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
             "correction_source_version",
+            "review_status", "submitted_to_ops_at", "submitted_to_ops_by",
+            "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "signed_at", "signed_by", "issued_at", "issued_by",
             "hospital_released_version", "hospital_released_at",
             "clean_pdf_ready",
         ]
@@ -46,6 +49,9 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
             "encounter", "status", "previewed_at", "lock_version", "finalized_version",
             "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
             "correction_source_version", "generated_suggestion",
+            "review_status", "submitted_to_ops_at", "submitted_to_ops_by",
+            "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "signed_at", "signed_by", "issued_at", "issued_by",
             "hospital_released_version", "hospital_released_at",
             "clean_pdf_ready",
         ]
@@ -68,7 +74,9 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
             "display_name": profile.display_name,
             "professional_role": profile.professional_role,
             "registration_number": profile.registration_number,
+            "registration_body": profile.registration_body,
             "qualifications": profile.qualifications,
+            "signature_name": profile.signature_name or profile.display_name,
         }
 
     def get_clean_pdf_ready(self, obj):

@@ -134,6 +134,44 @@ def require_responsible_clinician(user, report):
     return responsibility, authority
 
 
+
+def verified_profile_credentials(user, authority):
+    profile = getattr(user, "clinical_professional_profile", None)
+    if not profile or not profile.is_verified:
+        raise ValidationError("A verified clinical professional profile is required for sign-off.")
+    display_name = _text(profile.display_name)
+    professional_role = _text(profile.professional_role)
+    registration_number = _text(profile.registration_number)
+    if not display_name or not professional_role or not registration_number:
+        raise ValidationError("The verified professional profile is incomplete.")
+    return {
+        "user_id": user.pk,
+        "display_name": display_name,
+        "professional_role": professional_role,
+        "registration_number": registration_number,
+        "registration_body": _text(profile.registration_body),
+        "qualifications": _text(profile.qualifications),
+        "signature_name": _text(profile.signature_name) or display_name,
+        "authority_used": authority,
+    }
+
+
+def sync_responsibility_to_verified_profile(responsibility, *, user, authority):
+    profile = verified_profile_credentials(user, authority)
+    changed = []
+    mapping = {
+        "clinician_name": profile["display_name"],
+        "professional_role": profile["professional_role"],
+        "registration_number": profile["registration_number"],
+    }
+    for field, value in mapping.items():
+        if getattr(responsibility, field) != value:
+            setattr(responsibility, field, value)
+            changed.append(field)
+    if changed:
+        responsibility.save(update_fields=changed + ["updated_at"])
+    return profile
+
 def responsibility_snapshot(responsibility):
     if not responsibility:
         return {"historical_author": "unknown"}

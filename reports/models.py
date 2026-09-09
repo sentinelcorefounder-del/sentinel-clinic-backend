@@ -17,6 +17,7 @@ class StructuredReport(models.Model):
         ("draft", "Draft"),
         ("under_review", "Under Review"),
         ("signed_off", "Signed Off"),
+        ("clinician_signed", "Clinician Signed"),
         ("submitted_to_ops", "Submitted to Ops"),
         ("returned_to_clinic", "Returned to Clinic"),
         ("ops_approved", "Ops Approved"),
@@ -324,6 +325,7 @@ class ReportStatusEvent(models.Model):
         ("created", "Created"),
         ("responsibility_accepted", "Clinical responsibility accepted"),
         ("responsibility_taken_over", "Clinical responsibility taken over"),
+        ("clinician_signed", "Clinician Signed"),
         ("submitted_to_ops", "Submitted to Ops"),
         ("returned_to_clinic", "Returned to Clinic"),
         ("resubmitted", "Resubmitted"),
@@ -488,6 +490,14 @@ class EyeHealthScreeningReport(models.Model):
         DRAFT = "draft", "Draft"
         FINALIZED = "finalized", "Finalized"
 
+    class ReviewStatus(models.TextChoices):
+        DRAFT = "draft", "Draft / not submitted"
+        NOT_REQUIRED = "not_required", "Ops review not required"
+        AWAITING_OPS = "awaiting_ops", "Awaiting Ops review"
+        APPROVED = "approved", "Ops approved"
+        RETURNED_TO_CLINIC = "returned_to_clinic", "Returned to clinic"
+        LEGACY = "legacy", "Legacy finalized report"
+
     encounter = models.OneToOneField(
         ScreeningEncounter, on_delete=models.PROTECT, related_name="eye_health_report"
     )
@@ -524,6 +534,30 @@ class EyeHealthScreeningReport(models.Model):
     hospital_released_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
         related_name="eye_health_reports_released_to_hospital",
+    )
+    review_status = models.CharField(
+        max_length=24, choices=ReviewStatus.choices, default=ReviewStatus.DRAFT
+    )
+    submitted_to_ops_at = models.DateTimeField(null=True, blank=True)
+    submitted_to_ops_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="eye_health_reports_submitted_to_ops",
+    )
+    ops_reviewed_at = models.DateTimeField(null=True, blank=True)
+    ops_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="eye_health_reports_reviewed_by_ops",
+    )
+    ops_review_note = models.TextField(blank=True, default="")
+    signed_at = models.DateTimeField(null=True, blank=True)
+    signed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="eye_health_reports_signed",
+    )
+    issued_at = models.DateTimeField(null=True, blank=True)
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="eye_health_reports_issued",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

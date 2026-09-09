@@ -436,6 +436,14 @@ class OcularDiagnosticAssessment(models.Model):
     selected_fundus_upload_ids = models.JSONField(default=list, blank=True)
     selected_ocular_investigation_ids = models.JSONField(default=list, blank=True)
     attachment_captions = models.JSONField(default=dict, blank=True)
+    REPORT_STATUS_CHOICES = [
+        ("draft", "Draft"),
+        ("awaiting_ops", "Awaiting Ops review"),
+        ("ops_approved", "Ops approved"),
+        ("returned_to_clinic", "Returned to clinic"),
+        ("issued", "Issued"),
+    ]
+
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -444,11 +452,70 @@ class OcularDiagnosticAssessment(models.Model):
         on_delete=models.SET_NULL,
         related_name="completed_ocular_assessments",
     )
+    report_status = models.CharField(max_length=24, choices=REPORT_STATUS_CHOICES, default="draft")
+    signed_at = models.DateTimeField(null=True, blank=True)
+    signed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="signed_ocular_assessments",
+    )
+    signer_snapshot = models.JSONField(default=dict, blank=True)
+    submitted_to_ops_at = models.DateTimeField(null=True, blank=True)
+    submitted_to_ops_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="submitted_ocular_assessments",
+    )
+    ops_reviewed_at = models.DateTimeField(null=True, blank=True)
+    ops_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="reviewed_ocular_assessments",
+    )
+    ops_review_note = models.TextField(blank=True, default="")
+    issued_at = models.DateTimeField(null=True, blank=True)
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="issued_ocular_assessments",
+    )
+    current_version = models.ForeignKey(
+        "OcularDiagnosticAssessmentVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="current_for_assessments",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Ocular assessment - {self.encounter.encounter_id}"
+
+
+class OcularDiagnosticAssessmentVersion(models.Model):
+    assessment = models.ForeignKey(
+        OcularDiagnosticAssessment, on_delete=models.PROTECT, related_name="versions"
+    )
+    version_number = models.PositiveIntegerField()
+    clinical_snapshot = models.JSONField(default=dict)
+    clinician_snapshot = models.JSONField(default=dict)
+    checksum_sha256 = models.CharField(max_length=64)
+    signed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="ocular_report_versions_signed"
+    )
+    signed_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assessment", "version_number"],
+                name="ocular_report_unique_version",
+            )
+        ]
+        ordering = ["assessment_id", "version_number"]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise ValidationError("Ocular report versions are immutable.")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Ocular report versions cannot be deleted.")
 
 
 class OcularInvestigation(models.Model):

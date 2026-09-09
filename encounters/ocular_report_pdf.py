@@ -16,6 +16,40 @@ def _text(value, fallback="-"):
     return escape(value) if value else fallback
 
 
+
+
+def _signer_snapshot_details(assessment):
+    """Return immutable clinician sign-off details for finalized ocular reports.
+
+    The signed snapshot is authoritative once present. Falling back to completed_by
+    keeps legacy/draft records readable without making live profile data authoritative
+    for newly signed reports.
+    """
+    snapshot = dict(getattr(assessment, "signer_snapshot", None) or {})
+    if snapshot:
+        name = (snapshot.get("signature_name") or snapshot.get("display_name") or "").strip()
+        role = (snapshot.get("professional_role") or "").strip()
+        registration_number = (snapshot.get("registration_number") or "").strip()
+        registration_body = (snapshot.get("registration_body") or "").strip()
+        qualifications = (snapshot.get("qualifications") or "").strip()
+        return {
+            "name": name or "Signed clinician",
+            "role": role,
+            "registration_number": registration_number,
+            "registration_body": registration_body,
+            "qualifications": qualifications,
+        }
+
+    clinician = getattr(assessment, "completed_by", None)
+    name = (clinician.get_full_name() or clinician.username) if clinician else "Not yet signed"
+    return {
+        "name": name,
+        "role": "",
+        "registration_number": "",
+        "registration_body": "",
+        "qualifications": "",
+    }
+
 def build_ocular_report_pdf(assessment):
     encounter = assessment.encounter
     patient = encounter.patient
@@ -109,19 +143,29 @@ def build_ocular_report_pdf(assessment):
                 Spacer(1, 6),
             ])
 
-    clinician = assessment.completed_by
-    clinician_name = (
-        clinician.get_full_name() or clinician.username
-        if clinician else "Not yet signed"
+    signer = _signer_snapshot_details(assessment)
+    credential_parts = [
+        signer["role"],
+        (
+            f"{signer['registration_body']} {signer['registration_number']}".strip()
+            if signer["registration_body"]
+            else (f"Registration {signer['registration_number']}" if signer["registration_number"] else "")
+        ),
+        signer["qualifications"],
+    ]
+    credentials = " · ".join(part for part in credential_parts if part)
+    signoff_lines = [f"<b>{_text(signer['name'])}</b>"]
+    if credentials:
+        signoff_lines.append(_text(credentials))
+    signoff_lines.append(
+        "Electronically signed: " + _text(assessment.signed_at or assessment.completed_at)
+        if (assessment.signed_at or assessment.completed_at)
+        else "Draft report"
     )
     story.extend([
         Spacer(1, 6),
         Paragraph("Clinical sign-off", styles["ReportSection"]),
-        Paragraph(
-            f"<b>{_text(clinician_name)}</b><br/>"
-            f"{'Electronically completed: ' + _text(assessment.completed_at) if assessment.completed_at else 'Draft report'}",
-            styles["BodyText"],
-        ),
+        Paragraph("<br/>".join(signoff_lines), styles["BodyText"]),
     ])
     footer = str(getattr(primary, "report_footer_note", "") or "").strip()
     if footer:

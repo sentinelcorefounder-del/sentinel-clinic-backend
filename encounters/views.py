@@ -1,4 +1,6 @@
 from decimal import Decimal
+import hashlib
+import json
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -24,6 +26,8 @@ from organizations.services.branches import (
 )
 from referrals.models import HospitalReferral
 from users.clinical_authority import exact_clinical_authority
+from reports.eye_health import professional_snapshot
+from reports.permissions import has_internal_ops_authority
 from users.models import UserOrganization
 from finance.models import (
     OrganizationWallet,
@@ -36,6 +40,7 @@ from consents.models import ConsentRecord
 from .models import (
     OcularAIReview,
     OcularDiagnosticAssessment,
+    OcularDiagnosticAssessmentVersion,
     OcularInvestigation,
     EncounterServicePackageEvent,
     ScreeningEncounter,
@@ -780,18 +785,110 @@ class OcularDiagnosticAssessmentDetailView(
 
     def perform_update(self, serializer):
         assessment = serializer.instance
-        if not assessment.encounter.includes_ocular_diagnostics:
+        encounter = assessment.encounter
+        if not encounter.includes_ocular_diagnostics:
             raise PermissionDenied(
                 "This encounter does not include ocular diagnostics."
             )
+        authority = exact_clinical_authority(self.request.user)
+        if not authority:
+            raise PermissionDenied("Exact optometrist or qualified reviewer authority is required.")
+        clinic = encounter.patient.assigned_clinic
+        user_clinic = get_user_clinic(self.request.user)
+        if not clinic or not user_clinic or user_clinic.pk != clinic.pk:
+            raise PermissionDenied("The clinician is outside the performing clinic.")
+        branch = encounter.service_branch or encounter.patient.assigned_branch
+        if not branch or not self.request.user.branch_access.filter(
+            branch__organization=clinic
+        ).filter(Q(branch=branch) | Q(has_all_branch_access=True)).exists():
+            raise PermissionDenied("The clinician does not have access to the encounter branch.")
+        if assessment.report_status in {"awaiting_ops", "ops_approved", "issued"}:
+            raise PermissionDenied("This ocular report is locked while awaiting review or after issue.")
+
         complete = bool(self.request.data.get("mark_complete", False))
-        had_ai_review = assessment.encounter.ocular_ai_reviews.exists()
+        had_ai_review = encounter.ocular_ai_reviews.exists()
         previous_impression = assessment.impression
         previous_management = assessment.management_plan
-        serializer.save(
-            completed_at=timezone.now() if complete else assessment.completed_at,
-            completed_by=self.request.user if complete else assessment.completed_by,
-        )
+        serializer.save()
+        assessment.refresh_from_db()
+
+        if complete:
+            if not assessment.impression.strip() or not assessment.management_plan.strip() or not assessment.management_outcome:
+                raise ValidationError("Clinical impression, management plan and outcome are required before sign-off.")
+            clinician = professional_snapshot(self.request.user, authority)
+            clinician.update({
+                "clinic_id": clinic.pk, "clinic_name": clinic.name,
+                "branch_id": branch.pk, "branch_name": branch.name,
+            })
+            clinical_snapshot = {
+                "presenting_complaint": assessment.presenting_complaint,
+                "ocular_history": assessment.ocular_history,
+                "anterior_eye_findings": assessment.anterior_eye_findings,
+                "fundus_findings": assessment.fundus_findings,
+                "visual_field_summary": assessment.visual_field_summary,
+                "tonometry_summary": assessment.tonometry_summary,
+                "impression": assessment.impression,
+                "management_plan": assessment.management_plan,
+                "management_outcome": assessment.management_outcome,
+                "report_layout": assessment.report_layout,
+                "selected_fundus_upload_ids": list(assessment.selected_fundus_upload_ids or []),
+                "selected_ocular_investigation_ids": list(assessment.selected_ocular_investigation_ids or []),
+                "attachment_captions": dict(assessment.attachment_captions or {}),
+            }
+            checksum = hashlib.sha256(
+                json.dumps({"clinical": clinical_snapshot, "clinician": clinician}, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            now = timezone.now()
+            version = OcularDiagnosticAssessmentVersion.objects.create(
+                assessment=assessment,
+                version_number=assessment.versions.count() + 1,
+                clinical_snapshot=clinical_snapshot,
+                clinician_snapshot=clinician,
+                checksum_sha256=checksum,
+                signed_by=self.request.user,
+                signed_at=now,
+            )
+            requires_ops = bool(getattr(encounter, "hospital_referral_id", None))
+            assessment.completed_at = now
+            assessment.completed_by = self.request.user
+            assessment.signed_at = now
+            assessment.signed_by = self.request.user
+            assessment.signer_snapshot = clinician
+            assessment.current_version = version
+            assessment.ops_review_note = ""
+            if requires_ops:
+                assessment.report_status = "awaiting_ops"
+                assessment.submitted_to_ops_at = now
+                assessment.submitted_to_ops_by = self.request.user
+                assessment.issued_at = None
+                assessment.issued_by = None
+            else:
+                assessment.report_status = "issued"
+                assessment.issued_at = now
+                assessment.issued_by = self.request.user
+                assessment.submitted_to_ops_at = None
+                assessment.submitted_to_ops_by = None
+            assessment.save(update_fields=[
+                "completed_at", "completed_by", "signed_at", "signed_by",
+                "signer_snapshot", "current_version", "report_status",
+                "submitted_to_ops_at", "submitted_to_ops_by", "ops_review_note",
+                "issued_at", "issued_by", "updated_at",
+            ])
+            record_patient_event(
+                patient=encounter.patient,
+                event_key=f"encounter:{encounter.pk}:ocular-report-signed:v{version.version_number}",
+                category="encounter", event_type="ocular_report_signed",
+                title="Ocular report signed",
+                description=(
+                    "Ocular report signed and submitted for Ops review." if requires_ops
+                    else "Ocular report signed and issued directly by the clinic."
+                ),
+                source_type="encounter", source_id=encounter.pk,
+                encounter_id=encounter.encounter_id, actor=self.request.user,
+                organization=clinic, visibility="clinic_ops",
+                metadata={"version": version.version_number, "report_status": assessment.report_status},
+            )
+
         assessment.refresh_from_db()
         if had_ai_review and (
             assessment.impression != previous_impression
@@ -825,6 +922,64 @@ class OcularDiagnosticAssessmentDetailView(
             )
         if complete:
             assessment.encounter.update_status_from_related_records()
+
+
+class OcularDiagnosticAssessmentOpsReviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, encounter_id):
+        if not has_internal_ops_authority(request.user):
+            raise PermissionDenied("Exact Sentinel Ops authority is required.")
+        assessment = get_object_or_404(
+            OcularDiagnosticAssessment.objects.select_for_update(of=("self",)).select_related(
+                "encounter__patient__assigned_clinic", "encounter__hospital_referral", "current_version"
+            ),
+            encounter_id=encounter_id,
+        )
+        if not assessment.encounter.hospital_referral_id:
+            return Response({"detail": "Clinic-direct ocular reports do not require Ops review."}, status=400)
+        if assessment.report_status != "awaiting_ops" or not assessment.current_version_id:
+            return Response({"detail": "Only a signed ocular report awaiting Ops review can be reviewed."}, status=409)
+        decision = str(request.data.get("decision") or "").strip().lower()
+        note = str(request.data.get("note") or "").strip()
+        if decision not in {"approve", "return"}:
+            return Response({"detail": "Decision must be approve or return."}, status=400)
+        now = timezone.now()
+        assessment.ops_reviewed_at = now
+        assessment.ops_reviewed_by = request.user
+        assessment.ops_review_note = note
+        if decision == "approve":
+            assessment.report_status = "issued"
+            assessment.issued_at = now
+            assessment.issued_by = request.user
+            event_type = "ocular_report_ops_approved"
+            title = "Ocular report approved by Ops"
+        else:
+            if not note:
+                return Response({"detail": "A return note is required."}, status=400)
+            assessment.report_status = "returned_to_clinic"
+            assessment.completed_at = None
+            assessment.completed_by = None
+            assessment.issued_at = None
+            assessment.issued_by = None
+            event_type = "ocular_report_returned"
+            title = "Ocular report returned for correction"
+        assessment.save(update_fields=[
+            "report_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "completed_at", "completed_by", "issued_at", "issued_by", "updated_at",
+        ])
+        record_patient_event(
+            patient=assessment.encounter.patient,
+            event_key=f"encounter:{assessment.encounter.pk}:ocular-ops:{assessment.current_version_id}:{decision}",
+            category="encounter", event_type=event_type, title=title,
+            description=note or title, source_type="encounter",
+            source_id=assessment.encounter.pk, encounter_id=assessment.encounter.encounter_id,
+            actor=request.user, organization=assessment.encounter.patient.assigned_clinic,
+            visibility="clinic_ops", metadata={"decision": decision, "version_id": assessment.current_version_id},
+        )
+        assessment.encounter.update_status_from_related_records()
+        return Response(OcularDiagnosticAssessmentSerializer(assessment, context={"request": request}).data)
 
 
 class OcularDiagnosticAssessmentPDFView(APIView):

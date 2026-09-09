@@ -19,7 +19,11 @@ from reports.clinical_integrity import (
     snapshot_checksum,
 )
 from reports.models import ReportStatusEvent, StructuredReport, StructuredReportVersion
-from users.models import UserBranchAccess, UserOrganization
+from users.models import (
+    ClinicalProfessionalProfile,
+    UserBranchAccess,
+    UserOrganization,
+)
 
 
 class RetinalReportClinicalIntegrityMigrationTests(SimpleTestCase):
@@ -66,6 +70,16 @@ class RetinalReportClinicalIntegrityTests(TestCase):
         )
         self.admin = self.user("admin", {"clinic_admin"}, self.clinic, self.branch)
         self.optometrist = self.user("opto", {"optometrist"}, self.clinic, self.branch)
+        ClinicalProfessionalProfile.objects.create(
+            user=self.optometrist,
+            display_name="Dr Synthetic",
+            professional_role="Optometrist",
+            registration_number="OD-SYNTH-1",
+            registration_body="Test Registration Body",
+            qualifications="Optometrist",
+            signature_name="Dr Synthetic",
+            is_verified=True,
+        )
         self.master = self.user(
             "master", {"clinic_admin", "optometrist"}, self.clinic, self.branch
         )

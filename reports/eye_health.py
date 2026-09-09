@@ -241,7 +241,9 @@ def professional_snapshot(user, authority):
         "display_name": profile.display_name.strip(),
         "professional_role": profile.professional_role.strip(),
         "registration_number": profile.registration_number.strip(),
+        "registration_body": profile.registration_body.strip(),
         "qualifications": profile.qualifications.strip(),
+        "signature_name": (profile.signature_name or profile.display_name).strip(),
         "authority_used": authority,
     }
     if not all(values[key] for key in ("display_name", "professional_role", "registration_number")):
@@ -503,8 +505,13 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         Paragraph(_display(snapshot["limitation"]), small), Spacer(1, 4*mm),
         Paragraph("Responsible clinician and credentials", styles["Heading2"]),
         Paragraph(_display(
-            f"{snapshot['clinician']['display_name']} · {snapshot['clinician']['professional_role']} · "
-            f"Registration {snapshot['clinician']['registration_number']}"
+            f"{snapshot['clinician'].get('signature_name') or snapshot['clinician']['display_name']} · "
+            f"{snapshot['clinician']['professional_role']} · "
+            + (
+                f"{snapshot['clinician'].get('registration_body')} {snapshot['clinician']['registration_number']}"
+                if snapshot['clinician'].get('registration_body')
+                else f"Registration {snapshot['clinician']['registration_number']}"
+            )
             + (f" · {snapshot['clinician']['qualifications']}" if snapshot['clinician'].get('qualifications') else "")
         ), styles["BodyText"]),
     ])
@@ -650,13 +657,38 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
     EyeHealthScreeningReportVersion.objects.filter(pk=version.pk).update(
         pdf_object_key=key, pdf_checksum_sha256=pdf_checksum, pdf_size=len(pdf)
     )
+    now = timezone.now()
+    requires_ops = bool(report.encounter.hospital_referral_id)
     report.status = report.Status.FINALIZED
     report.finalized_version = version
+    report.signed_by = user
+    report.signed_at = now
     report.correction_reason = ""
     report.correction_source_version = None
+    if requires_ops:
+        report.review_status = report.ReviewStatus.AWAITING_OPS
+        report.submitted_to_ops_at = now
+        report.submitted_to_ops_by = user
+        report.ops_reviewed_at = None
+        report.ops_reviewed_by = None
+        report.ops_review_note = ""
+        report.issued_at = None
+        report.issued_by = None
+    else:
+        report.review_status = report.ReviewStatus.NOT_REQUIRED
+        report.submitted_to_ops_at = None
+        report.submitted_to_ops_by = None
+        report.ops_reviewed_at = None
+        report.ops_reviewed_by = None
+        report.ops_review_note = ""
+        report.issued_at = now
+        report.issued_by = user
     report.lock_version += 1
     report.save(update_fields=[
-        "status", "finalized_version", "correction_reason",
+        "status", "finalized_version", "signed_by", "signed_at",
+        "review_status", "submitted_to_ops_at", "submitted_to_ops_by",
+        "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+        "issued_at", "issued_by", "correction_reason",
         "correction_source_version", "lock_version", "updated_at",
     ])
     report.encounter.update_status_from_related_records()

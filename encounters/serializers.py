@@ -102,11 +102,19 @@ class OcularDiagnosticAssessmentSerializer(serializers.ModelSerializer):
             "report_layout", "selected_fundus_upload_ids",
             "selected_ocular_investigation_ids", "attachment_captions",
             "completed_at", "completed_by", "completed_by_display",
+            "report_status", "signed_at", "signed_by", "signer_snapshot",
+            "submitted_to_ops_at", "submitted_to_ops_by",
+            "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "issued_at", "issued_by", "current_version",
             "created_at", "updated_at",
         ]
         read_only_fields = [
             "encounter", "completed_at", "completed_by",
-            "completed_by_display", "created_at", "updated_at",
+            "completed_by_display", "report_status", "signed_at", "signed_by",
+            "signer_snapshot", "submitted_to_ops_at", "submitted_to_ops_by",
+            "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "issued_at", "issued_by", "current_version",
+            "created_at", "updated_at",
         ]
 
     def get_completed_by_display(self, obj):

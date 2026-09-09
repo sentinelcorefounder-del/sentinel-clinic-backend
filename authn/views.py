@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.tenant import get_user_organization
-from users.models import UserSecurityProfile
+from users.models import ClinicalProfessionalProfile, UserSecurityProfile
 
 
 def get_user_role_names(user):
@@ -46,6 +46,7 @@ def serialize_user(user):
         "is_internal_sentinel_staff": profile.is_internal_sentinel_staff,
         "roles": get_user_role_names(user),
         "can_access_ops": user.is_superuser or "ops_admin" in get_user_role_names(user) or "sentinel_ops" in get_user_role_names(user),
+        "clinical_profile": serialize_clinical_profile(user),
         "organization": {
             "id": org.id,
             "name": org.name,
@@ -56,6 +57,63 @@ def serialize_user(user):
             "is_sentinel_internal": org.organization_type == "sentinel",
         } if org else None,
     }
+
+
+
+def serialize_clinical_profile(user):
+    profile = getattr(user, "clinical_professional_profile", None)
+    if not profile:
+        return None
+    return {
+        "display_name": profile.display_name,
+        "professional_role": profile.professional_role,
+        "registration_number": profile.registration_number,
+        "registration_body": profile.registration_body,
+        "qualifications": profile.qualifications,
+        "signature_name": profile.signature_name or profile.display_name,
+        "is_verified": profile.is_verified,
+        "verified_at": profile.verified_at,
+        "updated_at": profile.updated_at,
+    }
+
+
+class ClinicalProfessionalProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+    editable_fields = (
+        "display_name", "professional_role", "registration_number",
+        "registration_body", "qualifications", "signature_name",
+    )
+
+    def get(self, request):
+        return Response({"clinical_profile": serialize_clinical_profile(request.user)})
+
+    def patch(self, request):
+        profile, _ = ClinicalProfessionalProfile.objects.get_or_create(
+            user=request.user,
+            defaults={
+                "display_name": request.user.get_full_name() or request.user.username,
+                "professional_role": "",
+                "registration_number": "",
+            },
+        )
+        changed_material = False
+        for field in self.editable_fields:
+            if field not in request.data:
+                continue
+            value = str(request.data.get(field) or "").strip()
+            if getattr(profile, field) != value:
+                setattr(profile, field, value)
+                changed_material = True
+        if not profile.display_name or not profile.professional_role or not profile.registration_number:
+            return Response(
+                {"detail": "Display name, professional role and registration number are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if changed_material and profile.is_verified:
+            profile.is_verified = False
+            profile.verified_at = None
+        profile.save()
+        return Response({"clinical_profile": serialize_clinical_profile(request.user)})
 
 
 class LoginView(APIView):

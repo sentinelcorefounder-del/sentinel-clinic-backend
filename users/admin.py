@@ -22,6 +22,6 @@ class UserSecurityProfileAdmin(admin.ModelAdmin):
 
 @admin.register(ClinicalProfessionalProfile)
 class ClinicalProfessionalProfileAdmin(admin.ModelAdmin):
-    list_display = ("user", "display_name", "professional_role", "registration_number", "is_verified")
+    list_display = ("user", "display_name", "professional_role", "registration_body", "registration_number", "is_verified")
     list_filter = ("is_verified",)
     search_fields = ("user__username", "user__email", "display_name", "registration_number")

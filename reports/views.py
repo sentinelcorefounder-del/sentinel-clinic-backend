@@ -37,6 +37,7 @@ from .clinical_integrity import (
     expected_version,
     latest_version,
     require_responsible_clinician,
+    sync_responsibility_to_verified_profile,
 )
 from .clinical_wording import apply_generated_wording
 from .recall_services import apply_recall_schedule
@@ -699,6 +700,9 @@ def submit_report_to_ops(request, pk):
             raise Http404("Report not found.")
         assert_expected(report, expected_version(request.data))
         responsibility, authority = require_responsible_clinician(request.user, report)
+        signer_profile = sync_responsibility_to_verified_profile(
+            responsibility, user=request.user, authority=authority
+        )
         if report.encounter.workflow_route != "sentinel_managed":
             return Response({"detail": "This is a Clinic Managed assessment. Use Sign and Issue Report instead."}, status=status.HTTP_400_BAD_REQUEST)
         if report.report_status not in {"draft", "under_review", "ops_rejected", "returned_to_clinic"}:
@@ -718,17 +722,32 @@ def submit_report_to_ops(request, pk):
         prior = ReportStatusEvent.objects.filter(report=report, idempotency_key=key).first()
         if prior:
             return Response(StructuredReportSerializer(report, context={"request": request}).data)
+        signed_at = timezone.now()
+        report.signed_by = request.user
+        report.signed_at = signed_at
+        report.signer_name = signer_profile["signature_name"]
+        report.signer_role = signer_profile["professional_role"]
+        report.signer_registration_number = signer_profile["registration_number"]
         report.report_status = "submitted_to_ops"
-        report.submitted_to_ops_at = timezone.now()
+        report.submitted_to_ops_at = signed_at
         report.submitted_to_ops_by = request.user
         report.submitted_version = version
         if is_resubmission:
             report.resubmission_count += 1
         report.lock_version += 1
         report.save(update_fields=[
-            "report_status", "submitted_to_ops_at", "submitted_to_ops_by",
-            "submitted_version", "resubmission_count", "lock_version", "updated_at",
+            "signed_by", "signed_at", "signer_name", "signer_role",
+            "signer_registration_number", "report_status", "submitted_to_ops_at",
+            "submitted_to_ops_by", "submitted_version", "resubmission_count",
+            "lock_version", "updated_at",
         ])
+        event_once(
+            report=report, event_type="clinician_signed", actor=request.user,
+            from_status=previous_status, to_status="submitted_to_ops",
+            source_version=version, target_version=version, authority_used=authority,
+            note=f"Report electronically signed by {responsibility.clinician_name} before Ops review.",
+            idempotency_key=f"clinician-sign:{version.pk}:{report.lock_version}",
+        )
         event_once(
             report=report, event_type="resubmitted" if is_resubmission else "submitted_to_ops",
             actor=request.user, from_status=previous_status, to_status="submitted_to_ops",
@@ -767,20 +786,30 @@ def clinic_issue_report(request, pk):
             if not report:
                 raise Http404("Report not found.")
             assert_expected(report, expected_version(request.data))
-            responsibility, authority = require_responsible_clinician(request.user, report)
+
             clinic = report.patient.assigned_clinic
+
             if report.encounter.workflow_route != "clinic_managed":
-                return Response({"detail": "Only Clinic Managed assessments can be issued directly by the clinic."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"detail": "Only Clinic Managed assessments can be issued directly by the clinic."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             profile, _ = OrganizationProfile.objects.get_or_create(organization=clinic)
             if not profile.can_issue_reports_directly:
                 raise PermissionDenied("This clinic is not permitted to issue reports directly.")
+
+            responsibility, authority = require_responsible_clinician(request.user, report)
+            signer_profile = sync_responsibility_to_verified_profile(
+                responsibility,
+                user=request.user,
+                authority=authority,
+            )
             if report.report_status not in {"draft", "under_review", "returned_to_clinic", "ops_rejected"}:
                 return Response({"detail": f"Only an editable report can be issued. Current status: {report.report_status}"}, status=status.HTTP_400_BAD_REQUEST)
-            signer_name = (request.data.get("signer_name") or responsibility.clinician_name).strip()
-            signer_role = (request.data.get("signer_role") or responsibility.professional_role).strip()
-            signer_registration_number = (request.data.get("signer_registration_number") or responsibility.registration_number).strip()
-            if not signer_name or not signer_role or not signer_registration_number:
-                return Response({"detail": "Complete clinician name, role and registration number are required."}, status=status.HTTP_400_BAD_REQUEST)
+            signer_name = signer_profile["signature_name"]
+            signer_role = signer_profile["professional_role"]
+            signer_registration_number = signer_profile["registration_number"]
             StructuredReportRulesMixin()._validate_report_can_be_clinic_issued(report)
             issued_version = latest_version(report)
             if not issued_version:
@@ -1119,12 +1148,125 @@ class EyeHealthScreeningCorrectionView(APIView):
         report.correction_source_version = report.finalized_version
         report.preview_checksum = ""
         report.previewed_at = None
+        if getattr(report.encounter, "hospital_referral_id", None):
+            report.review_status = report.ReviewStatus.RETURNED_TO_CLINIC
+        else:
+            report.review_status = report.ReviewStatus.DRAFT
+        report.ops_reviewed_at = None
+        report.ops_reviewed_by = None
+        report.ops_review_note = ""
+        report.issued_at = None
+        report.issued_by = None
         report.lock_version += 1
         report.save(update_fields=[
             "status", "correction_reason", "correction_source_version",
-            "preview_checksum", "previewed_at", "lock_version", "updated_at",
+            "preview_checksum", "previewed_at", "review_status",
+            "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "issued_at", "issued_by", "lock_version", "updated_at",
         ])
         report.encounter.update_status_from_related_records()
+        return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+
+
+class EyeHealthScreeningOpsApproveView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        if not has_internal_ops_authority(request.user):
+            raise PermissionDenied("Exact Sentinel Ops authority is required.")
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
+                "encounter__hospital_referral__source_hospital", "finalized_version", "signed_by",
+            ),
+            pk=pk,
+        )
+        if not report.encounter.hospital_referral_id:
+            return Response({"detail": "Clinic-direct reports do not require Ops review."}, status=400)
+        if report.status != report.Status.FINALIZED or not report.finalized_version_id:
+            return Response({"detail": "Only a clinician-finalized report can be approved."}, status=409)
+        if report.review_status == report.ReviewStatus.APPROVED:
+            return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+        if report.review_status not in {report.ReviewStatus.AWAITING_OPS, report.ReviewStatus.LEGACY}:
+            return Response({"detail": f"This report is not awaiting Ops review. Current review status: {report.review_status}."}, status=409)
+        if not (report.signed_by_id and report.signed_at and report.finalized_version.clinician_snapshot):
+            if report.review_status != report.ReviewStatus.LEGACY:
+                return Response({"detail": "The finalized report does not contain a complete clinician sign-off."}, status=409)
+        now = timezone.now()
+        report.review_status = report.ReviewStatus.APPROVED
+        report.ops_reviewed_at = now
+        report.ops_reviewed_by = request.user
+        report.ops_review_note = str(request.data.get("note") or "").strip()
+        report.issued_at = now
+        report.issued_by = request.user
+        report.lock_version += 1
+        report.save(update_fields=[
+            "review_status", "ops_reviewed_at", "ops_reviewed_by", "ops_review_note",
+            "issued_at", "issued_by", "lock_version", "updated_at",
+        ])
+        from ops.models import OpsAuditLog
+        OpsAuditLog.objects.create(
+            actor=request.user, action="report_approved",
+            entity_type="targeted_report", entity_id=str(report.pk),
+            entity_label=f"targeted_report:{report.pk}",
+            message="Clinician-signed targeted report approved by Sentinel Ops.",
+            metadata={
+                "report_version_id": report.finalized_version_id,
+                "clinical_signer_user_id": report.signed_by_id,
+                "review_note": report.ops_review_note,
+            },
+        )
+        return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
+
+
+class EyeHealthScreeningOpsReturnView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        if not has_internal_ops_authority(request.user):
+            raise PermissionDenied("Exact Sentinel Ops authority is required.")
+        reason = str(request.data.get("reason") or request.data.get("note") or "").strip()
+        if not reason:
+            return Response({"detail": "A return reason is required."}, status=400)
+        report = get_object_or_404(
+            EyeHealthScreeningReport.objects.select_for_update(of=("self",)).select_related(
+                "encounter__hospital_referral__source_hospital", "finalized_version",
+            ),
+            pk=pk,
+        )
+        if not report.encounter.hospital_referral_id:
+            return Response({"detail": "Clinic-direct reports do not require Ops review."}, status=400)
+        if report.status != report.Status.FINALIZED or not report.finalized_version_id:
+            return Response({"detail": "Only a clinician-finalized report can be returned."}, status=409)
+        if report.review_status not in {report.ReviewStatus.AWAITING_OPS, report.ReviewStatus.LEGACY}:
+            return Response({"detail": f"This report is not awaiting Ops review. Current review status: {report.review_status}."}, status=409)
+        report.status = report.Status.DRAFT
+        report.review_status = report.ReviewStatus.RETURNED_TO_CLINIC
+        report.correction_reason = reason
+        report.correction_source_version = report.finalized_version
+        report.preview_checksum = ""
+        report.previewed_at = None
+        report.ops_reviewed_at = timezone.now()
+        report.ops_reviewed_by = request.user
+        report.ops_review_note = reason
+        report.issued_at = None
+        report.issued_by = None
+        report.lock_version += 1
+        report.save(update_fields=[
+            "status", "review_status", "correction_reason", "correction_source_version",
+            "preview_checksum", "previewed_at", "ops_reviewed_at", "ops_reviewed_by",
+            "ops_review_note", "issued_at", "issued_by", "lock_version", "updated_at",
+        ])
+        report.encounter.update_status_from_related_records()
+        from ops.models import OpsAuditLog
+        OpsAuditLog.objects.create(
+            actor=request.user, action="report_returned",
+            entity_type="targeted_report", entity_id=str(report.pk),
+            entity_label=f"targeted_report:{report.pk}",
+            message="Targeted report returned to clinic for correction.",
+            metadata={"report_version_id": report.finalized_version_id, "reason": reason},
+        )
         return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
 
 
@@ -1206,6 +1348,11 @@ class EyeHealthScreeningReleaseView(APIView):
         referral = HospitalReferral.objects.select_for_update().get(pk=referral.pk)
         if report.hospital_released_version_id == report.finalized_version_id and report.hospital_released_at:
             return Response({"detail": "This exact targeted report version is already released.", "version": report.finalized_version_id})
+        if report.review_status != report.ReviewStatus.APPROVED:
+            return Response(
+                {"detail": "This clinician-signed targeted report requires Sentinel Ops approval before hospital release."},
+                status=409,
+            )
         try:
             capture_finance_for_hospital_publication(report.encounter, actor=request.user)
         except DjangoValidationError as exc:

@@ -26,8 +26,12 @@ from referrals.models import HospitalReferral
 from referrals.serializers import HospitalReferralSerializer
 from reports.clinical_integrity import accept_responsibility, create_version_if_changed
 from reports.models import ReportStatusEvent, StructuredReport, StructuredReportVersion
-from users.models import UserBranchAccess, UserOrganization, UserSecurityProfile
-
+from users.models import (
+    ClinicalProfessionalProfile,
+    UserBranchAccess,
+    UserOrganization,
+    UserSecurityProfile,
+)
 
 class ReleaseControlTestCase(TestCase):
     def setUp(self):
@@ -53,6 +57,16 @@ class ReleaseControlTestCase(TestCase):
         self.clinic_user = self.make_user("clinic-rc", "clinic_admin", self.clinic)
         self.clinic_user.groups.add(Group.objects.get_or_create(name="optometrist")[0])
         UserBranchAccess.objects.create(user=self.clinic_user, branch=self.branch, is_default=True)
+        ClinicalProfessionalProfile.objects.create(
+            user=self.clinic_user,
+            display_name="Dr Clinic",
+            professional_role="Optometrist",
+            registration_number="OD-RC-1",
+            registration_body="Test Registration Body",
+            qualifications="Optometrist",
+            signature_name="Dr Clinic",
+            is_verified=True,
+        )
         self.hospital_user = self.make_user("hospital-rc", "hospital_admin", self.hospital)
         self.other_hospital_user = self.make_user(
             "hospital-other", "hospital_admin", self.other_hospital
@@ -357,6 +371,9 @@ class ReleaseControlTestCase(TestCase):
         report.refresh_from_db()
         self.referral.refresh_from_db()
         self.assertEqual(report.report_status, "issued")
+        self.assertEqual(report.signed_by, self.clinic_user)
+        self.assertEqual(report.signer_name, "Dr Clinic")
+        self.assertNotEqual(report.signed_by, self.ops_user)
         self.assertEqual(report.distribution_status, "awaiting_distribution")
         self.assertIsNone(report.hospital_released_at)
         self.assertFalse(self.referral.report_ready)
