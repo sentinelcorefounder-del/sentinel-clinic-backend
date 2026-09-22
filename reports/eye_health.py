@@ -28,10 +28,10 @@ from .models import EyeHealthScreeningReport, EyeHealthScreeningReportVersion
 
 
 LIMITATION = (
-    "This was a targeted screening of visual acuity, eye pressure, visual fields and the retina/optic nerve. "
+    "This was a retinal and glaucoma-risk assessment using visual acuity, eye pressure, visual fields and retinal/optic-nerve assessment. "
     "It was not a comprehensive eye examination and did not include refraction, slit-lamp examination or a "
     "complete assessment of the cornea, lens and front of the eye. Cataract, corneal conditions and other eye "
-    "disorders may therefore not be detected. Screening findings do not confirm or exclude glaucoma. A routine "
+    "disorders may therefore not be detected. These assessment findings do not by themselves confirm or exclude glaucoma. A routine "
     "comprehensive eye examination remains advisable."
 )
 
@@ -47,16 +47,17 @@ def limitation_for_tests(tests):
     ]
     performed = ", ".join(labels[:-1]) + (" and " + labels[-1] if len(labels) > 1 else (labels[0] if labels else "limited recorded elements"))
     return (
-        f"This was a targeted screening of {performed}. It was not a comprehensive eye examination and did not "
+        f"This was a retinal and glaucoma-risk assessment using {performed}. It was not a complete sight test or comprehensive ophthalmic examination and did not "
         "include refraction, slit-lamp examination or a complete assessment of the cornea, lens and front of the eye. "
-        "Cataract, corneal conditions and other eye disorders may therefore not be detected. Screening findings do "
-        "not confirm or exclude glaucoma. A routine comprehensive eye examination remains advisable."
+        "Cataract, corneal conditions and other eye disorders may therefore not be detected. These assessment findings do "
+        "not by themselves confirm or exclude glaucoma. A routine comprehensive eye examination remains advisable."
     )
 EDITABLE_FIELDS = (
     "outcome", "selected_advice", "advice", "right_visual_field_result",
     "left_visual_field_result", "right_fundus_result", "left_fundus_result",
     "structured_findings", "clinical_summary",
     "selected_fundus_upload_ids", "selected_visual_field_investigation_ids",
+    "selected_ocular_investigation_ids",
 )
 
 STRUCTURED_OPTIONS = {
@@ -138,7 +139,7 @@ def generate_suggested_wording(value):
     findings = normalise_structured_findings(value)
     lines = []
     quality = {
-        "good": "The retinal photographs were of sufficient quality for the documented screening assessment.",
+        "good": "The retinal photographs were of sufficient quality for the documented assessment.",
         "mildly_limited": "The retinal photographs were mildly limited in quality. No immediate concern was identified within the visible areas, but subtle changes may not be detectable.",
         "significantly_limited": "The retinal photographs were significantly limited in quality, reducing confidence in the assessment. Further examination is advised.",
         "ungradable": "The retinal photographs could not be assessed reliably. Repeat imaging or direct clinical examination is required.",
@@ -181,12 +182,12 @@ def generate_suggested_wording(value):
             lines.append(f"The {label} visual-field result was inconclusive. Repeat testing is recommended.")
         elif result in {"within_expected_limits", "essentially_full"}:
             suffix = " Repeat testing is advised to confirm reproducibility." if ght == "borderline" else ""
-            lines.append(f"The {label} visual field was {result.replace('_', ' ')} on this screening assessment.{suffix}")
+            lines.append(f"The {label} visual field was {result.replace('_', ' ')} on this assessment.{suffix}")
     iop = {
-        "within_expected_range": "The recorded eye pressures were within the expected range at the time of screening. A single pressure measurement does not exclude glaucoma.",
+        "within_expected_range": "The recorded eye pressures were within the expected range at the time of assessment. A single pressure measurement does not exclude glaucoma.",
         "raised": "The recorded eye pressure was raised in one or both eyes. Further clinical assessment is recommended.",
         "asymmetrical": "A difference in pressure was recorded between the eyes. This should be interpreted alongside optic-disc appearance, visual fields and a comprehensive examination.",
-        "unavailable": "Eye-pressure measurements were unavailable for this screening assessment.",
+        "unavailable": "Eye-pressure measurements were unavailable for this assessment.",
     }.get(findings.get("iop_interpretation"))
     if iop:
         lines.append(iop)
@@ -205,9 +206,9 @@ def generate_suggested_wording(value):
     interpretation = {
         "no_immediate_concern": "No immediate concern was identified within the areas assessed.",
         "possible_physiological_cupping": "Possible physiological optic-disc cupping was identified; correlation with a comprehensive examination is advised.",
-        "glaucoma_risk_features": "Glaucoma-risk features were identified. This screening does not confirm glaucoma, and further assessment is recommended.",
+        "glaucoma_risk_features": "Glaucoma-risk features were identified. This assessment does not by itself confirm glaucoma, and further assessment is recommended.",
         "further_assessment": "Further assessment is recommended.", "urgent_ophthalmology": "Urgent ophthalmology assessment is recommended.",
-        "inconclusive_repeat": "The screening result was inconclusive and repeat testing is required.",
+        "inconclusive_repeat": "The assessment result was inconclusive and repeat testing is required.",
     }.get(findings.get("clinical_interpretation"))
     if interpretation:
         lines.append(interpretation)
@@ -254,11 +255,13 @@ def professional_snapshot(user, authority):
 def _attachment_manifest(report):
     encounter = report.encounter
     fundus_ids = list(report.selected_fundus_upload_ids or [])
-    visual_field_ids = list(report.selected_visual_field_investigation_ids or [])
+    legacy_visual_field_ids = list(report.selected_visual_field_investigation_ids or [])
+    selected_investigation_ids = list(report.selected_ocular_investigation_ids or [])
+    investigation_ids = list(dict.fromkeys(legacy_visual_field_ids + selected_investigation_ids))
     if len(fundus_ids) > 2:
         raise ValidationError("Select no more than one fundus image per eye.")
-    if len(visual_field_ids) > 10:
-        raise ValidationError("Select no more than ten visual-field PDF attachments.")
+    if len(investigation_ids) > 12:
+        raise ValidationError("Select no more than twelve supporting investigation attachments.")
     fundus = {item.pk: item for item in encounter.image_uploads.filter(pk__in=fundus_ids)}
     if len(fundus) != len(set(fundus_ids)):
         raise ValidationError("Every selected fundus image must belong to this encounter.")
@@ -267,11 +270,11 @@ def _attachment_manifest(report):
         raise ValidationError("Select no more than one fundus image for each eye.")
     investigations = {
         item.pk: item for item in encounter.ocular_investigations.filter(
-            pk__in=visual_field_ids, investigation_type="visual_field"
+            pk__in=investigation_ids, investigation_type__in=["visual_field", "oct", "other"]
         )
     }
-    if len(investigations) != len(set(visual_field_ids)):
-        raise ValidationError("Every selected visual-field PDF must belong to this encounter.")
+    if len(investigations) != len(set(investigation_ids)):
+        raise ValidationError("Every selected investigation must belong to this encounter and be eligible for this assessment report.")
     manifest = []
     for item_id in fundus_ids:
         item = fundus[item_id]
@@ -284,33 +287,47 @@ def _attachment_manifest(report):
             "checksum_sha256": fundus_checksum,
         })
     total_pdf_pages = 0
-    for item_id in visual_field_ids:
+    for item_id in investigation_ids:
         item = investigations[item_id]
         with open_ocular_investigation(item, "rb") as source:
             content = source.read()
-        if not content.startswith(b"%PDF-"):
-            raise ValidationError(f"Selected visual-field attachment {item.investigation_id} is not a readable PDF.")
-        try:
-            reader = PdfReader(BytesIO(content), strict=True)
-            page_count = len(reader.pages)
-            if page_count < 1:
-                raise ValueError("empty PDF")
-        except Exception as exc:
-            raise ValidationError(
-                f"Selected visual-field attachment {item.investigation_id} is unreadable."
-            ) from exc
-        total_pdf_pages += page_count
-        if total_pdf_pages > 100:
-            raise ValidationError("Selected visual-field attachments exceed the 100-page report limit.")
+        if not content:
+            raise ValidationError(f"Selected investigation {item.investigation_id} is empty.")
+        page_count = 0
+        is_pdf = content.startswith(b"%PDF-")
+        if is_pdf:
+            try:
+                reader = PdfReader(BytesIO(content), strict=True)
+                page_count = len(reader.pages)
+                if page_count < 1:
+                    raise ValueError("empty PDF")
+            except Exception as exc:
+                raise ValidationError(
+                    f"Selected investigation {item.investigation_id} is unreadable."
+                ) from exc
+            total_pdf_pages += page_count
+            if total_pdf_pages > 100:
+                raise ValidationError("Selected investigation attachments exceed the 100-page report limit.")
         content_checksum = hashlib.sha256(content).hexdigest()
         if item.content_sha256 and item.content_sha256 != content_checksum:
             raise ValidationError(
-                f"Selected visual-field attachment {item.investigation_id} failed its integrity check."
+                f"Selected investigation {item.investigation_id} failed its integrity check."
             )
+        # Preserve the legacy visual-field manifest kind for reports that still use
+        # selected_visual_field_investigation_ids. New portfolio-aware selections
+        # use the generic investigation kind. This keeps existing immutable-version
+        # and compatibility expectations intact while supporting OCT/other assets.
+        manifest_kind = (
+            "visual_field_pdf"
+            if item_id in legacy_visual_field_ids and item.investigation_type == "visual_field"
+            else "investigation"
+        )
         manifest.append({
-            "kind": "visual_field_pdf", "id": item.pk, "laterality": item.laterality,
+            "kind": manifest_kind, "id": item.pk, "laterality": item.laterality,
+            "investigation_type": item.investigation_type,
             "checksum_sha256": content_checksum,
             "page_count": page_count,
+            "is_pdf": is_pdf,
         })
     return manifest, fundus, investigations
 
@@ -327,7 +344,9 @@ def screening_snapshot(report, clinician):
             or encounter.left_corrected_pinhole_va or encounter.left_unaided_va or encounter.visual_acuity_left
         ),
         "iop": bool(encounter.iop_before_dilation_left or encounter.iop_before_dilation_right or encounter.iop_after_dilation_left or encounter.iop_after_dilation_right),
-        "visual_fields": bool(report.right_visual_field_result or report.left_visual_field_result or report.selected_visual_field_investigation_ids),
+        "visual_fields": bool(report.right_visual_field_result or report.left_visual_field_result or report.selected_visual_field_investigation_ids or any(
+            item.investigation_type == "visual_field" for item in report.encounter.ocular_investigations.filter(pk__in=(report.selected_ocular_investigation_ids or []))
+        )),
         "fundus": bool(report.right_fundus_result or report.left_fundus_result or report.selected_fundus_upload_ids),
     }
     snapshot = {
@@ -438,7 +457,7 @@ def build_screening_pdf(report, snapshot, audience="patient"):
     story = [
         header,
         Paragraph(
-            "Targeted Retinal and Glaucoma-Risk Screening Report"
+            "Retinal and Glaucoma-Risk Assessment Report"
             + (" — Clinician Report" if audience == "clinician" else ""),
             title,
         ), Spacer(1, 5*mm),
@@ -459,14 +478,90 @@ def build_screening_pdf(report, snapshot, audience="patient"):
             ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("VALIGN", (0,0), (-1,-1), "TOP"),
             ("FONTSIZE", (0,0), (-1,-1), 8.5),
         ])), Spacer(1, 4*mm),
-        Paragraph("What the screening showed", styles["Heading2"]),
+        Paragraph("Assessment summary", styles["Heading2"]),
         Paragraph(_display(snapshot["clinical_summary"]), styles["BodyText"]),
-        Paragraph("Outcome", styles["Heading2"]),
-        Paragraph(_display(snapshot["outcome_display"]), styles["BodyText"]),
-        Paragraph("Recommended next steps", styles["Heading2"]), Paragraph(_display(snapshot["advice"]), styles["BodyText"]),
     ]
+    findings = snapshot.get("structured_findings") or {}
+    retinal_parts = []
+    quality_text = {
+        "good": "Retinal photographs were of sufficient quality for assessment.",
+        "mildly_limited": "Retinal photographs were mildly limited in quality.",
+        "significantly_limited": "Retinal photographs were significantly limited in quality.",
+        "ungradable": "Retinal photographs were not reliably gradable.",
+    }.get(findings.get("fundus_quality"))
+    if quality_text:
+        retinal_parts.append(quality_text)
+    retinal_labels = {
+        "no_concerning_feature": "No concerning retinal vascular feature was identified.",
+        "av_nicking": "Arteriovenous nicking was observed.",
+        "vascular_attenuation": "Generalized retinal vascular attenuation was observed.",
+        "no_visible_abnormality": "No visible retinal or macular abnormality was identified within the photographed area.",
+        "retinal_haemorrhage": "A retinal haemorrhage was observed.",
+        "retinal_exudate": "Retinal exudate was observed.",
+        "cotton_wool_spot": "A cotton-wool spot was observed.",
+        "macular_concern": "A macular concern was observed and further assessment is recommended.",
+    }
+    for key in findings.get("retinal_vessels", []) + findings.get("retina_macula", []):
+        if key in retinal_labels:
+            retinal_parts.append(retinal_labels[key])
+    for key in ("retinal_vessels_other", "retina_macula_other"):
+        if findings.get(key):
+            retinal_parts.append(str(findings[key]))
+
+    glaucoma_parts = []
+    disc_labels = {
+        "no_concerning_feature": "No concerning optic-disc feature was identified on the available photographs.",
+        "symmetrical_cupping": "The optic nerves show broadly symmetrical cupping.",
+        "asymmetrical_cupping": "Optic-disc cupping is asymmetrical between the eyes.",
+        "possible_physiological_cupping": "The disc appearance may represent physiological cupping.",
+        "rim_thinning_notching": "Rim thinning or notching was observed.",
+        "disc_haemorrhage": "An optic-disc haemorrhage was observed.",
+    }
+    for key in findings.get("optic_disc", []):
+        if key in disc_labels:
+            glaucoma_parts.append(disc_labels[key])
+    if findings.get("optic_disc_other"):
+        glaucoma_parts.append(str(findings["optic_disc_other"]))
+    for eye, eye_label in (("right", "Right"), ("left", "Left")):
+        field = findings.get(eye) or {}
+        result = str(field.get("visual_field_result") or "").replace("_", " ")
+        reliability = str(field.get("visual_field_reliability") or "").replace("_", " ")
+        if result and result != "not performed":
+            glaucoma_parts.append(f"{eye_label} visual field: {result}" + (f" ({reliability})" if reliability else "") + ".")
+    iop_text = {
+        "within_expected_range": "Recorded intraocular pressures were within the expected range.",
+        "raised": "Raised intraocular pressure was recorded in one or both eyes.",
+        "asymmetrical": "An asymmetry in intraocular pressure was recorded.",
+        "unavailable": "Intraocular-pressure measurements were unavailable.",
+    }.get(findings.get("iop_interpretation"))
+    if iop_text:
+        glaucoma_parts.append(iop_text)
+    elif findings.get("iop_other"):
+        glaucoma_parts.append(str(findings["iop_other"]))
+
+    if audience == "patient":
+        story.extend([
+            Paragraph("What we found in the retina", styles["Heading2"]),
+            Paragraph(_display(" ".join(retinal_parts) or "No separate retinal finding was recorded beyond the assessment summary."), styles["BodyText"]),
+            Paragraph("What we found relating to glaucoma risk", styles["Heading2"]),
+            Paragraph(_display(" ".join(glaucoma_parts) or "No separate glaucoma-risk finding was recorded beyond the assessment summary."), styles["BodyText"]),
+            Paragraph("What this means", styles["Heading2"]),
+            Paragraph(_display(snapshot["outcome_display"]), styles["BodyText"]),
+            Paragraph("What happens next", styles["Heading2"]),
+            Paragraph(_display(snapshot["advice"]), styles["BodyText"]),
+        ])
+    else:
+        story.extend([
+            Paragraph("Retinal assessment", styles["Heading2"]),
+            Paragraph(_display(" ".join(retinal_parts) or "No separate retinal finding was recorded beyond the assessment summary."), styles["BodyText"]),
+            Paragraph("Glaucoma-risk assessment", styles["Heading2"]),
+            Paragraph(_display(" ".join(glaucoma_parts) or "No separate glaucoma-risk finding was recorded beyond the assessment summary."), styles["BodyText"]),
+            Paragraph("Overall clinical impression", styles["Heading2"]),
+            Paragraph(_display(snapshot["outcome_display"]), styles["BodyText"]),
+            Paragraph("Management and recommended next steps", styles["Heading2"]),
+            Paragraph(_display(snapshot["advice"]), styles["BodyText"]),
+        ])
     if audience == "clinician":
-        findings = snapshot.get("structured_findings") or {}
         detail_rows = [["Clinical detail", "Right eye", "Left eye"]]
         right, left = findings.get("right") or {}, findings.get("left") or {}
         for key, label in (
@@ -501,19 +596,14 @@ def build_screening_pdf(report, snapshot, audience="patient"):
             ])), Spacer(1, 3*mm),
         ])
     story.extend([
-        Paragraph("Screening limitation", styles["Heading2"]),
+        Paragraph("Assessment scope and limitations", styles["Heading2"]),
         Paragraph(_display(snapshot["limitation"]), small), Spacer(1, 4*mm),
-        Paragraph("Responsible clinician and credentials", styles["Heading2"]),
-        Paragraph(_display(
-            f"{snapshot['clinician'].get('signature_name') or snapshot['clinician']['display_name']} · "
-            f"{snapshot['clinician']['professional_role']} · "
-            + (
-                f"{snapshot['clinician'].get('registration_body')} {snapshot['clinician']['registration_number']}"
-                if snapshot['clinician'].get('registration_body')
-                else f"Registration {snapshot['clinician']['registration_number']}"
-            )
-            + (f" · {snapshot['clinician']['qualifications']}" if snapshot['clinician'].get('qualifications') else "")
-        ), styles["BodyText"]),
+        Paragraph("Responsible clinician", styles["Heading2"]),
+        Paragraph(_display(snapshot["clinician"].get("signature_name") or snapshot["clinician"].get("display_name")), styles["BodyText"]),
+        Paragraph(_display(snapshot["clinician"].get("professional_role")), styles["BodyText"]),
+        Paragraph(_display(snapshot["clinician"].get("registration_body") or "Registration body not recorded"), styles["BodyText"]),
+        Paragraph(_display(f"Registration number: {snapshot['clinician'].get('registration_number') or 'Not recorded'}"), styles["BodyText"]),
+        *([Paragraph(_display(f"Qualifications: {snapshot['clinician'].get('qualifications')}"), styles["BodyText"])] if snapshot["clinician"].get("qualifications") else []),
     ])
     if footer:
         story.extend([Spacer(1, 4*mm), Paragraph(_display(footer), small)])
@@ -564,30 +654,74 @@ def _draft_overlay(page):
 
 def _version_assets(report, manifest):
     fundus_ids = [item["id"] for item in manifest if item.get("kind") == "fundus"]
-    visual_field_ids = [item["id"] for item in manifest if item.get("kind") == "visual_field_pdf"]
+    investigation_ids = [item["id"] for item in manifest if item.get("kind") in {"visual_field_pdf", "investigation"}]
     fundus = {item.pk: item for item in report.encounter.image_uploads.filter(pk__in=fundus_ids)}
     investigations = {
-        item.pk: item for item in report.encounter.ocular_investigations.filter(pk__in=visual_field_ids)
+        item.pk: item for item in report.encounter.ocular_investigations.filter(pk__in=investigation_ids)
     }
-    if len(fundus) != len(fundus_ids) or len(investigations) != len(visual_field_ids):
+    if len(fundus) != len(fundus_ids) or len(investigations) != len(investigation_ids):
         raise ValidationError("A versioned report attachment is no longer available.")
     for entry in manifest:
-        item = fundus.get(entry.get("id")) or investigations.get(entry.get("id"))
+        item = fundus.get(entry.get("id")) if entry.get("kind") == "fundus" else investigations.get(entry.get("id"))
         opener = open_image_upload if entry.get("kind") == "fundus" else open_ocular_investigation
         with opener(item, "rb") as source:
             if hashlib.sha256(source.read()).hexdigest() != entry.get("checksum_sha256"):
                 raise ValidationError("A versioned report attachment failed its integrity check.")
-    return fundus_ids, visual_field_ids, fundus, investigations
+    return fundus_ids, investigation_ids, fundus, investigations
+
+
+def _investigation_image_page(item, content):
+    try:
+        output = BytesIO()
+        doc = SimpleDocTemplate(
+            output,
+            pagesize=A4,
+            rightMargin=18*mm,
+            leftMargin=18*mm,
+            topMargin=15*mm,
+            bottomMargin=15*mm,
+        )
+        styles = getSampleStyleSheet()
+        image_buffer = BytesIO(content)
+        story = [
+            Paragraph(
+                f"{item.get_investigation_type_display()} — {item.get_laterality_display()}",
+                styles["Heading1"],
+            ),
+            Spacer(1, 4*mm),
+            Image(image_buffer, width=165*mm, height=220*mm, kind="proportional"),
+        ]
+        doc.build(story)
+        return output.getvalue()
+    except Exception as exc:
+        raise ValidationError(
+            "A selected ocular investigation is not a valid PDF or supported image."
+        ) from exc
+
+
+def _investigation_attachment_pdf(item, attachment):
+    if attachment.startswith(b"%PDF-"):
+        try:
+            # Parse strictly here so malformed PDFs are rejected as a controlled
+            # validation error before they reach the report merge path.
+            PdfReader(BytesIO(attachment), strict=True)
+        except Exception as exc:
+            raise ValidationError("A selected ocular investigation PDF is invalid.") from exc
+        return attachment
+    return _investigation_image_page(item, attachment)
 
 
 def build_complete_pdf(report, snapshot, audience="patient", draft=False, manifest=None):
     if manifest is None:
         manifest, fundus, investigations = _attachment_manifest(report)
         fundus_ids = list(report.selected_fundus_upload_ids or [])
-        visual_field_ids = list(report.selected_visual_field_investigation_ids or [])
+        investigation_ids = [
+            item["id"] for item in manifest
+            if item.get("kind") in {"visual_field_pdf", "investigation"}
+        ]
     else:
         manifest = list(manifest)
-        fundus_ids, visual_field_ids, fundus, investigations = _version_assets(report, manifest)
+        fundus_ids, investigation_ids, fundus, investigations = _version_assets(report, manifest)
     writer = PdfWriter()
     for page in PdfReader(BytesIO(build_screening_pdf(report, snapshot, audience=audience))).pages:
         if draft:
@@ -599,10 +733,12 @@ def build_complete_pdf(report, snapshot, audience="patient", draft=False, manife
             if draft:
                 _draft_overlay(page)
             writer.add_page(page)
-    for item_id in visual_field_ids:
-        with open_ocular_investigation(investigations[item_id], "rb") as source:
+    for item_id in investigation_ids:
+        item = investigations[item_id]
+        with open_ocular_investigation(item, "rb") as source:
             attachment = source.read()
-        for page in PdfReader(BytesIO(attachment), strict=True).pages:
+        attachment_pdf = _investigation_attachment_pdf(item, attachment)
+        for page in PdfReader(BytesIO(attachment_pdf), strict=True).pages:
             if draft:
                 _draft_overlay(page)
             writer.add_page(page)
@@ -620,7 +756,7 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
     if report.status == report.Status.FINALIZED:
         return report.finalized_version
     if report.lock_version != expected_version:
-        raise ValidationError("This screening report changed after it was loaded.")
+        raise ValidationError("This assessment report changed after it was loaded.")
     if not signoff_confirmed:
         raise ValidationError("Explicit clinician sign-off confirmation is required.")
     if not report.outcome or not report.advice.strip() or not report.clinical_summary.strip():
@@ -629,7 +765,7 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
     clinician.update({"clinic_id": clinic.pk, "clinic_name": clinic.name, "branch_id": branch.pk, "branch_name": branch.name})
     snapshot, checksum, manifest = screening_snapshot(report, clinician)
     if not report.preview_checksum or report.preview_checksum != checksum:
-        raise ValidationError("Preview the current screening report before finalization.")
+        raise ValidationError("Preview the current assessment report before finalization.")
     # Keep the established patient-friendly bytes as the canonical stored copy.
     # The clinician rendering is deterministic from this same immutable snapshot.
     pdf, manifest = build_complete_pdf(report, snapshot, audience="patient", draft=False)
@@ -648,12 +784,12 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
         with storage.open(key, "rb") as existing:
             existing_checksum = hashlib.sha256(existing.read()).hexdigest()
         if existing_checksum != pdf_checksum:
-            raise ValidationError("A conflicting finalized screening report object already exists.")
+            raise ValidationError("A conflicting finalized assessment report object already exists.")
     else:
         saved = storage.save(key, ContentFile(pdf))
         if saved != key:
             storage.delete(saved)
-            raise ValidationError("The finalized screening report could not be stored safely.")
+            raise ValidationError("The finalized assessment report could not be stored safely.")
     EyeHealthScreeningReportVersion.objects.filter(pk=version.pk).update(
         pdf_object_key=key, pdf_checksum_sha256=pdf_checksum, pdf_size=len(pdf)
     )

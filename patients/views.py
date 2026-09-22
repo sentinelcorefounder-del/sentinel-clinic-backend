@@ -82,6 +82,15 @@ class PatientListCreateView(generics.ListCreateAPIView):
             self.request.query_params.get("hospital_id") or ""
         ).strip()
         diabetic = (self.request.query_params.get("diabetic") or "all").strip().lower()
+        ordering = (self.request.query_params.get("ordering") or "-created_at").strip()
+        allowed_ordering = {
+            "name": ("first_name", "last_name", "id"),
+            "-name": ("-first_name", "-last_name", "-id"),
+            "created_at": ("created_at", "id"),
+            "-created_at": ("-created_at", "-id"),
+            "patient_id": ("patient_id", "id"),
+            "-patient_id": ("-patient_id", "-id"),
+        }
 
         if search:
             queryset = queryset.filter(
@@ -119,7 +128,7 @@ class PatientListCreateView(generics.ListCreateAPIView):
         elif diabetic == "no":
             queryset = queryset.exclude(encounters__is_diabetic=True)
 
-        return queryset.distinct().order_by("-created_at")
+        return queryset.distinct().order_by(*allowed_ordering.get(ordering, allowed_ordering["-created_at"]))
 
     def perform_create(self, serializer):
         raise PermissionDenied(

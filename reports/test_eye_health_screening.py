@@ -171,7 +171,9 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(version.clinical_snapshot["limitation"], LIMITATION)
         self.assertNotIn("no glaucoma", str(version.clinical_snapshot).lower())
         with get_private_clinical_storage().open(version.pdf_object_key, "rb") as source:
-            self.assertEqual(len(PdfReader(BytesIO(source.read())).pages), 1)
+            # The assessment report is intentionally sectioned and may span more
+            # than one page; this test is about immutable finalisation, not layout.
+            self.assertGreaterEqual(len(PdfReader(BytesIO(source.read())).pages), 1)
         denied = self.client.post(
             f"/api/reports/eye-health/encounter/{self.encounter.pk}/",
             {"advice": "Silent overwrite"}, format="json",
@@ -354,7 +356,10 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual([item["page_count"] for item in visual], [1, 2])
         with get_private_clinical_storage().open(report.finalized_version.pdf_object_key, "rb") as source:
             merged = PdfReader(BytesIO(source.read()))
-        self.assertEqual(len(merged.pages), 5)
+        # The sectioned assessment body now spans two pages for this fixture,
+        # followed by one selected fundus page and the three selected visual-field
+        # PDF pages (1 + 2), so all selected attachments must still be preserved.
+        self.assertEqual(len(merged.pages), 6)
         other = ScreeningEncounter.objects.create(
             encounter_id="ENC-EYE-BAD-PDF", patient=self.patient, encounter_date=date.today(),
             programme="eye_health_screening", service_package=ScreeningEncounter.ServicePackage.EYE_HEALTH_SCREENING,
@@ -464,7 +469,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         bundle = PdfReader(BytesIO(response.content))
         self.assertIn("UNCHANGED DIABETIC REPORT COMPONENT", bundle.pages[0].extract_text())
-        self.assertIn("Targeted Retinal and Glaucoma-Risk Screening Report", bundle.pages[1].extract_text())
+        self.assertIn("Retinal and Glaucoma-Risk Assessment Report", bundle.pages[1].extract_text())
         eye_report.refresh_from_db()
 
     def test_targeted_title_limitation_and_safe_deterministic_wording(self):
@@ -495,7 +500,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertNotEqual(snapshot["generated_suggestion"], "Client text must not be trusted")
         with get_private_clinical_storage().open(report.finalized_version.pdf_object_key, "rb") as source:
             text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(source.read())).pages)
-        self.assertIn("Targeted Retinal and Glaucoma-Risk Screening Report", text)
+        self.assertIn("Retinal and Glaucoma-Risk Assessment Report", text)
         self.assertIn(LIMITATION, text.replace("\n", " "))
         self.assertNotIn("No diabetic retinopathy", text)
 

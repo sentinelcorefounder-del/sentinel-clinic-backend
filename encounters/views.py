@@ -1006,6 +1006,26 @@ class OcularDiagnosticAssessmentPDFView(APIView):
         return response
 
 
+def allowed_investigation_types_for_encounter(encounter):
+    """Return encounter-level investigation types permitted by the active clinical portfolio.
+
+    Existing investigations remain encounter records even if the service package later changes.
+    Fundus photography continues to use the dedicated fundus upload workflow.
+    """
+    allowed = set()
+    if encounter.includes_diabetic_screening:
+        allowed.update({"oct", "other"})
+    if encounter.includes_eye_health_screening:
+        allowed.update({"visual_field", "oct", "other"})
+    if encounter.includes_ocular_diagnostics:
+        allowed.update({"visual_field", "oct", "anterior_segment", "other"})
+    return allowed
+
+
+def encounter_supports_additional_investigations(encounter):
+    return bool(allowed_investigation_types_for_encounter(encounter))
+
+
 class OcularInvestigationListCreateView(generics.ListCreateAPIView):
     serializer_class = OcularInvestigationSerializer
     parser_classes = [MultiPartParser, FormParser]
@@ -1018,9 +1038,9 @@ class OcularInvestigationListCreateView(generics.ListCreateAPIView):
             pk=self.kwargs["encounter_id"],
             patient__assigned_clinic=org,
         ).first()
-        if not encounter or not encounter.includes_ocular_diagnostics:
+        if not encounter or not encounter_supports_additional_investigations(encounter):
             raise PermissionDenied(
-                "This encounter does not include ocular diagnostics."
+                "This assessment portfolio does not support additional ocular investigations."
             )
         branch = encounter.service_branch or encounter.patient.assigned_branch
         if not branch or not (
@@ -1041,6 +1061,12 @@ class OcularInvestigationListCreateView(generics.ListCreateAPIView):
         from uploads.private_uploads import delete_private_object, save_private_upload
 
         encounter = self._encounter()
+        investigation_type = serializer.validated_data.get("investigation_type")
+        allowed_types = allowed_investigation_types_for_encounter(encounter)
+        if investigation_type not in allowed_types:
+            raise PermissionDenied(
+                "This investigation type is not available for the current assessment portfolio."
+            )
         uploaded_file = serializer.validated_data["file"]
         organization = encounter.originating_organization or encounter.patient.assigned_clinic
         branch = encounter.service_branch or encounter.patient.assigned_branch
@@ -1067,11 +1093,10 @@ class OcularInvestigationDetailView(generics.RetrieveDestroyAPIView):
         org = get_user_clinic(self.request.user)
         if not org or org.organization_type != "clinic":
             return OcularInvestigation.objects.none()
+        # Investigation records belong to the encounter and remain accessible to the
+        # owning clinic even if the service package is subsequently corrected.
         return OcularInvestigation.objects.filter(
             encounter__patient__assigned_clinic=org,
-            encounter__programme__in=[
-                "ocular_diagnostics", "combined_assessment"
-            ],
         )
 
     def perform_destroy(self, instance):

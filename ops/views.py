@@ -1636,6 +1636,7 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
         referral_status = (request.query_params.get("referral_status") or "").strip()
         report_status = (request.query_params.get("report_status") or "").strip()
         payment_status = (request.query_params.get("payment_status") or "").strip()
+        ordering = (request.query_params.get("ordering") or "-created_at").strip()
 
         patients = Patient.objects.select_related("assigned_clinic", "master_patient").all().order_by("-created_at")
 
@@ -1855,7 +1856,12 @@ class OpsPatientListView(OpsOnlyMixin, APIView):
                 }
             )
 
-        data.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        if ordering in {"name", "-name"}:
+            data.sort(key=lambda item: str(item.get("name") or "").casefold(), reverse=ordering.startswith("-"))
+        elif ordering in {"patient_id", "-patient_id"}:
+            data.sort(key=lambda item: str(item.get("sentinel_patient_id") or item.get("patient_id") or "").casefold(), reverse=ordering.startswith("-"))
+        else:
+            data.sort(key=lambda item: str(item.get("created_at") or ""), reverse=ordering != "created_at")
         return Response(data)
 
 
@@ -2098,7 +2104,15 @@ class OpsClinicListView(OpsOnlyMixin, APIView):
         if denied:
             return denied
 
-        clinics = Organization.objects.filter(organization_type="clinic").order_by("name")
+        ordering = (request.query_params.get("ordering") or "name").strip()
+        allowed_ordering = {
+            "name": ("name", "id"), "-name": ("-name", "-id"),
+            "created_at": ("created_at", "id"), "-created_at": ("-created_at", "-id"),
+            "code": ("clinic_id", "id"), "-code": ("-clinic_id", "-id"),
+        }
+        clinics = Organization.objects.filter(organization_type="clinic").order_by(
+            *allowed_ordering.get(ordering, allowed_ordering["name"])
+        )
         data = []
 
         for c in clinics:
@@ -2116,6 +2130,7 @@ class OpsClinicListView(OpsOnlyMixin, APIView):
                     "address": c.address,
                     "assigned_referrals": referrals.count(),
                     "reports_count": reports.count(),
+                    "created_at": c.created_at,
                     "paid_payments": payments.filter(status="paid").count(),
                     "capability_profile": capability_profile_data(c),
                 }

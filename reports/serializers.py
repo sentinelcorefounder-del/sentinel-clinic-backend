@@ -36,6 +36,7 @@ class EyeHealthScreeningReportSerializer(serializers.ModelSerializer):
             "right_visual_field_result", "left_visual_field_result",
             "right_fundus_result", "left_fundus_result",
             "selected_fundus_upload_ids", "selected_visual_field_investigation_ids",
+            "selected_ocular_investigation_ids",
             "status", "previewed_at", "lock_version", "finalized_version",
             "finalized_version_detail", "professional_defaults", "created_at", "updated_at",
             "correction_source_version",

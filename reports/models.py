@@ -513,6 +513,7 @@ class EyeHealthScreeningReport(models.Model):
     left_fundus_result = models.TextField(blank=True, default="")
     selected_fundus_upload_ids = models.JSONField(default=list, blank=True)
     selected_visual_field_investigation_ids = models.JSONField(default=list, blank=True)
+    selected_ocular_investigation_ids = models.JSONField(default=list, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     preview_checksum = models.CharField(max_length=64, blank=True, default="")
     previewed_at = models.DateTimeField(null=True, blank=True)

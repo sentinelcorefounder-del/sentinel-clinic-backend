@@ -601,6 +601,8 @@ class ClinicReportListView(APIView):
                 structured = structured.filter(report_status=status_filter)
                 historical = historical.none()
 
+        ordering = (request.query_params.get("ordering") or "-date").strip()
+
         search = (request.query_params.get("search") or "").strip()
         if search:
             from django.db import models as db_models
@@ -625,7 +627,17 @@ class ClinicReportListView(APIView):
                 "patient_id": item.get("patient_reference"),
             })
             data.append(item)
-        data.sort(key=lambda row: str(row.get("updated_at") or row.get("report_date") or ""), reverse=True)
+        def _sort_value(row):
+            if ordering in {"name", "-name"}:
+                return str(row.get("patient_name") or "").casefold()
+            if ordering in {"status", "-status"}:
+                return str(row.get("report_status") or "").casefold()
+            if ordering in {"report_id", "-report_id"}:
+                return str(row.get("report_id") or "").casefold()
+            return str(row.get("updated_at") or row.get("report_date") or row.get("created_at") or "")
+
+        reverse = ordering.startswith("-") or ordering == "date"
+        data.sort(key=_sort_value, reverse=reverse)
         return Response(data)
 
 

@@ -130,15 +130,15 @@ class AssessmentServiceSession(models.Model):
 class ScreeningEncounter(models.Model):
     class ServicePackage(models.TextChoices):
         DIABETIC_RETINAL = "diabetic_retinal_assessment", "Diabetic Retinal Assessment"
-        EYE_HEALTH_SCREENING = "eye_health_screening", "Targeted Retinal and Glaucoma-Risk Screening"
-        COMBINED = "combined_diabetic_eye_health", "Combined Diabetic Retinal Assessment and Targeted Glaucoma-Risk Screening"
+        EYE_HEALTH_SCREENING = "eye_health_screening", "Retinal and Glaucoma-Risk Assessment"
+        COMBINED = "combined_diabetic_eye_health", "Combined Diabetic Retinal and Glaucoma-Risk Assessment"
         COMPREHENSIVE_OCULAR = "comprehensive_ocular_assessment", "Comprehensive Ocular Assessment"
 
     PROGRAMME_CHOICES = [
         ("diabetic_screening", "Diabetic Retinal Assessment"),
-        ("eye_health_screening", "Targeted Retinal and Glaucoma-Risk Screening"),
+        ("eye_health_screening", "Retinal and Glaucoma-Risk Assessment"),
         ("ocular_diagnostics", "Comprehensive Ocular Assessment"),
-        ("combined_assessment", "Combined Diabetic Retinal Assessment and Targeted Glaucoma-Risk Screening"),
+        ("combined_assessment", "Combined Diabetic Retinal and Glaucoma-Risk Assessment"),
     ]
     SOURCE_TYPE_CHOICES = [
         ("hospital_referral", "Hospital Referral"),

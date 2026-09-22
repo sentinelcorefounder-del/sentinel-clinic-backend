@@ -119,7 +119,7 @@ def build_ocular_report_pdf(assessment):
         ("ALIGN", (1, 0), (1, 0), "RIGHT"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
-    story.extend([header, Paragraph("Ocular Clinical Report", styles["Title"]), Spacer(1, 5)])
+    story.extend([header, Paragraph("Comprehensive Ocular Assessment Report", styles["Title"]), Spacer(1, 5)])
 
     details = [
         ["Patient", f"{patient.first_name} {patient.last_name}", "Date of birth", patient.date_of_birth],
@@ -158,19 +158,15 @@ def build_ocular_report_pdf(assessment):
             ])
 
     signer = _signer_snapshot_details(assessment)
-    credential_parts = [
-        signer["role"],
-        (
-            f"{signer['registration_body']} {signer['registration_number']}".strip()
-            if signer["registration_body"]
-            else (f"Registration {signer['registration_number']}" if signer["registration_number"] else "")
-        ),
-        signer["qualifications"],
-    ]
-    credentials = " · ".join(part for part in credential_parts if part)
     signoff_lines = [f"<b>{_text(signer['name'])}</b>"]
-    if credentials:
-        signoff_lines.append(_text(credentials))
+    if signer["role"]:
+        signoff_lines.append(_text(signer["role"]))
+    if signer["registration_body"]:
+        signoff_lines.append(_text(signer["registration_body"]))
+    if signer["registration_number"]:
+        signoff_lines.append(_text(f"Registration number: {signer['registration_number']}"))
+    if signer["qualifications"]:
+        signoff_lines.append(_text(f"Qualifications: {signer['qualifications']}"))
     signoff_lines.append(
         "Electronically signed: " + _text((_signed_version(assessment).signed_at if _signed_version(assessment) else None) or assessment.signed_at or assessment.completed_at)
         if ((_signed_version(assessment).signed_at if _signed_version(assessment) else None) or assessment.signed_at or assessment.completed_at)
@@ -186,6 +182,7 @@ def build_ocular_report_pdf(assessment):
         story.extend([Spacer(1, 10), Paragraph(_text(footer), styles["BodyText"])])
 
     report_layout = _clinical_value(assessment, "report_layout", "text_only")
+    pdf_attachments = []
     if report_layout == "with_investigations":
         fundus_ids = list(_clinical_value(assessment, "selected_fundus_upload_ids", []) or [])
         investigation_ids = list(_clinical_value(assessment, "selected_ocular_investigation_ids", []) or [])
@@ -226,7 +223,13 @@ def build_ocular_report_pdf(assessment):
                 except Exception:
                     story.append(Paragraph("Selected image could not be embedded.", styles["BodyText"]))
             else:
-                story.append(Paragraph("Selected PDF investigation (listed but not embedded).", styles["BodyText"]))
+                try:
+                    file_obj.open("rb")
+                    pdf_attachments.append(file_obj.read())
+                    file_obj.close()
+                    story.append(Paragraph("Selected PDF investigation is appended to this report.", styles["BodyText"]))
+                except Exception:
+                    story.append(Paragraph("Selected PDF investigation could not be appended.", styles["BodyText"]))
             caption = captions.get(caption_key)
             if caption:
                 story.append(Paragraph(f"<b>Caption:</b> {_text(caption)}", styles["BodyText"]))
@@ -263,4 +266,19 @@ def build_ocular_report_pdf(assessment):
         canvas.restoreState()
 
     doc.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
-    return output.getvalue()
+    base_pdf = output.getvalue()
+    if not pdf_attachments:
+        return base_pdf
+    from pypdf import PdfReader, PdfWriter
+    writer = PdfWriter()
+    for page in PdfReader(BytesIO(base_pdf)).pages:
+        writer.add_page(page)
+    for attachment in pdf_attachments:
+        try:
+            for page in PdfReader(BytesIO(attachment), strict=True).pages:
+                writer.add_page(page)
+        except Exception:
+            continue
+    merged = BytesIO()
+    writer.write(merged)
+    return merged.getvalue()

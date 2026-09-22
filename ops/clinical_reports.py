@@ -57,6 +57,7 @@ class OpsClinicalReportQueueView(APIView):
             return denied
         requested_status = (request.query_params.get("status") or "awaiting_ops").strip()
         search = (request.query_params.get("search") or "").strip()
+        ordering = (request.query_params.get("ordering") or "-submitted_at").strip()
         rows = []
 
         diabetic = StructuredReport.objects.select_related(
@@ -126,7 +127,14 @@ class OpsClinicalReportQueueView(APIView):
             signer = assessment.current_version.clinician_snapshot if assessment.current_version_id else assessment.signer_snapshot
             rows.append(_row("ocular", assessment.id, assessment.encounter, assessment.report_status, assessment.submitted_to_ops_at, signer))
 
-        rows.sort(key=lambda item: item["submitted_at"].timestamp() if item["submitted_at"] else 0, reverse=True)
+        if ordering in {"name", "-name"}:
+            rows.sort(key=lambda item: str(item.get("patient_name") or "").casefold(), reverse=ordering.startswith("-"))
+        elif ordering in {"clinic", "-clinic"}:
+            rows.sort(key=lambda item: str(item.get("clinic_name") or "").casefold(), reverse=ordering.startswith("-"))
+        elif ordering in {"status", "-status"}:
+            rows.sort(key=lambda item: str(item.get("status") or "").casefold(), reverse=ordering.startswith("-"))
+        else:
+            rows.sort(key=lambda item: item["submitted_at"].timestamp() if item["submitted_at"] else 0, reverse=ordering != "submitted_at")
         return Response(rows[:500])
 
 
