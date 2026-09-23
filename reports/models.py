@@ -604,11 +604,11 @@ class EyeHealthScreeningReportVersion(models.Model):
 
     def save(self, *args, **kwargs):
         if self.pk:
-            raise ValidationError("Targeted screening report versions are immutable.")
+            raise ValidationError("Retinal and glaucoma-risk assessment report versions are immutable.")
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        raise ValidationError("Targeted screening report versions cannot be deleted.")
+        raise ValidationError("Retinal and glaucoma-risk assessment report versions cannot be deleted.")
 
 
 

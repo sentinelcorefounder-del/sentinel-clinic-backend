@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.test import APIClient
 
@@ -93,7 +94,7 @@ class ComplimentaryTests(TestCase):
         before = (WalletLedgerEntry.objects.count(), self.wallet.available_balance, self.wallet.reserved_balance)
         decide_complimentary(self.request(record), actor=self.approver, action="approve")
         with self.assertRaisesMessage(ValidationError, "No unsettled allocations"):
-            create_settlement_batch(self.sentinel, date.today(), date.today(), actor=self.operator)
+            create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=self.operator)
         self.assertFalse(SettlementItem.objects.filter(allocation__financial_record=record).exists())
         self.assertEqual(before, (WalletLedgerEntry.objects.count(), self.wallet.available_balance, self.wallet.reserved_balance))
         record.refresh_from_db()

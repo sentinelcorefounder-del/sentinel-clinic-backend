@@ -7,6 +7,7 @@ from django.contrib.auth.models import Group
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from encounters.models import AssessmentServiceSession, ScreeningEncounter
@@ -82,7 +83,7 @@ class SponsorshipAndTreasuryTests(TestCase):
         )
         self.encounter = ScreeningEncounter.objects.create(
             encounter_id="SPONSOR-ENCOUNTER", patient=self.patient,
-            encounter_date=date.today(), originating_organization=self.clinic,
+            encounter_date=timezone.localdate(), originating_organization=self.clinic,
             service_branch=self.branch, source_type="clinic_direct",
             workflow_route="clinic_managed", payment_responsibility="patient",
             programme="ocular_diagnostics", encounter_type="ocular_assessment",
@@ -134,7 +135,7 @@ class SponsorshipAndTreasuryTests(TestCase):
         BankTransferFundingRequest.objects.create(
             wallet=self.wallet, requested_amount=Decimal(amount), received_amount=Decimal(amount),
             status=BankTransferFundingRequest.Status.CREDITED,
-            bank_transaction_reference=f"SYNTHETIC-{amount}", value_date=date.today(),
+            bank_transaction_reference=f"SYNTHETIC-{amount}", value_date=timezone.localdate(),
             ledger_entry=entry,
         )
         return entry
@@ -265,7 +266,7 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.assertEqual(ServicePartnerEarning.objects.count(), 0)
         StructuredReport.objects.create(
             report_id="SYNTHETIC-SPONSOR-REPORT", encounter=self.encounter,
-            patient=self.patient, review_date=date.today(), report_status="clinic_issued",
+            patient=self.patient, review_date=timezone.localdate(), report_status="clinic_issued",
         )
         first = recognize_service_partner_earning(
             item.financial_record, trigger_source="sponsorship-test"
@@ -361,10 +362,10 @@ class SponsorshipAndTreasuryTests(TestCase):
         self.assertEqual(summary["transferable_surplus"], Decimal("20000.00"))
         evidence = SimpleUploadedFile("evidence.pdf", b"synthetic evidence", content_type="application/pdf")
         transfer = record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="SYNTHETIC-EXECUTION", evidence=evidence
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="SYNTHETIC-EXECUTION", evidence=evidence
         )
         repeated = record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="IGNORED-RETRY", evidence=evidence
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="IGNORED-RETRY", evidence=evidence
         )
         self.assertEqual(repeated.ledger_entry_id, transfer.ledger_entry_id)
         self.assertEqual(transfer.events.filter(action="execution_recorded").count(), 1)
@@ -462,7 +463,7 @@ class SponsorshipAndTreasuryTests(TestCase):
         ), actor=self.operator), actor=self.approver, approve=True)
         evidence = SimpleUploadedFile("evidence.pdf", b"synthetic evidence", content_type="application/pdf")
         transfer = record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="SYNTHETIC-EVIDENCE", evidence=evidence
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="SYNTHETIC-EVIDENCE", evidence=evidence
         )
         client = APIClient()
         path = f"/api/finance/treasury-transfers/{transfer.pk}/evidence/"
@@ -499,7 +500,7 @@ class SponsorshipAndTreasuryTests(TestCase):
             organization_type="service_partner",
         )
         ServicePartnerSettlementBatch.objects.create(
-            service_partner=service_partner, assessment_date=date.today(), currency="NGN",
+            service_partner=service_partner, assessment_date=timezone.localdate(), currency="NGN",
             status=ServicePartnerSettlementBatch.Status.PAID, assessment_count=2,
             gross_amount=Decimal("10000.00"), final_amount=Decimal("7000.00"),
             prepared_by=self.operator, approved_by=self.approver, paid_by=self.operator,

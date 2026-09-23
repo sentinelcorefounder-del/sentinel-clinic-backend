@@ -7,6 +7,7 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from encounters.models import AssessmentServiceSession
@@ -184,10 +185,10 @@ class OperationalFinanceControlsTests(TestCase):
             ), actor=self.operator), actor=self.approver, approve=True,
         )
         executed = record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="BANK-1", evidence=self._evidence()
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="BANK-1", evidence=self._evidence()
         )
         repeated = record_treasury_transfer_execution(
-            executed, actor=self.operator, execution_date=date.today(), external_reference="BANK-1", evidence=self._evidence("retry.pdf")
+            executed, actor=self.operator, execution_date=timezone.localdate(), external_reference="BANK-1", evidence=self._evidence("retry.pdf")
         )
         self.assertEqual(repeated.ledger_entry_id, executed.ledger_entry_id)
         self.assertEqual(self.sentinel_wallet.available_balance, Decimal("500.00"))
@@ -254,12 +255,12 @@ class OperationalFinanceControlsTests(TestCase):
             ), actor=self.operator), actor=self.approver, approve=True,
         )
         transfer = record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="BANK-FOUNDER", evidence=self._evidence("bank.pdf")
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="BANK-FOUNDER", evidence=self._evidence("bank.pdf")
         )
         expense.refresh_from_db()
         self.assertEqual(expense.status, FounderFundedExpense.Status.SETTLED)
         self.assertEqual(expense.reimbursement_transfers.filter(status=TreasuryTransfer.Status.EXECUTED).count(), 1)
         record_treasury_transfer_execution(
-            transfer, actor=self.operator, execution_date=date.today(), external_reference="BANK-FOUNDER", evidence=self._evidence("bank-retry.pdf")
+            transfer, actor=self.operator, execution_date=timezone.localdate(), external_reference="BANK-FOUNDER", evidence=self._evidence("bank-retry.pdf")
         )
         self.assertEqual(expense.reimbursement_transfers.filter(status=TreasuryTransfer.Status.EXECUTED).count(), 1)

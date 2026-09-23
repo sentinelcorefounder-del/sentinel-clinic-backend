@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection, transaction
 from django.test import TestCase
+from django.utils import timezone
 
 from . import test_sponsorship_dashboard as fixtures
 from .models import EncounterFinancialRecord, WalletLedgerEntry, TreasuryTransfer
@@ -30,7 +31,7 @@ class BatchOneControlTests(TestCase):
         submit_treasury_transfer(item, actor=self.operator)
         decide_treasury_transfer(item, actor=self.approver, approve=True)
         return record_treasury_transfer_execution(item, actor=self.operator,
-            execution_date=date.today(), external_reference="EXEC-TEST",
+            execution_date=timezone.localdate(), external_reference="EXEC-TEST",
             evidence=SimpleUploadedFile("paid.pdf", b"%PDF-1.4 test"))
 
     def test_reason_only_reversal_posts_nothing(self):
@@ -85,9 +86,9 @@ class BatchOneControlTests(TestCase):
         from .services import earn_financial_record_allocations
         earn_financial_record_allocations(sponsor.financial_record)
         before = WalletLedgerEntry.objects.count()
-        batch = create_settlement_batch(self.sentinel, date.today(), date.today(), actor=self.operator)
+        batch = create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=self.operator)
         with self.assertRaises(ValidationError):
-            create_settlement_batch(self.sentinel, date.today(), date.today(), actor=self.operator)
+            create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=self.operator)
         self.operator.groups.add(self.approver.groups.first())
         with self.assertRaises(ValidationError):
             approve_settlement_batch(batch, actor=self.operator)

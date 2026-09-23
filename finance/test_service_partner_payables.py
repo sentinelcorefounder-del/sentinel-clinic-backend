@@ -78,7 +78,7 @@ class ServicePartnerPayablesTests(TestCase):
         attach_encounter_to_service_session(encounter, session, self.admin)
         report = StructuredReport.objects.create(
             report_id=f"PAY-RPT-{suffix}", encounter=encounter, patient=patient,
-            review_date=date.today(), ungradable=True, urgency_outcome="image_retake",
+            review_date=timezone.localdate(), ungradable=True, urgency_outcome="image_retake",
             report_status="issued" if issued else "draft",
         )
         record, _ = EncounterFinancialRecord.objects.get_or_create(encounter=encounter)
@@ -107,7 +107,7 @@ class ServicePartnerPayablesTests(TestCase):
             ServicePartnerEarning.objects.create(
                 financial_record=record, encounter=record.encounter,
                 service_partner=self.other_partner, service_session=session,
-                assessment_date=date.today(), session_reference="duplicate",
+                assessment_date=timezone.localdate(), session_reference="duplicate",
                 provider_type="service_partner", amount=1, currency="NGN",
                 rate_snapshot={}, trigger_source="bad", earned_at=timezone.now(),
             )
@@ -146,10 +146,10 @@ class ServicePartnerPayablesTests(TestCase):
             decide_service_partner_settlement(replacement, actor=self.operator, approve=True)
         decide_service_partner_settlement(replacement, actor=self.approver, approve=True)
         paid = mark_service_partner_settlement_paid(
-            replacement, actor=self.operator, payment_date=date.today(), external_reference="PAY-EXT-1",
+            replacement, actor=self.operator, payment_date=timezone.localdate(), external_reference="PAY-EXT-1",
         )
         repeated = mark_service_partner_settlement_paid(
-            paid, actor=self.operator, payment_date=date.today(), external_reference="PAY-EXT-1",
+            paid, actor=self.operator, payment_date=timezone.localdate(), external_reference="PAY-EXT-1",
         )
         self.assertEqual(paid.pk, repeated.pk)
         self.assertEqual(ServicePartnerSettlementBatch.objects.filter(status="paid").count(), 1)
@@ -193,7 +193,7 @@ class ServicePartnerPayablesTests(TestCase):
         )
         decide_service_partner_settlement(batch, actor=self.approver, approve=True)
         mark_service_partner_settlement_paid(
-            batch, actor=self.operator, payment_date=date.today(), external_reference="REFUND-PAID-1",
+            batch, actor=self.operator, payment_date=timezone.localdate(), external_reference="REFUND-PAID-1",
         )
         wallet = OrganizationWallet.objects.create(organization=self.clinic, currency="NGN")
         refund_to_wallet(
@@ -232,7 +232,7 @@ class ServicePartnerPayablesTests(TestCase):
         )
         decide_service_partner_settlement(original, actor=self.approver, approve=True)
         mark_service_partner_settlement_paid(
-            original, actor=self.operator, payment_date=date.today(), external_reference="ORIGINAL-PAID",
+            original, actor=self.operator, payment_date=timezone.localdate(), external_reference="ORIGINAL-PAID",
         )
         correction = request_service_partner_correction(
             earning=earning, amount="5000.00", reason="Wrong partner attribution", actor=self.operator,
@@ -284,7 +284,7 @@ class ServicePartnerPayablesTests(TestCase):
         )
         decide_service_partner_settlement(paid_batch, actor=self.approver, approve=True)
         mark_service_partner_settlement_paid(
-            paid_batch, actor=self.operator, payment_date=date.today(), external_reference="PAID-CORR",
+            paid_batch, actor=self.operator, payment_date=timezone.localdate(), external_reference="PAID-CORR",
         )
         correction = request_service_partner_correction(
             earning=paid_earning, amount="5000.00", reason="Invalid paid earning", actor=self.operator,

@@ -377,6 +377,7 @@ def screening_snapshot(report, clinician):
         "clinical_summary": report.clinical_summary,
         "limitation": limitation_for_tests(tests),
         "clinician": clinician,
+        "signed_at": report.signed_at.isoformat() if report.signed_at else "",
         "attachments": manifest,
     }
     encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
@@ -541,9 +542,9 @@ def build_screening_pdf(report, snapshot, audience="patient"):
 
     if audience == "patient":
         story.extend([
-            Paragraph("What we found in the retina", styles["Heading2"]),
+            Paragraph("Diabetic Retinal Assessment", styles["Heading2"]),
             Paragraph(_display(" ".join(retinal_parts) or "No separate retinal finding was recorded beyond the assessment summary."), styles["BodyText"]),
-            Paragraph("What we found relating to glaucoma risk", styles["Heading2"]),
+            Paragraph("Glaucoma-Risk Assessment", styles["Heading2"]),
             Paragraph(_display(" ".join(glaucoma_parts) or "No separate glaucoma-risk finding was recorded beyond the assessment summary."), styles["BodyText"]),
             Paragraph("What this means", styles["Heading2"]),
             Paragraph(_display(snapshot["outcome_display"]), styles["BodyText"]),
@@ -552,13 +553,13 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         ])
     else:
         story.extend([
-            Paragraph("Retinal assessment", styles["Heading2"]),
+            Paragraph("Diabetic Retinal Assessment", styles["Heading2"]),
             Paragraph(_display(" ".join(retinal_parts) or "No separate retinal finding was recorded beyond the assessment summary."), styles["BodyText"]),
-            Paragraph("Glaucoma-risk assessment", styles["Heading2"]),
+            Paragraph("Glaucoma-Risk Assessment", styles["Heading2"]),
             Paragraph(_display(" ".join(glaucoma_parts) or "No separate glaucoma-risk finding was recorded beyond the assessment summary."), styles["BodyText"]),
-            Paragraph("Overall clinical impression", styles["Heading2"]),
+            Paragraph("Overall Clinical Impression", styles["Heading2"]),
             Paragraph(_display(snapshot["outcome_display"]), styles["BodyText"]),
-            Paragraph("Management and recommended next steps", styles["Heading2"]),
+            Paragraph("Recommended Next Steps", styles["Heading2"]),
             Paragraph(_display(snapshot["advice"]), styles["BodyText"]),
         ])
     if audience == "clinician":
@@ -595,15 +596,49 @@ def build_screening_pdf(report, snapshot, audience="patient"):
                 ("VALIGN", (0,0), (-1,-1), "TOP"), ("FONTSIZE", (0,0), (-1,-1), 8),
             ])), Spacer(1, 3*mm),
         ])
+    clinician = snapshot.get("clinician") or {}
+    clinician_name = clinician.get("signature_name") or clinician.get("display_name") or "Not recorded"
+    qualifications = str(clinician.get("qualifications") or "").strip()
+    professional_role = str(clinician.get("professional_role") or "").strip()
+    registration_body = str(clinician.get("registration_body") or "").strip()
+    registration_number = str(clinician.get("registration_number") or "").strip()
+    if registration_body and registration_number:
+        if registration_number.lower().startswith(registration_body.lower()):
+            registration_display = registration_number
+        else:
+            registration_display = f"{registration_body} / {registration_number}"
+    else:
+        registration_display = registration_number or registration_body or "Not recorded"
+    signed_at = snapshot.get("signed_at") or (report.signed_at.isoformat() if report.signed_at else "")
+    signature_lines = [
+        Paragraph(f"<b>{_display(clinician_name)}</b>", styles["BodyText"]),
+    ]
+    if qualifications:
+        signature_lines.append(Paragraph(_display(qualifications), small))
+    if professional_role:
+        signature_lines.append(Paragraph(_display(professional_role), small))
+    signature_lines.append(Paragraph(_display(f"Registration: {registration_display}"), small))
+    if signed_at:
+        signature_lines.append(Paragraph(_display(f"Electronically signed: {signed_at}"), small))
+    else:
+        signature_lines.append(Paragraph("Electronic signature: Pending finalization", small))
+
+    signoff_box = Table([[signature_lines]], colWidths=[170*mm])
+    signoff_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#eef4f8")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#b8c6d1")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+
     story.extend([
         Paragraph("Assessment scope and limitations", styles["Heading2"]),
         Paragraph(_display(snapshot["limitation"]), small), Spacer(1, 4*mm),
-        Paragraph("Responsible clinician", styles["Heading2"]),
-        Paragraph(_display(snapshot["clinician"].get("signature_name") or snapshot["clinician"].get("display_name")), styles["BodyText"]),
-        Paragraph(_display(snapshot["clinician"].get("professional_role")), styles["BodyText"]),
-        Paragraph(_display(snapshot["clinician"].get("registration_body") or "Registration body not recorded"), styles["BodyText"]),
-        Paragraph(_display(f"Registration number: {snapshot['clinician'].get('registration_number') or 'Not recorded'}"), styles["BodyText"]),
-        *([Paragraph(_display(f"Qualifications: {snapshot['clinician'].get('qualifications')}"), styles["BodyText"])] if snapshot["clinician"].get("qualifications") else []),
+        Paragraph("Clinical sign-off", styles["Heading2"]),
+        signoff_box,
     ])
     if footer:
         story.extend([Spacer(1, 4*mm), Paragraph(_display(footer), small)])
@@ -766,6 +801,15 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
     snapshot, checksum, manifest = screening_snapshot(report, clinician)
     if not report.preview_checksum or report.preview_checksum != checksum:
         raise ValidationError("Preview the current assessment report before finalization.")
+    # Freeze the electronic-signature timestamp into the immutable clinical snapshot.
+    # Preview validation still checks the clinician-reviewed draft content; the final
+    # immutable version adds only the signing timestamp.
+    now = timezone.now()
+    snapshot = dict(snapshot)
+    snapshot["signed_at"] = now.isoformat()
+    checksum = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     # Keep the established patient-friendly bytes as the canonical stored copy.
     # The clinician rendering is deterministic from this same immutable snapshot.
     pdf, manifest = build_complete_pdf(report, snapshot, audience="patient", draft=False)
@@ -793,7 +837,6 @@ def finalize_screening_report(report, *, user, expected_version, signoff_confirm
     EyeHealthScreeningReportVersion.objects.filter(pk=version.pk).update(
         pdf_object_key=key, pdf_checksum_sha256=pdf_checksum, pdf_size=len(pdf)
     )
-    now = timezone.now()
     requires_ops = bool(report.encounter.hospital_referral_id)
     report.status = report.Status.FINALIZED
     report.finalized_version = version

@@ -169,6 +169,8 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(version.clinical_snapshot["assessment_location"]["site_name"], "Synthetic client site")
         self.assertEqual(version.clinician_snapshot["user_id"], self.optometrist.pk)
         self.assertEqual(version.clinical_snapshot["limitation"], LIMITATION)
+        self.assertTrue(version.clinical_snapshot.get("signed_at"))
+        self.assertEqual(report.signed_at.isoformat(), version.clinical_snapshot["signed_at"])
         self.assertNotIn("no glaucoma", str(version.clinical_snapshot).lower())
         with get_private_clinical_storage().open(version.pdf_object_key, "rb") as source:
             # The assessment report is intentionally sectioned and may span more
@@ -207,6 +209,11 @@ class EyeHealthScreeningWorkflowTests(TestCase):
             self.assertEqual(preview.status_code, 200)
             text = " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(preview.content)).pages)
             self.assertIn("DRAFT — NOT FOR DISTRIBUTION", text)
+            self.assertIn("Diabetic Retinal Assessment", text)
+            self.assertIn("Glaucoma-Risk Assessment", text)
+            self.assertIn("Clinical sign-off", text)
+            self.assertNotIn("What we found in the retina", text)
+            self.assertNotIn("What we found relating to glaucoma risk", text)
             if audience == "patient":
                 self.assertNotIn("Detailed clinical findings", text)
                 self.assertNotIn("Visual field index", text)

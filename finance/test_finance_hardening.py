@@ -4,6 +4,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.test import APIClient
 
@@ -40,7 +41,7 @@ class FinanceHardeningTests(TestCase):
         earn_financial_record_allocations(sponsor.financial_record)
 
     def batch(self):
-        return create_settlement_batch(self.sentinel, date.today(), date.today(), actor=self.operator)
+        return create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=self.operator)
 
     def outsiders(self):
         return [None, self.user("random", ""), self.user("root", "", superuser=True),
@@ -51,7 +52,7 @@ class FinanceHardeningTests(TestCase):
         self.earned()
         batch = self.batch()
         for actor in self.outsiders():
-            for operation in [lambda: create_settlement_batch(self.sentinel, date.today(), date.today(), actor=actor),
+            for operation in [lambda: create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=actor),
                 lambda: approve_settlement_batch(batch, actor=actor),
                 lambda: mark_settlement_batch_paid(batch, "PAY", actor=actor),
                 lambda: cancel_settlement_batch(batch, "Cancelled", actor=actor)]:
@@ -78,7 +79,7 @@ class FinanceHardeningTests(TestCase):
             mark_settlement_batch_paid(batch, "DIFFERENT", actor=self.operator)
 
     def batch_with_actor(self, actor):
-        return create_settlement_batch(self.sentinel, date.today(), date.today(), actor=actor)
+        return create_settlement_batch(self.sentinel, timezone.localdate(), timezone.localdate(), actor=actor)
 
     def test_database_membership_unique_and_cancelled_history_preserved(self):
         self.earned()

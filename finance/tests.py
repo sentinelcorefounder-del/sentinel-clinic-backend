@@ -58,7 +58,7 @@ class FinanceEngineTests(TestCase):
         self.encounter = ScreeningEncounter.objects.create(
             encounter_id="ENC-FIN-001",
             patient=self.patient,
-            encounter_date=date.today(),
+            encounter_date=timezone.localdate(),
             originating_organization=self.organization,
             source_type="hospital_referral",
             workflow_route="sentinel_managed",
@@ -487,7 +487,7 @@ class BankTransferFundingTests(WalletEngineTests):
             self.request,
             received_amount=Decimal(amount),
             bank_transaction_reference=reference,
-            value_date=date.today(),
+            value_date=timezone.localdate(),
             actor=self.user,
         )
 
@@ -541,7 +541,7 @@ class BankTransferFundingTests(WalletEngineTests):
                 other,
                 received_amount=Decimal("10000.00"),
                 bank_transaction_reference="DUPLICATE-REF",
-                value_date=date.today(),
+                value_date=timezone.localdate(),
                 actor=self.user,
             )
 
@@ -695,7 +695,7 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
             date_of_birth=date(1980, 1, 1), sex="female",
         )
         second_encounter = ScreeningEncounter.objects.create(
-            encounter_id="ENC-VOLUME-2", patient=second_patient, encounter_date=date.today(),
+            encounter_id="ENC-VOLUME-2", patient=second_patient, encounter_date=timezone.localdate(),
             originating_organization=self.organization, source_type="hospital_referral",
             workflow_route="sentinel_managed", payment_responsibility="hospital",
         )
@@ -720,7 +720,7 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
     def test_settlement_requires_evidence_and_prevents_duplicate_reference(self):
         self._earned_allocations()
         batch = create_settlement_batch(
-            self.organization, date.today(), date.today(), actor=self.operator
+            self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator
         )
         approve_settlement_batch(batch, actor=self.approver)
         with self.assertRaisesMessage(ValidationError, "Payment evidence"):
@@ -732,7 +732,7 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
 
     def test_cancel_draft_settlement_releases_allocations_for_one_replacement(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        batch = create_settlement_batch(self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator)
         self.assertEqual(
             EncounterAllocation.objects.filter(
                 settlement_items__batch=batch,
@@ -748,16 +748,16 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
             ).count(), 1,
         )
         replacement = create_settlement_batch(
-            self.organization, date.today(), date.today(), actor=self.operator
+            self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator
         )
         self.assertNotEqual(replacement.pk, batch.pk)
         self.assertEqual(replacement.items.count(), 1)
         with self.assertRaisesMessage(ValidationError, "No unsettled allocations"):
-            create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+            create_settlement_batch(self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator)
 
     def test_approved_settlement_cannot_be_cancelled_or_edited(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        batch = create_settlement_batch(self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator)
         original_total = batch.total_amount
         original_items = list(batch.items.values_list("allocation_id", "amount", "currency"))
         approve_settlement_batch(batch, actor=self.approver)
@@ -773,7 +773,7 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
 
     def test_paid_settlement_cannot_be_cancelled(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        batch = create_settlement_batch(self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator)
         approve_settlement_batch(batch, actor=self.approver)
         evidence = SimpleUploadedFile("paid.pdf", b"paid", content_type="application/pdf")
         mark_settlement_batch_paid(batch, "PAY-CANCEL-GUARD", actor=self.operator, payment_evidence=evidence)
@@ -782,7 +782,7 @@ class VersionedPricingAndSettlementTests(WalletEngineTests):
 
     def test_repeated_draft_cancellation_is_rejected(self):
         self._earned_allocations()
-        batch = create_settlement_batch(self.organization, date.today(), date.today(), actor=self.operator)
+        batch = create_settlement_batch(self.organization, timezone.localdate(), timezone.localdate(), actor=self.operator)
         cancel_settlement_batch(batch, "First cancellation", actor=self.operator)
         with self.assertRaisesMessage(ValidationError, "Only draft settlement"):
             cancel_settlement_batch(batch, "Second cancellation", actor=self.operator)
@@ -799,7 +799,7 @@ class ServiceAllowanceTests(TestCase):
         )
         self.encounter = ScreeningEncounter.objects.create(
             encounter_id="ENC-FIN-ALLOW-1", patient=self.patient,
-            encounter_date=date.today(), originating_organization=self.organization,
+            encounter_date=timezone.localdate(), originating_organization=self.organization,
             source_type="hospital_referral", workflow_route="sentinel_managed",
             payment_responsibility="hospital",
         )
@@ -830,7 +830,7 @@ class ServiceAllowanceTests(TestCase):
             currency="NGN",
             monetary_limit=Decimal("30000.00"),
             patient_limit=2,
-            valid_from=date.today(),
+            valid_from=timezone.localdate(),
             expires_at=timezone.now() + timedelta(days=30),
         )
         approve_service_allowance(self.allowance, actor=self.user)
@@ -852,7 +852,7 @@ class ServiceAllowanceTests(TestCase):
         )
         second_encounter = ScreeningEncounter.objects.create(
             encounter_id="ENC-FIN-ALLOW-2", patient=second_patient,
-            encounter_date=date.today(), originating_organization=self.organization,
+            encounter_date=timezone.localdate(), originating_organization=self.organization,
             source_type="hospital_referral", workflow_route="sentinel_managed",
             payment_responsibility="hospital",
         )
@@ -866,7 +866,7 @@ class ServiceAllowanceTests(TestCase):
         )
         third_encounter = ScreeningEncounter.objects.create(
             encounter_id="ENC-FIN-ALLOW-3", patient=third_patient,
-            encounter_date=date.today(), originating_organization=self.organization,
+            encounter_date=timezone.localdate(), originating_organization=self.organization,
             source_type="hospital_referral", workflow_route="sentinel_managed",
             payment_responsibility="hospital",
         )

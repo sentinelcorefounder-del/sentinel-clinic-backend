@@ -1038,7 +1038,7 @@ class EyeHealthScreeningReportView(APIView):
         encounter = self._encounter(request, encounter_id)
         report = EyeHealthScreeningReport.objects.filter(encounter=encounter).first()
         if not report:
-            return Response({"detail": "No targeted screening report draft exists."}, status=404)
+            return Response({"detail": "No retinal and glaucoma-risk assessment report draft exists."}, status=404)
         return Response(EyeHealthScreeningReportSerializer(report, context={"request": request}).data)
 
     @transaction.atomic
@@ -1050,7 +1050,7 @@ class EyeHealthScreeningReportView(APIView):
         if report is None:
             report = EyeHealthScreeningReport.objects.create(encounter=encounter)
         if report.status == report.Status.FINALIZED:
-            return Response({"detail": "The finalized screening report is immutable."}, status=409)
+            return Response({"detail": "The finalized assessment report is immutable."}, status=409)
         supplied_version = request.data.get("expected_version")
         if not _created:
             try:
@@ -1059,7 +1059,7 @@ class EyeHealthScreeningReportView(APIView):
                 return Response({"detail": "The current report version is required."}, status=400)
             if supplied_version != report.lock_version:
                 return Response(
-                    {"detail": "This screening report changed after it was loaded."},
+                    {"detail": "This assessment report changed after it was loaded."},
                     status=status.HTTP_409_CONFLICT,
                 )
         payload = request.data.copy()
@@ -1321,7 +1321,7 @@ class EyeHealthScreeningPDFView(APIView):
             if draft and not has_internal_ops_authority(request.user):
                 require_eye_health_authority(request.user, encounter)
         if not version:
-            return Response({"detail": "No finalized screening report is available."}, status=404)
+            return Response({"detail": "No finalized assessment report is available."}, status=404)
         content, _manifest = build_complete_pdf(
             report, version.clinical_snapshot, audience=audience, draft=draft,
             manifest=version.attachment_manifest,
