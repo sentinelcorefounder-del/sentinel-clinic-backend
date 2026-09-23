@@ -446,6 +446,16 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         ("LEFTPADDING", (-1, 0), (-1, 0), 5),
         ("RIGHTPADDING", (-1, 0), (-1, 0), 0),
     ]))
+    # Use Paragraph flowables for result cells so long findings wrap inside their
+    # own column instead of overflowing into the neighbouring eye column.
+    result_cell = ParagraphStyle(
+        "ResultCell",
+        parent=small,
+        fontSize=8.2,
+        leading=10.2,
+        spaceAfter=0,
+        spaceBefore=0,
+    )
     result_rows = [["Test", "Right eye", "Left eye"]]
     for key, label in (
         ("visual_acuity", "Visual acuity"),
@@ -456,8 +466,9 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         if snapshot["tests"].get(key):
             value_key = "visual_field" if key == "visual_fields" else key
             result_rows.append([
-                label, _display(snapshot["right"].get(value_key)),
-                _display(snapshot["left"].get(value_key)),
+                Paragraph(_display(label), result_cell),
+                Paragraph(_display(snapshot["right"].get(value_key)), result_cell),
+                Paragraph(_display(snapshot["left"].get(value_key)), result_cell),
             ])
     story = [
         header,
@@ -480,8 +491,13 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         Table(result_rows, colWidths=[42*mm, 64*mm, 64*mm], style=TableStyle([
             ("GRID", (0,0), (-1,-1), .4, colors.HexColor("#b8c6d1")),
             ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#12395b")),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("FONTSIZE", (0,0), (-1,-1), 8.5),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("FONTSIZE", (0,0), (-1,0), 8.5),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ("TOPPADDING", (0,1), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,1), (-1,-1), 4),
         ])), Spacer(1, 4*mm),
         Paragraph("Assessment summary", styles["Heading2"]),
         Paragraph(_display(snapshot["clinical_summary"]), styles["BodyText"]),
