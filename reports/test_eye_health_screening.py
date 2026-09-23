@@ -476,7 +476,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         bundle = PdfReader(BytesIO(response.content))
         self.assertIn("UNCHANGED DIABETIC REPORT COMPONENT", bundle.pages[0].extract_text())
-        self.assertIn("Retinal and Glaucoma-Risk Assessment Report", bundle.pages[1].extract_text())
+        self.assertIn("Diabetic Retinal and Glaucoma-Risk Assessment Report", bundle.pages[1].extract_text())
         eye_report.refresh_from_db()
 
     def test_targeted_title_limitation_and_safe_deterministic_wording(self):
@@ -507,7 +507,7 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertNotEqual(snapshot["generated_suggestion"], "Client text must not be trusted")
         with get_private_clinical_storage().open(report.finalized_version.pdf_object_key, "rb") as source:
             text = "\n".join(page.extract_text() or "" for page in PdfReader(BytesIO(source.read())).pages)
-        self.assertIn("Retinal and Glaucoma-Risk Assessment Report", text)
+        self.assertIn("Diabetic Retinal and Glaucoma-Risk Assessment Report", text)
         self.assertIn(LIMITATION, text.replace("\n", " "))
         self.assertNotIn("No diabetic retinopathy", text)
 

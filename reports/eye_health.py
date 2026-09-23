@@ -402,7 +402,7 @@ def build_screening_pdf(report, snapshot, audience="patient"):
     output = BytesIO()
     doc = SimpleDocTemplate(output, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=15*mm, bottomMargin=15*mm)
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("EyeTitle", parent=styles["Title"], alignment=TA_CENTER, textColor=colors.HexColor("#12395b"), fontSize=18)
+    title = ParagraphStyle("EyeTitle", parent=styles["Title"], alignment=TA_CENTER, textColor=colors.HexColor("#12395b"), fontSize=16.5, leading=20)
     small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=8.5, leading=11)
     branding, primary, footer = _branding(report.encounter)
     patient = report.encounter.patient
@@ -428,20 +428,24 @@ def build_screening_pdf(report, snapshot, audience="patient"):
         return Paragraph(f"<b>{_display(brand.name)}</b>", styles["Heading2"])
 
     brand_cells = [brand_cell(brand) for brand in branding.brands]
-    contact = " · ".join(filter(None, [
-        str(getattr(primary, "address", "") or "").strip(),
-        str(getattr(primary, "phone", "") or "").strip(),
-        str(getattr(primary, "contact_email", "") or "").strip(),
-    ]))
+    address = str(getattr(primary, "address", "") or "").strip()
+    phone = str(getattr(primary, "phone", "") or "").strip()
+    email = str(getattr(primary, "contact_email", "") or "").strip()
+    contact_lines = [value for value in (address, phone, email) if value]
+    contact_html = "".join(f"<br/><font size='7.5'>{_display(value)}</font>" for value in contact_lines)
     header = Table([[
         *brand_cells,
         Paragraph(
-            f"<b>{_display(getattr(primary, 'name', ''))}</b>"
-            + (f"<br/><font size='8'>{_display(contact)}</font>" if contact else ""),
-            styles["BodyText"],
+            f"<b>{_display(getattr(primary, 'name', ''))}</b>{contact_html}",
+            small,
         ),
-    ]], colWidths=[85 * mm / max(len(brand_cells), 1)] * len(brand_cells) + [87 * mm])
-    header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    ]], colWidths=[88 * mm / max(len(brand_cells), 1)] * len(brand_cells) + [84 * mm])
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (-1, 0), (-1, 0), 5),
+        ("RIGHTPADDING", (-1, 0), (-1, 0), 0),
+    ]))
     result_rows = [["Test", "Right eye", "Left eye"]]
     for key, label in (
         ("visual_acuity", "Visual acuity"),
@@ -458,15 +462,15 @@ def build_screening_pdf(report, snapshot, audience="patient"):
     story = [
         header,
         Paragraph(
-            "Retinal and Glaucoma-Risk Assessment Report"
+            "Diabetic Retinal and Glaucoma-Risk Assessment Report"
             + (" — Clinician Report" if audience == "clinician" else ""),
             title,
         ), Spacer(1, 5*mm),
         Table([
-            ["Patient", _display(f"{patient.first_name} {patient.last_name}".strip()), "Reference", _display(patient.patient_id)],
-            ["Assessment", _display(report.encounter.encounter_id), "Date", _display(snapshot["assessment_date"])],
-            ["Assessment location", _display(location_text), "Tests included", _display(", ".join(tests))],
-        ], colWidths=[32*mm, 55*mm, 32*mm, 55*mm], style=TableStyle([
+            ["Patient", Paragraph(_display(f"{patient.first_name} {patient.last_name}".strip()), small), "Reference", Paragraph(_display(patient.patient_id), small)],
+            ["Assessment", Paragraph(_display(report.encounter.encounter_id), small), "Date", Paragraph(_display(snapshot["assessment_date"]), small)],
+            ["Assessment location", Paragraph(_display(location_text), small), "Tests included", Paragraph(_display(", ".join(tests)), small)],
+        ], colWidths=[30*mm, 62*mm, 28*mm, 54*mm], style=TableStyle([
             ("GRID", (0,0), (-1,-1), .4, colors.HexColor("#b8c6d1")),
             ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#eef4f8")),
             ("BACKGROUND", (2,0), (2,-1), colors.HexColor("#eef4f8")),
