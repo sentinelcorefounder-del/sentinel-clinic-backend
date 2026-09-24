@@ -376,9 +376,31 @@ class OcularDiagnosticWorkflowTests(TestCase):
         self.assertTrue(encounter.includes_diabetic_screening)
         self.assertTrue(encounter.includes_eye_health_screening)
         self.assertFalse(encounter.includes_ocular_diagnostics)
+        self.assertEqual(encounter.payment_responsibility, "clinic")
         self.assertFalse(hasattr(encounter, "ocular_assessment"))
         self.assertEqual(encounter.assessment_location_snapshot["site_name"], self.branch.name)
         self.assertEqual(encounter.assessment_location_snapshot["branch_code"], self.branch.branch_code)
+
+    def test_combined_encounter_completes_from_finalized_unified_report_without_legacy_structured_report(self):
+        response = self.client.post(
+            "/api/encounters/",
+            self.payload("combined_assessment"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        encounter = ScreeningEncounter.objects.get(pk=response.data["id"])
+        report = EyeHealthScreeningReport.objects.create(encounter=encounter, status="finalized")
+        version = EyeHealthScreeningReportVersion.objects.create(
+            report=report, version_number=1, clinical_snapshot={"synthetic": True},
+            checksum_sha256="c" * 64, clinician_snapshot={"name": "Synthetic"}, editor=self.user,
+        )
+        EyeHealthScreeningReport.objects.filter(pk=report.pk).update(finalized_version=version)
+
+        encounter.update_status_from_related_records()
+        encounter.refresh_from_db()
+
+        self.assertEqual(encounter.screening_status, "completed")
+        self.assertFalse(hasattr(encounter, "structured_report"))
 
     def test_mobile_location_is_snapshotted_without_rewriting_branch(self):
         payload = self.payload("eye_health_screening")

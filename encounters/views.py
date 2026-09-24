@@ -405,12 +405,11 @@ class ScreeningEncounterListCreateView(generics.ListCreateAPIView):
                 "encounter_type": requested_encounter_type,
                 "source_type": "clinic_direct",
                 "workflow_route": route,
-                "payment_responsibility": (
-                    serializer.validated_data.get(
-                        "payment_responsibility"
-                    )
-                    or profile.default_payment_responsibility
-                ),
+                # Clinic-direct assessments are funded by the performing clinic.
+                # Hospital responsibility is reserved for genuine hospital-referral
+                # pathways; accepting a stale/default hospital payer here leaves
+                # clinic-direct encounters unable to match their pricing rule.
+                "payment_responsibility": "clinic",
                 "hospital_referral": None,
                 "source_override_reason": (
                     override_reason

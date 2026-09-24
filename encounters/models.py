@@ -340,8 +340,12 @@ class ScreeningEncounter(models.Model):
         elif (
             self.service_package == self.ServicePackage.COMBINED
             and eye_health_completed
-            and has_completed_report
+            and (not has_reports or has_completed_report)
         ):
+            # The current unified combined workflow is finalized through the
+            # EyeHealthScreeningReport. Some historical combined encounters also
+            # have a StructuredReport; when one exists, do not complete the
+            # encounter until that component has reached an accepted final state.
             new_status = "completed"
         elif self.service_package == self.ServicePackage.EYE_HEALTH_SCREENING and eye_health_completed:
             new_status = "completed"
