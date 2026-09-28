@@ -1845,11 +1845,31 @@ def sync_encounter_finance_lifecycle(encounter, actor=None):
         except ValidationError:
             try:
                 reserve_service_allowance(record, actor=actor)
-            except ValidationError:
+            except ValidationError as funding_exc:
                 if record.contract and record.contract.credit_allowed:
                     approve_financial_record_credit(record, actor=actor)
                 else:
-                    raise
+                    # Pricing is a durable fact even when funding is unavailable.
+                    # Do not let the surrounding atomic lifecycle roll back the
+                    # contract/rule/charge/allocation snapshot: Ops needs that
+                    # priced state for sponsorship or complimentary disposition.
+                    record.refresh_from_db()
+                    previous_status = record.status
+                    record.status = EncounterFinancialRecord.Status.EXCEPTION
+                    record.financially_releasable = False
+                    messages = getattr(funding_exc, "messages", None) or [str(funding_exc)]
+                    record.exception_reason = "; ".join(str(message) for message in messages)
+                    record.save(update_fields=[
+                        "status", "financially_releasable", "exception_reason", "updated_at"
+                    ])
+                    _audit(
+                        record,
+                        "automatic_funding_unavailable",
+                        actor=actor,
+                        previous_status=previous_status,
+                        details={"reason": record.exception_reason},
+                    )
+                    return record
         record.refresh_from_db()
 
     if (
