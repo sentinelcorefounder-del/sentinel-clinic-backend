@@ -21,7 +21,7 @@ def require_role(actor, role):
 
 def _eligible(record):
     if (record.disposition != record.Disposition.STANDARD or record.captured_at
-            or record.status not in {record.Status.PRICED, record.Status.AWAITING_PAYMENT}
+            or record.status not in {record.Status.PRICED, record.Status.AWAITING_PAYMENT, record.Status.EXCEPTION}
             or record.gross_amount <= 0 or record.outstanding_amount != record.gross_amount
             or not record.pricing_rule_id):
         raise ValidationError("Complimentary disposition requires an existing, fully unpaid standard pricing record.")

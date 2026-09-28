@@ -1851,7 +1851,7 @@ class SentinelTreasuryDashboardView(APIView):
 
 from .models import ComplimentaryRequest
 from .serializers import ComplimentaryRequestSerializer
-from .complimentary import request_complimentary, decide_complimentary
+from .complimentary import _eligible, request_complimentary, decide_complimentary
 
 
 class ComplimentaryRequestViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1863,6 +1863,27 @@ class ComplimentaryRequestViewSet(viewsets.ReadOnlyModelViewSet):
             IsInternalFinanceApprover if self.action in {"approve", "reject"} else IsInternalFinanceOperator
         )
         return [IsAuthenticated(), role()]
+
+    @action(detail=False, methods=["get"], url_path="eligible-records")
+    def eligible_records(self, request):
+        candidates = EncounterFinancialRecord.objects.select_related(
+            "encounter", "encounter__patient", "encounter__originating_organization",
+            "encounter__service_branch", "encounter__service_session", "contract", "pricing_rule",
+        ).prefetch_related(
+            "allocations", "allocations__beneficiary_organization"
+        ).filter(status__in=[
+            EncounterFinancialRecord.Status.PRICED,
+            EncounterFinancialRecord.Status.AWAITING_PAYMENT,
+            EncounterFinancialRecord.Status.EXCEPTION,
+        ]).order_by("-created_at")
+        eligible = []
+        for record in candidates:
+            try:
+                _eligible(record)
+            except DjangoValidationError:
+                continue
+            eligible.append(record)
+        return Response(EncounterFinancialRecordSerializer(eligible, many=True).data)
 
     def create(self, request):
         from django.shortcuts import get_object_or_404

@@ -139,6 +139,42 @@ class ComplimentaryTests(TestCase):
         with self.assertRaises(ValidationError):
             decide_complimentary(item, actor=self.approver, action="approve")
 
+    def test_exception_record_is_eligible_and_eligible_endpoint_excludes_active_sponsorship(self):
+        # While sponsorship is active, the same financial record must not be offered
+        # by the complimentary selector.  Check this before prepare() cancels the
+        # fixture sponsorship and reuses its idempotent record.
+        active_sponsorship = self.draft()
+        client = APIClient(); client.force_authenticate(self.operator)
+        response = client.get("/api/finance/complimentary/eligible-records/")
+        self.assertEqual(response.status_code, 200, response.data)
+        ids = {item["id"] for item in response.data}
+        self.assertNotIn(active_sponsorship.financial_record_id, ids)
+
+        # Once that sponsorship is cancelled, prepare() returns the same financial
+        # record in a fully-unpaid state.  An exception caused by failed ordinary
+        # funding should remain eligible for the non-cash complimentary path.
+        record = self.prepare()
+        record.status = EncounterFinancialRecord.Status.EXCEPTION
+        record.exception_reason = "The active contract does not permit credit."
+        record.save(update_fields=["status", "exception_reason", "updated_at"])
+
+        response = client.get("/api/finance/complimentary/eligible-records/")
+        self.assertEqual(response.status_code, 200, response.data)
+        ids = {item["id"] for item in response.data}
+        self.assertIn(record.pk, ids)
+
+        before = WalletLedgerEntry.objects.count()
+        item = request_complimentary(
+            financial_record=record, actor=self.operator, reason="Free assessment",
+            idempotency_key="exception-noncash",
+        )
+        decide_complimentary(item, actor=self.approver, action="approve")
+        record.refresh_from_db()
+        self.assertEqual(record.disposition, "complimentary_non_cash")
+        self.assertEqual(record.outstanding_amount, 0)
+        self.assertTrue(record.financially_releasable)
+        self.assertEqual(WalletLedgerEntry.objects.count(), before)
+
     def test_api_and_immutable_audit(self):
         record = self.prepare(); client = APIClient(); client.force_authenticate(self.operator)
         response = client.post("/api/finance/complimentary/", {"financial_record": record.pk, "reason": "Free", "idempotency_key": "api"})
