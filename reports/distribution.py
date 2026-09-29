@@ -32,11 +32,17 @@ def _financial_record(encounter):
 
 def financial_clean_pdf_ready(encounter) -> bool:
     record = _financial_record(encounter)
+    if not record or encounter.screening_status != "completed":
+        return False
+
+    if not record.financially_releasable:
+        return False
+
+    if record.disposition == EncounterFinancialRecord.Disposition.COMPLIMENTARY:
+        return record.status == EncounterFinancialRecord.Status.READY_FOR_RELEASE
+
     return bool(
-        encounter.screening_status == "completed"
-        and record
-        and record.financially_releasable
-        and record.captured_at is not None
+        record.captured_at is not None
         and record.status in {
             EncounterFinancialRecord.Status.CAPTURED,
             EncounterFinancialRecord.Status.READY_FOR_RELEASE,

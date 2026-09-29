@@ -254,6 +254,46 @@ class EyeHealthScreeningWorkflowTests(TestCase):
         self.assertEqual(report.finalized_version_id, version_id)
         self.assertEqual(report.versions.count(), 1)
 
+    def test_completed_complimentary_non_cash_report_allows_clean_pdf_without_capture(self):
+        report = self.preview_and_finalize(self.save_draft())
+        EncounterFinancialRecord.objects.update_or_create(
+            encounter=self.encounter,
+            defaults={
+                "disposition": EncounterFinancialRecord.Disposition.COMPLIMENTARY,
+                "status": EncounterFinancialRecord.Status.READY_FOR_RELEASE,
+                "gross_amount": 15000,
+                "allocated_amount": 0,
+                "outstanding_amount": 0,
+                "financially_releasable": True,
+                "captured_at": None,
+                "payer_type": "waived",
+                "payer_organization": None,
+                "collecting_organization": None,
+                "collector_type": "none",
+                "payment_method": "waived",
+            },
+        )
+        response = self.client.get(f"/api/reports/eye-health/{report.pk}/pdf/?report_format=patient")
+        self.assertEqual(response.status_code, 200)
+        text = " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages)
+        self.assertNotIn("DRAFT — NOT FOR DISTRIBUTION", text)
+
+    def test_standard_ready_for_release_record_still_requires_capture_for_clean_pdf(self):
+        report = self.preview_and_finalize(self.save_draft())
+        EncounterFinancialRecord.objects.update_or_create(
+            encounter=self.encounter,
+            defaults={
+                "disposition": EncounterFinancialRecord.Disposition.STANDARD,
+                "status": EncounterFinancialRecord.Status.READY_FOR_RELEASE,
+                "financially_releasable": True,
+                "captured_at": None,
+            },
+        )
+        response = self.client.get(f"/api/reports/eye-health/{report.pk}/pdf/?report_format=patient")
+        self.assertEqual(response.status_code, 200)
+        text = " ".join(page.extract_text() or "" for page in PdfReader(BytesIO(response.content)).pages)
+        self.assertIn("DRAFT — NOT FOR DISTRIBUTION", text)
+
     def test_hospital_requires_exact_release_and_repeated_release_does_not_charge(self):
         referral = HospitalReferral.objects.create(
             referral_id="SNT-REF-EYE-RELEASE", source_hospital=self.hospital,
