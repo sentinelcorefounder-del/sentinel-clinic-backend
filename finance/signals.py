@@ -5,7 +5,7 @@ from django.dispatch import receiver
 from encounters.models import ScreeningEncounter
 
 from .models import EncounterFinancialRecord
-from .services import ensure_financial_record, sync_encounter_finance_lifecycle
+from .services import ensure_financial_record, infer_financial_identity, sync_encounter_finance_lifecycle
 
 
 def _record_exception(encounter, message):
@@ -15,9 +15,18 @@ def _record_exception(encounter, message):
         EncounterFinancialRecord.Status.SETTLED,
         EncounterFinancialRecord.Status.REFUNDED,
     }:
+        (
+            record.service_pathway,
+            record.payer_type,
+            record.collector_type,
+            record.payment_method,
+        ) = infer_financial_identity(encounter)
         record.status = EncounterFinancialRecord.Status.EXCEPTION
         record.exception_reason = str(message)
-        record.save(update_fields=["status", "exception_reason", "updated_at"] )
+        record.save(update_fields=[
+            "service_pathway", "payer_type", "collector_type", "payment_method",
+            "status", "exception_reason", "updated_at",
+        ])
 
 
 @receiver(post_save, sender=ScreeningEncounter)

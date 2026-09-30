@@ -1143,3 +1143,106 @@ class FinanceGroupProvisioningTests(TestCase):
         self.assertEqual(Group.objects.filter(name="finance_viewer").count(), 1)
         self.assertTrue(user.groups.filter(name="finance_viewer").exists())
         self.assertEqual(user.groups.count(), 1)
+
+
+class PricingRevisionAllocationRegressionTests(TestCase):
+    def test_revision_carries_single_full_fixed_allocation_to_new_gross(self):
+        from finance.views import PartnerContractViewSet
+
+        clinic = Organization.objects.create(
+            clinic_id="CLINIC-REVISION-ALLOC",
+            name="Revision Allocation Clinic",
+            organization_type="clinic",
+        )
+        contract = PartnerContract.objects.create(
+            organization=clinic,
+            name="Combined Assessment Agreement",
+            programme="combined_assessment",
+            status=PartnerContract.Status.ACTIVE,
+            effective_from=date(2026, 1, 1),
+        )
+        current = PricingRule.objects.create(
+            contract=contract,
+            name="Combined assessment pricing",
+            service_type="combined_assessment",
+            source_type="clinic_direct",
+            payment_responsibility="clinic",
+            gross_amount=Decimal("15000.00"),
+            effective_from=date(2026, 1, 1),
+        )
+        source = AllocationRule.objects.create(
+            pricing_rule=current,
+            beneficiary_role=AllocationRule.BeneficiaryRole.SENTINEL,
+            beneficiary_organization=clinic,
+            calculation_type=AllocationRule.CalculationType.FIXED,
+            fixed_amount=Decimal("15000.00"),
+        )
+        replacement = PricingRule.objects.create(
+            contract=contract,
+            name="Combined assessment pricing",
+            version=2,
+            supersedes=current,
+            service_type="combined_assessment",
+            source_type="clinic_direct",
+            payment_responsibility="clinic",
+            gross_amount=Decimal("12500.00"),
+            effective_from=date(2026, 9, 30),
+        )
+
+        PartnerContractViewSet._clone_revision_allocations(current, replacement)
+
+        cloned = replacement.allocation_rules.get()
+        self.assertNotEqual(cloned.pk, source.pk)
+        self.assertEqual(cloned.fixed_amount, Decimal("12500.00"))
+        self.assertEqual(cloned.beneficiary_role, source.beneficiary_role)
+        self.assertEqual(cloned.beneficiary_organization_id, source.beneficiary_organization_id)
+
+    def test_finance_exception_keeps_clinic_direct_identity(self):
+        clinic = Organization.objects.create(
+            clinic_id="CLINIC-EXCEPTION-IDENTITY",
+            name="Exception Identity Clinic",
+            organization_type="clinic",
+        )
+        patient = Patient.objects.create(
+            patient_id="PAT-EXCEPTION-IDENTITY",
+            first_name="Exception",
+            last_name="Identity",
+            date_of_birth=date(1980, 1, 1),
+            sex="female",
+        )
+        contract = PartnerContract.objects.create(
+            organization=clinic,
+            name="Combined Assessment Agreement",
+            programme="combined_assessment",
+            status=PartnerContract.Status.ACTIVE,
+            effective_from=date(2026, 1, 1),
+        )
+        PricingRule.objects.create(
+            contract=contract,
+            name="Broken combined pricing",
+            service_type="combined_assessment",
+            source_type="clinic_direct",
+            payment_responsibility="clinic",
+            gross_amount=Decimal("12500.00"),
+            effective_from=date(2026, 1, 1),
+        )
+
+        encounter = ScreeningEncounter.objects.create(
+            encounter_id="ENC-EXCEPTION-IDENTITY",
+            patient=patient,
+            encounter_date=timezone.localdate(),
+            originating_organization=clinic,
+            source_type="clinic_direct",
+            workflow_route="sentinel_managed",
+            payment_responsibility="clinic",
+            programme="combined_assessment",
+            service_package=ScreeningEncounter.ServicePackage.COMBINED,
+            encounter_type="combined_assessment",
+        )
+
+        record = EncounterFinancialRecord.objects.get(encounter=encounter)
+        self.assertEqual(record.status, EncounterFinancialRecord.Status.EXCEPTION)
+        self.assertEqual(record.service_pathway, EncounterFinancialRecord.ServicePathway.CLINIC_DIRECT)
+        self.assertEqual(record.payer_type, EncounterFinancialRecord.PayerType.ORGANIZATION)
+        self.assertEqual(record.payment_method, EncounterFinancialRecord.PaymentMethod.WALLET)
+        self.assertIn("Allocation rules total", record.exception_reason)

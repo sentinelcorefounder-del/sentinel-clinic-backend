@@ -567,6 +567,42 @@ class PartnerContractViewSet(FinanceAdminViewSet):
         replacement = serializer.save()
         return Response(self.get_serializer(replacement).data, status=status.HTTP_201_CREATED)
 
+    @staticmethod
+    def _clone_revision_allocations(current, replacement):
+        """Carry allocation policy into a new pricing-rule version.
+
+        A pricing revision must not silently drop the allocation rules that make
+        the service priceable.  For the common single fixed 100% allocation,
+        keep it at 100% when the gross price changes; otherwise preserve the
+        existing allocation terms exactly.
+        """
+        source_rules = list(current.allocation_rules.all().order_by("priority", "id"))
+        if not source_rules:
+            return
+
+        single_full_fixed = (
+            len(source_rules) == 1
+            and source_rules[0].calculation_type == AllocationRule.CalculationType.FIXED
+            and source_rules[0].fixed_amount == current.gross_amount
+        )
+        for source in source_rules:
+            AllocationRule.objects.create(
+                pricing_rule=replacement,
+                beneficiary_role=source.beneficiary_role,
+                beneficiary_organization=source.beneficiary_organization,
+                beneficiary_source=source.beneficiary_source,
+                label=source.label,
+                calculation_type=source.calculation_type,
+                fixed_amount=(
+                    replacement.gross_amount
+                    if single_full_fixed
+                    else source.fixed_amount
+                ),
+                percentage=source.percentage,
+                priority=source.priority,
+                is_active=source.is_active,
+            )
+
     @action(detail=True, methods=["post"], url_path="revise-pricing")
     @transaction.atomic
     def revise_pricing(self, request, pk=None):
@@ -608,6 +644,7 @@ class PartnerContractViewSet(FinanceAdminViewSet):
                 serializer = PricingRuleSerializer(data=payload)
                 serializer.is_valid(raise_exception=True)
                 new_rule = serializer.save()
+                self._clone_revision_allocations(current, new_rule)
                 current.is_active = False
                 current.effective_to = new_rule.effective_from - timedelta(days=1)
                 current.save(update_fields=["is_active", "effective_to", "updated_at"])
