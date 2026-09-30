@@ -38,6 +38,7 @@ from .services import (
     cancel_settlement_batch,
     create_finance_action_request, approve_finance_action_request,
     reject_finance_action_request, reconcile_finance_controls,
+    prefund_wallet_from_sentinel_treasury,
 )
 
 
@@ -288,6 +289,70 @@ class WalletEngineTests(FinanceEngineTests):
         )
         self.assertEqual(
             self.record.audit_entries.filter(action="allocations_earned").count(), 1
+        )
+
+    def test_treasury_prefunding_returns_only_captured_prefunded_value(self):
+        treasury_org = Organization.objects.create(
+            clinic_id="TREASURY-PREFUND-001",
+            name="Project Sentinel Treasury Test",
+            organization_type="sentinel",
+            is_sentinel_treasury=True,
+        )
+        treasury = OrganizationWallet.objects.create(
+            organization=treasury_org, currency="NGN", credit_limit=Decimal("0.00")
+        )
+        top_up_wallet(treasury, Decimal("50000.00"), "treasury-prefund-seed")
+
+        first = prefund_wallet_from_sentinel_treasury(
+            treasury_wallet=treasury, target_wallet=self.wallet, amount=Decimal("15000.00"),
+            idempotency_key="prefund-test-001", reference="TEST-PREFUND",
+        )
+        second = prefund_wallet_from_sentinel_treasury(
+            treasury_wallet=treasury, target_wallet=self.wallet, amount=Decimal("15000.00"),
+            idempotency_key="prefund-test-001", reference="TEST-PREFUND",
+        )
+        self.assertEqual(first[0].pk, second[0].pk)
+        self.assertEqual(first[1].pk, second[1].pk)
+        self.assertEqual(treasury.available_balance, Decimal("35000.00"))
+        self.assertEqual(self.wallet.available_balance, Decimal("15000.00"))
+
+        reservation = reserve_wallet_funds(
+            self.wallet, self.record, Decimal("15000.00"), "prefund-reserve-001"
+        )
+        capture_wallet_reservation(reservation, idempotency_key="prefund-capture-001")
+        treasury.refresh_from_db()
+        self.wallet.refresh_from_db()
+        self.assertEqual(treasury.available_balance, Decimal("50000.00"))
+        self.assertEqual(self.wallet.available_balance, Decimal("0.00"))
+        self.assertEqual(self.wallet.reserved_balance, Decimal("0.00"))
+        self.assertEqual(
+            WalletLedgerEntry.objects.filter(
+                wallet=treasury, metadata__direction="captured_prefunding_return"
+            ).count(), 1
+        )
+
+    def test_ordinary_wallet_capture_is_not_swept_to_treasury(self):
+        treasury_org = Organization.objects.create(
+            clinic_id="TREASURY-ORDINARY-001",
+            name="Project Sentinel Treasury Ordinary Test",
+            organization_type="sentinel",
+            is_sentinel_treasury=True,
+        )
+        treasury = OrganizationWallet.objects.create(
+            organization=treasury_org, currency="NGN", credit_limit=Decimal("0.00")
+        )
+        top_up_wallet(treasury, Decimal("50000.00"), "treasury-ordinary-seed")
+        top_up_wallet(self.wallet, Decimal("15000.00"), "ordinary-clinic-funding")
+        reservation = reserve_wallet_funds(
+            self.wallet, self.record, Decimal("15000.00"), "ordinary-reserve-001"
+        )
+        capture_wallet_reservation(reservation, idempotency_key="ordinary-capture-001")
+        treasury.refresh_from_db()
+        self.assertEqual(treasury.available_balance, Decimal("50000.00"))
+        self.assertFalse(
+            WalletLedgerEntry.objects.filter(
+                wallet=treasury, metadata__direction="captured_prefunding_return"
+            ).exists()
         )
 
     def test_release_returns_reserved_funds(self):

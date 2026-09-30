@@ -1105,6 +1105,133 @@ def adjust_wallet(wallet, available_delta, idempotency_key, actor=None, referenc
 
 
 @transaction.atomic
+def prefund_wallet_from_sentinel_treasury(*, treasury_wallet, target_wallet, amount, idempotency_key, actor=None, reference="", description=""):
+    """Move existing Sentinel cash into an operating wallet without creating new cash.
+
+    The paired immutable ledger entries are explicitly tagged as Sentinel Treasury
+    prefunding. Only captures backed by this tagged pool are returned to Treasury.
+    """
+    from .models import OrganizationWallet, WalletLedgerEntry
+
+    amount = _money(amount)
+    if amount <= 0:
+        raise ValidationError("Prefunding amount must be greater than zero.")
+    base_key = _require_idempotency_key(idempotency_key)
+    if treasury_wallet.pk == target_wallet.pk:
+        raise ValidationError("Treasury and target wallets must be different.")
+
+    wallet_ids = sorted([treasury_wallet.pk, target_wallet.pk])
+    locked = {w.pk: w for w in OrganizationWallet.objects.select_for_update().select_related("organization").filter(pk__in=wallet_ids)}
+    treasury = locked.get(treasury_wallet.pk)
+    target = locked.get(target_wallet.pk)
+    if not treasury or not target:
+        raise ValidationError("Treasury or target wallet does not exist.")
+    if not is_eligible_sentinel_treasury_wallet(treasury):
+        raise ValidationError("The source wallet is not the active Sentinel Treasury wallet.")
+    if not target.is_active:
+        raise ValidationError("The target wallet is inactive.")
+    if treasury.currency != target.currency:
+        raise ValidationError("Treasury and target wallet currencies do not match.")
+
+    debit_key = f"{base_key}:treasury-debit"
+    credit_key = f"{base_key}:target-credit"
+    debit = WalletLedgerEntry.objects.filter(idempotency_key=debit_key).first()
+    credit = WalletLedgerEntry.objects.filter(idempotency_key=credit_key).first()
+    if debit or credit:
+        if not (debit and credit):
+            raise ValidationError("Incomplete prior prefunding transfer detected; manual review required.")
+        return debit, credit
+    if treasury.available_balance < amount:
+        raise ValidationError("Sentinel Treasury does not have enough available funds for this prefunding transfer.")
+
+    common = {
+        "sentinel_treasury_prefunding": True,
+        "treasury_wallet_id": treasury.pk,
+        "target_wallet_id": target.pk,
+        "amount": str(amount),
+        "base_idempotency_key": base_key,
+    }
+    debit = WalletLedgerEntry.objects.create(
+        wallet=treasury, entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+        available_delta=-amount, reserved_delta=Decimal("0.00"), currency=treasury.currency,
+        idempotency_key=debit_key, reference=reference,
+        description=description or f"Sentinel Treasury prefunding to {target.organization.name}",
+        metadata={**common, "direction": "treasury_to_operating_debit"}, actor=actor,
+    )
+    credit = WalletLedgerEntry.objects.create(
+        wallet=target, entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+        available_delta=amount, reserved_delta=Decimal("0.00"), currency=target.currency,
+        related_entry=debit, idempotency_key=credit_key, reference=reference,
+        description=description or f"Sentinel Treasury prefunding from {treasury.organization.name}",
+        metadata={**common, "direction": "treasury_to_operating_credit"}, actor=actor,
+    )
+    return debit, credit
+
+
+def _return_prefunded_capture_to_sentinel_treasury(*, reservation, capture_entry, amount, actor=None):
+    """Return only explicitly Treasury-prefunded captured value to Treasury.
+
+    Ordinary wallet funding is untouched. The prefunding credit is the source-of-truth
+    pool and each return is linked to both that credit and the capture in metadata.
+    """
+    from .models import WalletLedgerEntry
+
+    remaining_capture = _money(amount)
+    if remaining_capture <= 0:
+        return Decimal("0.00")
+
+    prefunding_credits = WalletLedgerEntry.objects.select_for_update().filter(
+        wallet_id=reservation.wallet_id,
+        entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+        available_delta__gt=0,
+        metadata__sentinel_treasury_prefunding=True,
+        metadata__direction="treasury_to_operating_credit",
+    ).order_by("created_at", "id")
+
+    returned_total = Decimal("0.00")
+    for credit in prefunding_credits:
+        if remaining_capture <= 0:
+            break
+        prefunded_amount = _money(credit.available_delta)
+        already_returned = WalletLedgerEntry.objects.filter(
+            related_entry=credit,
+            entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+            available_delta__gt=0,
+            metadata__direction="captured_prefunding_return",
+        ).aggregate(total=Sum("available_delta"))["total"] or Decimal("0.00")
+        pool_remaining = prefunded_amount - already_returned
+        if pool_remaining <= 0:
+            continue
+        return_amount = min(remaining_capture, pool_remaining)
+        treasury_wallet_id = credit.metadata.get("treasury_wallet_id")
+        treasury = OrganizationWallet.objects.select_for_update().select_related("organization").filter(pk=treasury_wallet_id).first()
+        if not is_eligible_sentinel_treasury_wallet(treasury):
+            raise ValidationError("The Sentinel Treasury wallet for this prefunding pool is unavailable.")
+        key = f"prefunding-return:capture:{capture_entry.pk}:credit:{credit.pk}"
+        existing = WalletLedgerEntry.objects.filter(idempotency_key=key).first()
+        if existing:
+            returned = _money(existing.available_delta)
+        else:
+            entry = WalletLedgerEntry.objects.create(
+                wallet=treasury, entry_type=WalletLedgerEntry.EntryType.TRANSFER,
+                available_delta=return_amount, reserved_delta=Decimal("0.00"), currency=treasury.currency,
+                financial_record=reservation.financial_record, reservation=reservation,
+                related_entry=credit, idempotency_key=key, reference=capture_entry.reference,
+                description=f"Return of captured Sentinel-prefunded service funds for {reservation.financial_record}",
+                metadata={
+                    "direction": "captured_prefunding_return",
+                    "prefunding_credit_entry_id": credit.pk,
+                    "capture_entry_id": capture_entry.pk,
+                    "source_wallet_id": reservation.wallet_id,
+                }, actor=actor,
+            )
+            returned = _money(entry.available_delta)
+        returned_total += returned
+        remaining_capture -= returned
+    return returned_total
+
+
+@transaction.atomic
 def reserve_wallet_funds(wallet, financial_record, amount, idempotency_key, actor=None, reference=""):
     from .models import OrganizationWallet, WalletLedgerEntry, WalletReservation
 
@@ -1189,7 +1316,7 @@ def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, a
     if reservation.status in {WalletReservation.Status.RELEASED, WalletReservation.Status.CAPTURED}:
         raise ValidationError("This reservation is already closed.")
 
-    WalletLedgerEntry.objects.create(
+    capture_entry = WalletLedgerEntry.objects.create(
         wallet=reservation.wallet,
         entry_type=WalletLedgerEntry.EntryType.SERVICE_CAPTURE,
         available_delta=Decimal("0.00"),
@@ -1209,6 +1336,10 @@ def capture_wallet_reservation(reservation, amount=None, idempotency_key=None, a
     else:
         reservation.status = WalletReservation.Status.PARTIALLY_CAPTURED
     reservation.save(update_fields=["captured_amount", "status", "captured_at", "updated_at"])
+
+    _return_prefunded_capture_to_sentinel_treasury(
+        reservation=reservation, capture_entry=capture_entry, amount=amount, actor=actor
+    )
 
     record = reservation.financial_record
     previous_status = record.status
